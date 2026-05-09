@@ -1,0 +1,47 @@
+[package]
+name = "am-fs-erofs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust EROFS (Enhanced Read-Only File System) reader and writer. Clean-room implementation; reads everything mkfs.erofs 1.9 emits (LZ4/LZMA/DEFLATE, compacted-2B, ztailpacking, fragments, big_pcluster) and produces fsck.erofs-clean output."
+repository = "https://github.com/antimatter-studios/rust-fs-erofs"
+
+[lib]
+name = "fs_erofs"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "mkfs_erofs"
+path = "src/bin/mkfs_erofs.rs"
+
+[dependencies]
+am-fs-core = { path = "../rust-fs-core", version = "0.1" }
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
+lzma-rs = "0.3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# CRC32C (Castagnoli, polynomial 0x1EDC6F41) for the EROFS superblock
+# checksum (feature_compat bit 0). Apache-2.0 licensed; no proc-macro
+# deps so it stays cleanroom-safe.
+crc32c = "0.6"
+# LRU cache for decompressed pcluster bytes — avoids re-paying the
+# LZ4/LZMA/DEFLATE cost on every block-level read of a multi-block
+# compressed inode. MIT licensed; pure-Rust; no proc-macro deps.
+lru = "0.12"
+
+[dev-dependencies]
+lz4_flex = { version = "0.11", features = ["safe-encode"] }
+tempfile = "3"
+# CLI integration tests use `Command::cargo_bin("mkfs_erofs")` to spawn
+# the just-built binary. MIT/Apache-2.0; no proc-macro deps that would
+# pull GPL'd code into the test build.
+assert_cmd = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1
+panic = "unwind"

@@ -1,0 +1,13 @@
+/target
+Cargo.lock
+*.img
+*audit*
+.history
+
+# GSI test fixture (downloaded by tests/fixtures/download-gsi.sh).
+# AOSP-licensed; not redistributed by this repo. The *.img rule above
+# already covers system.img, but be explicit for the .tar / .zip
+# intermediate forms as well.
+tests/fixtures/*.img
+tests/fixtures/*.tar*
+tests/fixtures/*.zip
