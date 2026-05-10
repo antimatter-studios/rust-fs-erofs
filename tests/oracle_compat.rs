@@ -1544,7 +1544,7 @@ fn our_writer_image_kernel_mountable() {
     let img_bytes = mkfs::build_image(
         dir(vec![
             ("hello.txt", file(b"hello\n")),
-            ("a.bin", file(&vec![0xAB; 200])),
+            ("a.bin", file(&[0xAB; 200])),
             ("sub", dir(vec![("nested.txt", file(b"nested\n"))])),
         ]),
         12,
