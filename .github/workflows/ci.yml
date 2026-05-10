@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: test-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # The crate has a path dep on am-fs-core (../rust-fs-core).
+      # Clone the sibling repo alongside so cargo can resolve it.
+      # Anonymous HTTPS clone — rust-fs-core is public.
+      - name: Clone sibling rust-fs-core
+        run: git clone --depth 1 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # erofs-utils provides mkfs.erofs / fsck.erofs / dump.erofs — the
+      # oracle binaries the #[ignore]-gated round-trip and oracle_compat
+      # tests shell out to. `attr` provides setfattr/getfattr for the
+      # xattr oracle paths.
+      - name: Install erofs-utils + attr (oracle binaries)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq erofs-utils attr
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+      # Oracle tests are #[ignore]-gated so a fresh checkout without
+      # erofs-utils still passes `cargo test`. CI installed the oracle
+      # above, so we opt them in here.
+      - run: cargo test --release -- --ignored
+
+  # Validate the mkfs_erofs CLI binary's output by running upstream's
+  # fsck.erofs (from erofs-utils) against an image we generated. This is
+  # the canonical "does the kernel-shipped reader think this is a valid
+  # EROFS volume?" check — much stricter than our own crate's read-path
+  # round-trip because it exercises every superblock / inode / layout
+  # assertion in the upstream tooling, including CRC32C verification.
+  #
+  # Runs on every PR + push so a regression in the mkfs path is caught
+  # before the binary ships to a tag.
+  validate-mkfs-bin:
+    name: validate mkfs_erofs (fsck.erofs strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The crate has a path dep on am-fs-core (../rust-fs-core).
+      # Clone the sibling repo alongside so cargo can resolve it.
+      - name: Clone sibling rust-fs-core
+        run: git clone --depth 1 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install erofs-utils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq erofs-utils
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-mkfs-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build mkfs_erofs
+        run: cargo build --release --bin mkfs_erofs
+      - name: Build a small source tree, mkfs it, validate with fsck.erofs
+        run: |
+          src=/tmp/src
+          out=/tmp/out.erofs
+          mkdir -p "$src/sub/nested"
+          echo "hello world" > "$src/file.txt"
+          echo "another" > "$src/sub/another.txt"
+          printf '0123456789%.0s' {1..200} > "$src/sub/nested/longer.txt"
+          ./target/release/mkfs_erofs "$out" "$src"
+          ls -la "$out"
+          # fsck.erofs's clean exit is the canonical "this is a valid
+          # EROFS image" signal. Verbose flag prints the structural
+          # walk so failures point at the offending inode/block.
+          fsck.erofs --extract=/tmp/extracted "$out"
+          # Cross-check: extracted tree byte-matches the source.
+          diff -r "$src" /tmp/extracted
+      - name: Dump superblock + structure for inspection in CI logs
+        run: dump.erofs /tmp/out.erofs
