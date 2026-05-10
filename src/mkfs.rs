@@ -38,8 +38,7 @@ use crate::inode::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOC
 use crate::layout::DataLayout;
 pub use crate::superblock::LzmaCfg;
 use crate::superblock::{
-    EROFS_FEATURE_INCOMPAT_COMPR_CFGS, EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_MAGIC_V1,
-    EROFS_SUPER_OFFSET,
+    EROFS_FEATURE_INCOMPAT_COMPR_CFGS, EROFS_SUPER_MAGIC_V1, EROFS_SUPER_OFFSET,
 };
 pub use crate::xattr::XattrLongPrefix;
 use crate::xattr::XATTR_HEADER_SIZE;
@@ -2105,17 +2104,25 @@ fn write_superblock(
     img[off + 0x5B] = xattr_prefix_count;
     img[off + 0x5C..off + 0x60].copy_from_slice(&xattr_prefix_start.to_le_bytes());
 
-    // feature_compat: advertise SB_CHKSUM and compute the CRC32C over the
-    // full 128-byte SB with the checksum field zero. The checksum is
-    // only validated by readers when this feature bit is set, so writers
-    // can opt in without breaking older readers. Convention conveyed by
-    // the public EROFS on-disk format documentation
-    // (https://erofs.docs.kernel.org/). The checksum field at 0x04..0x08
-    // is already zero (just initialized from the buffer); we compute,
-    // then write.
+    // feature_compat: advertise SB_CHKSUM and compute the CRC32C over
+    // the bytes from EROFS_SUPER_OFFSET to the end of the block that
+    // contains the SB, with the checksum field at 0x04..0x08 zeroed
+    // during the calculation. For the default 4 KiB block the SB lives
+    // in block 0 and the range is 3072 bytes (4096 - 1024); for
+    // smaller blocks the SB lives in a later block and the range is
+    // `block_size - (off % block_size)` bytes.
+    //
+    // Upstream erofs-utils (and the kernel verifier) uses CRC32C-
+    // Castagnoli with init=0xFFFFFFFF and NO final XOR-out; the
+    // `crc32c` crate computes the standard form (final XOR with
+    // 0xFFFFFFFF), so we undo that XOR to match. The checksum field
+    // is already zero in `img` here -- nothing has written into it --
+    // so we can compute over `img` directly without a temporary copy.
     img[off + 0x08..off + 0x0C].copy_from_slice(&EROFS_FEATURE_COMPAT_SB_CHKSUM.to_le_bytes());
-    let sb_bytes = &img[off..off + EROFS_SUPER_BLOCK_SIZE];
-    let csum = crc32c::crc32c(sb_bytes);
+    let block_size = 1usize << blkszbits;
+    let crc_len = block_size - off % block_size;
+    let sb_to_block_end = &img[off..off + crc_len];
+    let csum = crc32c::crc32c(sb_to_block_end) ^ 0xFFFF_FFFF;
     img[off + 0x04..off + 0x08].copy_from_slice(&csum.to_le_bytes());
 }
 
@@ -2292,59 +2299,24 @@ fn inode_nlink(n: &PlanNode, _idx: usize, plan: &[PlanNode]) -> u32 {
     }
 }
 
-/// Dirent name hash used as the EROFS dir-block sort key. EROFS uses a
-/// salt of 0; the canonical reader binary-searches dirents by this hash
-/// within each block, which means our writer MUST emit dirents in
-/// non-decreasing hash order or external readers will silently fail
-/// name lookups.
-///
-/// The algorithm (a classic byte-wise rotate-and-multiply mixer):
-/// ```text
-/// hash = 0                            // u64 accumulator
-/// for byte b in name:
-///     hash = (hash + (b << 4) + (b >> 4)) * 11
-/// return (hash ^ (hash >> 32)) as u32 // fold + truncate
-/// ```
-///
-/// Width note: the accumulator MUST be 64-bit so that the on-disk hash
-/// is byte-identical across host word sizes — the canonical writer is a
-/// 64-bit binary, the canonical reader compares against 64-bit-derived
-/// keys, and the final XOR-fold to u32 is what gets stored. A 32-bit
-/// accumulator would silently produce a different sort order and break
-/// kernel-mount name lookups.
-///
-/// Spec source: dentry hash convention described in the public EROFS
-/// directory-format documentation
-/// (<https://erofs.docs.kernel.org/en/latest/design.html#directory-format>).
-/// Independent implementation; algorithm reimplemented from public
-/// description, not derived from any GPL'd source.
-pub(crate) fn full_name_hash(name: &[u8]) -> u32 {
-    let mut h: u64 = 0; // init_name_hash(0)
-    for &b in name {
-        let c = b as u64;
-        h = h.wrapping_add(c << 4).wrapping_add(c >> 4).wrapping_mul(11);
-    }
-    // end_name_hash: fold top half into bottom and truncate to u32.
-    ((h ^ (h >> 32)) & 0xFFFF_FFFF) as u32
-}
-
 /// Pack a directory's entries into `block_size`-sized blocks. ".", ".."
-/// always anchor block 0; subsequent children are sorted by
-/// [`full_name_hash`] (kernel-mountable dirent order) and then greedily
-/// packed, overflowing into block 1, 2, ... as needed. Each block's
-/// dirent array is internally consistent (its own first nameoff = its
-/// array end), so the reader can iterate per-block.
+/// always anchor block 0; subsequent children are sorted byte-wise by
+/// name (`memcmp` order) and then greedily packed, overflowing into
+/// block 1, 2, ... as needed. Each block's dirent array is internally
+/// consistent (its own first nameoff = its array end), so the reader
+/// can iterate per-block.
 ///
-/// Why sort: the canonical EROFS reader does a binary search keyed by
-/// `full_name_hash` within each dir block. If our writer emitted
-/// alphabetical (or insertion) order, externally-mountable images would
-/// silently miss lookups whose hash ordering disagrees with
-/// alphabetical. Our own reader does linear scan and is unaffected, so
-/// the change is writer-only.
+/// Why byte-wise sort: upstream `fsck.erofs` enforces strict
+/// `strcmp`-ascending order on dirents within a block (errors out with
+/// "wrong dirent name order"), and the kernel `erofs_namei` lookup
+/// does a linear scan that requires the same order. Hash-keyed
+/// binary-search ordering does NOT exist in the on-disk format -- the
+/// `erofs_dirent` struct has no hash field; lookups are
+/// strcmp-based against the name table.
 ///
 /// Spec: `erofs_dirent` byte format in the public EROFS format header
-/// `erofs_fs.h`; hash algorithm description from the public dentry-hash
-/// documentation
+/// `erofs_fs.h`; ordering convention conveyed by the public EROFS
+/// directory-format documentation
 /// (<https://erofs.docs.kernel.org/en/latest/design.html#directory-format>).
 /// Independent implementation.
 fn encode_dir_blocks(
@@ -2362,9 +2334,10 @@ fn encode_dir_blocks(
     all.push((".".to_string(), parent_nid, ftype::DIR));
     all.push(("..".to_string(), parent_parent_nid, ftype::DIR));
 
-    // Sort the real children by full_name_hash. ".", ".." stay at indexes
-    // 0/1 by kernel convention; they're not part of the hash-sorted run
-    // (the kernel binary search starts at index 2 in the first block).
+    // Sort the real children byte-wise by name. ".", ".." stay at
+    // indexes 0/1 by EROFS convention; they're not part of the sorted
+    // run. fsck.erofs enforces strict strcmp-ascending order on the
+    // remaining entries within a block.
     let mut sorted_children: Vec<(String, u64, u8)> = children
         .iter()
         .map(|(name, child_idx)| {
@@ -2373,13 +2346,7 @@ fn encode_dir_blocks(
             (name.clone(), nids[*child_idx as usize], ft)
         })
         .collect();
-    sorted_children.sort_by(|a, b| {
-        full_name_hash(a.0.as_bytes())
-            .cmp(&full_name_hash(b.0.as_bytes()))
-            // Stable secondary key on raw name keeps test ordering
-            // deterministic when two names hash to the same bucket.
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    sorted_children.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     all.extend(sorted_children);
 
     let mut out: Vec<Vec<u8>> = Vec::new();
@@ -3601,14 +3568,12 @@ mod tests {
         format!("{h:016x}")
     }
 
-    // --- W4: hash-sorted dirents + SB CRC32C checksum --------------------
+    // --- W4: byte-wise-sorted dirents + SB CRC32C checksum ---------------
 
     #[test]
-    fn dirents_sorted_by_hash_within_block() {
-        // Four names whose alphabetical and full_name_hash orders disagree.
-        // We don't pre-compute the exact hashes here — the assertion just
-        // verifies that whatever order the writer emits is non-decreasing
-        // by full_name_hash for the real children (skipping ".", "..").
+    fn dirents_sorted_byte_wise_within_block() {
+        // Names fed in non-alphabetical order so the assertion catches a
+        // regression to insertion order.
         let img = build_image(
             dir(vec![
                 ("zebra", file(b"z")),
@@ -3620,9 +3585,8 @@ mod tests {
         )
         .unwrap();
 
-        // The root dir block sits at the first data block. We can find it
-        // via the reader: read root inode, get raw_blkaddr, fetch that
-        // block, and parse the dirent array.
+        // Walk the root dir block: read root inode, get raw_blkaddr,
+        // fetch that block, parse the dirent array.
         let fs = open(img.clone());
         let root = fs.root_inode().unwrap();
         let bs = fs.superblock().block_size() as usize;
@@ -3630,56 +3594,25 @@ mod tests {
         let block = &img[blk_off..blk_off + bs];
         let entries = crate::dir::iter_block(block).unwrap();
 
-        // First two entries must be ".", ".." per kernel convention.
+        // First two entries must be ".", ".." per EROFS convention.
         assert_eq!(entries[0].name, b".");
         assert_eq!(entries[1].name, b"..");
 
-        // The remaining entries (real children) must be in
-        // non-decreasing full_name_hash order.
-        let mut last_hash: Option<u32> = None;
-        for e in &entries[2..] {
-            let h = full_name_hash(&e.name);
-            if let Some(prev) = last_hash {
-                assert!(
-                    prev <= h,
-                    "dirent {:?} (hash {:#x}) comes after hash {:#x}",
-                    String::from_utf8_lossy(&e.name),
-                    h,
-                    prev
-                );
-            }
-            last_hash = Some(h);
+        // Remaining entries (real children) must be in strict
+        // byte-wise ascending order; fsck.erofs enforces this and
+        // errors out with "wrong dirent name order" otherwise.
+        let names: Vec<&[u8]> = entries[2..].iter().map(|e| e.name.as_slice()).collect();
+        for w in names.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "dirent {:?} should come before {:?}",
+                String::from_utf8_lossy(w[0]),
+                String::from_utf8_lossy(w[1])
+            );
         }
-
-        // And the order should NOT be the alphabetical order we fed in:
-        // if alphabetical happened to match hash order for these specific
-        // names the test would still pass on the hash-monotonic check
-        // above, but we want to guard against a regression where the
-        // sort silently no-ops. Pick names whose alphabetical and hash
-        // orders genuinely diverge by checking at least one inversion.
-        let names_in_order: Vec<&[u8]> = entries[2..].iter().map(|e| e.name.as_slice()).collect();
-        let mut alpha = names_in_order.clone();
-        alpha.sort();
-        // It's still possible (extremely rarely) for the two orders to
-        // coincide. Treat that as a soft test: we only require the hash
-        // monotonicity above; the differing-from-alpha check is a sanity
-        // observation, not a hard assertion.
-        let _coincides = names_in_order == alpha;
-    }
-
-    #[test]
-    fn full_name_hash_matches_known_property() {
-        // The hash for an empty name is 0 (the salt) -> end_name_hash(0) == 0.
-        assert_eq!(full_name_hash(b""), 0);
-        // Different names should generally hash differently. Sanity: at
-        // least the four we use in the sort test shouldn't all collide.
-        let names: &[&[u8]] = &[b"apple", b"banana", b"mango", b"zebra"];
-        let hashes: std::collections::BTreeSet<u32> =
-            names.iter().map(|n| full_name_hash(n)).collect();
         assert_eq!(
-            hashes.len(),
-            names.len(),
-            "full_name_hash collided across simple test names"
+            names,
+            vec![&b"apple"[..], &b"banana"[..], &b"mango"[..], &b"zebra"[..]],
         );
     }
 
@@ -3694,31 +3627,37 @@ mod tests {
         )
         .unwrap();
 
-        // Pull the 128-byte SB out of the raw image and verify the
-        // checksum field via the recompute-with-zeroed-csum convention.
+        // Pull the SB-to-block-end slice out of the raw image and verify
+        // the checksum field via the recompute-with-zeroed-csum
+        // convention. EROFS computes CRC32C over `block_size - 1024`
+        // bytes (3072 for the default 4 KiB block) with init=~0 and no
+        // final XOR-out -- the `crc32c` crate's standard final XOR is
+        // undone with `^ 0xFFFFFFFF`.
         let off = EROFS_SUPER_OFFSET as usize;
-        let sb_bytes: [u8; 128] = img[off..off + 128].try_into().unwrap();
-        let stored_csum = u32::from_le_bytes(sb_bytes[0x04..0x08].try_into().unwrap());
+        let block_size: usize = 1 << 12;
+        let raw: Vec<u8> = img[off..block_size].to_vec();
+        let stored_csum = u32::from_le_bytes(raw[0x04..0x08].try_into().unwrap());
 
-        let mut tmp = sb_bytes;
+        let mut tmp = raw.clone();
         tmp[0x04..0x08].fill(0);
-        let recomputed = crc32c::crc32c(&tmp);
+        let recomputed = crc32c::crc32c(&tmp) ^ 0xFFFF_FFFF;
         assert_eq!(stored_csum, recomputed, "SB checksum mismatch");
 
         // The compat-bit MUST be set (writer advertises SB_CHKSUM).
-        let feature_compat = u32::from_le_bytes(sb_bytes[0x08..0x0C].try_into().unwrap());
+        let feature_compat = u32::from_le_bytes(raw[0x08..0x0C].try_into().unwrap());
         assert_eq!(feature_compat & 0x0000_0001, 0x0000_0001);
 
         // Reader-side helper agrees.
         let fs = open(img);
         let sb = fs.superblock();
-        assert!(sb.verify_checksum(&sb_bytes));
+        assert!(sb.verify_checksum(&raw));
     }
 
     #[test]
     fn superblock_verify_checksum_detects_tampering() {
         let img = build_image(dir(vec![("a.txt", file(b"hello\n"))]), 12).unwrap();
         let off = EROFS_SUPER_OFFSET as usize;
+        let block_size: usize = 1 << 12;
 
         // Tamper one byte AFTER the checksum field — verify_checksum
         // must return false now that the recomputed CRC differs.
@@ -3726,8 +3665,8 @@ mod tests {
         tampered[off + 0x10] ^= 0xFF;
         let fs = open(img.clone());
         let sb = fs.superblock();
-        assert!(sb.verify_checksum(&img[off..off + 128]));
-        assert!(!sb.verify_checksum(&tampered[off..off + 128]));
+        assert!(sb.verify_checksum(&img[off..block_size]));
+        assert!(!sb.verify_checksum(&tampered[off..block_size]));
     }
 
     // --- W5: BuildOptions writer extensions ------------------------------

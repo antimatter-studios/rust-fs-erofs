@@ -215,31 +215,37 @@ impl Superblock {
     /// `true` if `EROFS_FEATURE_COMPAT_SB_CHKSUM` is clear (no checksum
     /// to verify) OR the recomputed CRC32C matches `self.checksum`.
     ///
-    /// The CRC is computed over the 128-byte SB with the 4-byte checksum
-    /// field at offset 0x04..0x08 zeroed for the calculation. Callers
-    /// pass `raw_sb` -- the exact 128 bytes read from
-    /// `EROFS_SUPER_OFFSET`. We deliberately don't gate `parse` on this
-    /// (older mkfs.erofs images don't set the bit) -- it's an opt-in
-    /// integrity check.
+    /// `raw_sb_to_block_end` must be the bytes from `EROFS_SUPER_OFFSET`
+    /// (i.e. SB start) up to the end of block 0 -- length
+    /// `block_size - EROFS_SUPER_OFFSET`, which is 3072 for the default
+    /// 4 KiB block. Shorter slices return `false`. We deliberately
+    /// don't gate `parse` on this (older mkfs.erofs images don't set
+    /// the bit) -- it's an opt-in integrity check.
     ///
-    /// Algorithm: CRC32C (Castagnoli, RFC 3720) over the 128-byte
-    /// superblock with the 4-byte checksum field at offset 0x04..0x08
-    /// treated as zero during the calculation. Conveyed by the public
-    /// EROFS on-disk format documentation
+    /// Algorithm: CRC32C (Castagnoli, RFC 3720) over the SB-to-block-end
+    /// range with the 4-byte checksum field at offset 0x04..0x08
+    /// treated as zero during the calculation. Upstream erofs-utils +
+    /// the kernel verifier use init=0xFFFFFFFF and NO final XOR-out;
+    /// the `crc32c` crate computes the standard form (final XOR with
+    /// 0xFFFFFFFF), so we undo that XOR here. Range + algorithm
+    /// match what fsck.erofs / kernel super.c enforce. Conveyed by the
+    /// public EROFS on-disk format documentation
     /// (<https://erofs.docs.kernel.org/en/latest/design.html>).
     /// Independent implementation.
-    pub fn verify_checksum(&self, raw_sb: &[u8]) -> bool {
+    pub fn verify_checksum(&self, raw_sb_to_block_end: &[u8]) -> bool {
         if self.feature_compat & EROFS_FEATURE_COMPAT_SB_CHKSUM == 0 {
             return true;
         }
-        if raw_sb.len() < EROFS_SUPER_BLOCK_SIZE {
+        let block_size = 1usize << self.blkszbits;
+        let off = EROFS_SUPER_OFFSET as usize;
+        let want_len = block_size - off % block_size;
+        if raw_sb_to_block_end.len() < want_len {
             return false;
         }
-        let mut tmp = [0u8; EROFS_SUPER_BLOCK_SIZE];
-        tmp.copy_from_slice(&raw_sb[..EROFS_SUPER_BLOCK_SIZE]);
+        let mut tmp = raw_sb_to_block_end[..want_len].to_vec();
         // Zero the checksum field for recomputation.
         tmp[0x04..0x08].fill(0);
-        crc32c::crc32c(&tmp) == self.checksum
+        (crc32c::crc32c(&tmp) ^ 0xFFFF_FFFF) == self.checksum
     }
 }
 
