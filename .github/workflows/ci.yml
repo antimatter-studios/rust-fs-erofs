@@ -27,12 +27,27 @@ jobs:
           components: rustfmt, clippy
       # erofs-utils provides mkfs.erofs / fsck.erofs / dump.erofs — the
       # oracle binaries the #[ignore]-gated round-trip and oracle_compat
-      # tests shell out to. `attr` provides setfattr/getfattr for the
-      # xattr oracle paths.
-      - name: Install erofs-utils + attr (oracle binaries)
+      # tests shell out to. ubuntu-latest's apt erofs-utils is 1.7.1
+      # which predates variable block-size + the dump.erofs "Filesystem
+      # blocksize:" line our writer tests assert against, so we
+      # source-build 1.9.1 instead. `attr` provides setfattr/getfattr
+      # for the xattr oracle paths.
+      - name: Install erofs-utils 1.9.1 from source + attr
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq erofs-utils attr
+          sudo apt-get install -y -qq \
+            attr \
+            autoconf automake libtool pkg-config \
+            uuid-dev libselinux1-dev liblz4-dev liblzma-dev libzstd-dev zlib1g-dev
+          curl -sSL https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-1.9.1.tar.gz | tar -xz
+          cd erofs-utils-1.9.1
+          ./autogen.sh
+          ./configure --enable-fuse=no
+          make -j"$(nproc)"
+          sudo make install
+          mkfs.erofs --version | head -1
+          fsck.erofs --version | head -1
+          dump.erofs --version | head -1
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -69,10 +84,22 @@ jobs:
         run: git clone --depth 1 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Install erofs-utils
+      # Same 1.9.1-from-source path as the test job: apt's 1.7.1 is too
+      # old to print "Filesystem blocksize:" and rejects images with
+      # variable block sizes that our writer can produce.
+      - name: Install erofs-utils 1.9.1 from source
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq erofs-utils
+          sudo apt-get install -y -qq \
+            autoconf automake libtool pkg-config \
+            uuid-dev libselinux1-dev liblz4-dev liblzma-dev libzstd-dev zlib1g-dev
+          curl -sSL https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-1.9.1.tar.gz | tar -xz
+          cd erofs-utils-1.9.1
+          ./autogen.sh
+          ./configure --enable-fuse=no
+          make -j"$(nproc)"
+          sudo make install
+          fsck.erofs --version | head -1
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
