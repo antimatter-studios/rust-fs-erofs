@@ -1567,12 +1567,28 @@ fn our_writer_image_kernel_mountable() {
         .output()
         .expect("spawn mount");
     if !mount.status.success() {
-        // Surface stderr for diagnosis; this is the load-bearing
-        // failure mode we want operators to see.
+        let stderr = String::from_utf8_lossy(&mount.stderr);
+        // Skip rather than fail when the harness lacks the privileges
+        // this test needs. GitHub Actions ubuntu runners run unprivileged
+        // and can't `losetup` -- exit 32 with "failed to setup loop
+        // device" or "Permission denied" or "must be superuser" comes
+        // from that, not from a writer bug.
+        let no_priv = stderr.contains("setup loop device")
+            || stderr.contains("Permission denied")
+            || stderr.contains("must be superuser")
+            || stderr.contains("Operation not permitted");
+        if no_priv {
+            eprintln!(
+                "skipping: harness lacks mount privileges (need root + loop module); stderr: {}",
+                stderr.trim()
+            );
+            return;
+        }
+        // Otherwise it's a writer bug -- surface stderr for diagnosis.
         panic!(
             "kernel mount of our writer's EROFS image FAILED:\n  exit: {:?}\n  stderr: {}\n  stdout: {}",
             mount.status.code(),
-            String::from_utf8_lossy(&mount.stderr),
+            stderr,
             String::from_utf8_lossy(&mount.stdout)
         );
     }
