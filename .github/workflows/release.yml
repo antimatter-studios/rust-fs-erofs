@@ -1,0 +1,108 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned tag of the sibling am-fs-core repo used to satisfy the path dep
+  # during local build/verify. Bump in lockstep with the am-fs-core version
+  # constraint in Cargo.toml when releasing a new fs-erofs minor.
+  FS_CORE_REF: v0.2.2
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The crate has a path dep on am-fs-core (../rust-fs-core). Clone the
+      # sibling repo alongside, pinned to FS_CORE_REF, so cargo resolves it.
+      # Anonymous HTTPS clone — rust-fs-core is public.
+      - name: clone am-fs-core sibling
+        shell: bash
+        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate_ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"(.*)"/\1/')
+          if [ "$tag" != "$crate_ver" ]; then
+            echo "tag $tag does not match Cargo.toml version $crate_ver" >&2
+            exit 1
+          fi
+
+      # erofs-utils provides mkfs.erofs / fsck.erofs / dump.erofs — the
+      # oracle binaries the #[ignore]-gated round-trip and oracle_compat
+      # tests shell out to. ubuntu-latest's apt erofs-utils is 1.7.1 which
+      # predates variable block-size + the dump.erofs "Filesystem
+      # blocksize:" line our writer tests assert against, so we source-build
+      # 1.9.1 instead (same path as ci.yml). `attr` provides setfattr /
+      # getfattr for the xattr oracle paths.
+      - name: install erofs-utils 1.9.1 from source + attr
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            attr \
+            autoconf automake libtool pkg-config \
+            uuid-dev libselinux1-dev liblz4-dev liblzma-dev libzstd-dev zlib1g-dev
+          curl -sSL https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-1.9.1.tar.gz | tar -xz
+          cd erofs-utils-1.9.1
+          ./autogen.sh
+          ./configure --enable-fuse=no
+          make -j"$(nproc)"
+          sudo make install
+          mkfs.erofs --version | head -1
+          fsck.erofs --version | head -1
+          dump.erofs --version | head -1
+
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      # Oracle tests are #[ignore]-gated so a fresh checkout without
+      # erofs-utils still passes `cargo test`. The oracle is installed
+      # above, so opt them in here — this is the canonical "does the
+      # kernel-shipped tooling accept what we emit / can we read what it
+      # emits" gate, the strongest signal the release artifact is sound.
+      - run: cargo test --all-targets -- --ignored
+
+  publish:
+    name: publish to crates.io
+    needs: test
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: clone am-fs-core sibling
+        shell: bash
+        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: rust-lang/crates-io-auth-action@v1.0.4
+        id: auth
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        # No `--locked`: publish must rewrite the `am-fs-core` path
+        # dependency into its registry equivalent in the packaged
+        # lockfile, which `--locked` forbids ("cannot update the lock
+        # file"). The verify-build resolves am-fs-core from crates.io via
+        # the `version` constraint, so the published artifact is pinned by
+        # that constraint, not by the local path checkout.
+        run: cargo publish
