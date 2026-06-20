@@ -15,7 +15,7 @@ name = "mkfs_erofs"
 path = "src/bin/mkfs_erofs.rs"
 
 [dependencies]
-am-fs-core = { path = "../rust-fs-core", version = "0.1" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2" }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 lzma-rs = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
