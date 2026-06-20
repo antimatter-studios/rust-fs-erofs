@@ -392,23 +392,50 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     }
     let bs: u64 = 1u64 << blkszbits;
 
-    // The COMPR_CFGS blob (when present) influences how the LZMA encoder
-    // synthesises its on-disk header — we patch the in-stream
-    // `dict_size` field to match what we'll advertise in the blob,
-    // because lzma-rs has no knob for it. Other codecs ignore the
-    // override.
-    let lzma_dict_size_override: Option<u32> = options
-        .compr_cfgs
-        .as_ref()
-        .and_then(|c| c.lzma.as_ref())
-        .map(|cfg| cfg.dict_size);
-
     // Pass 1: flatten + per-inode body planning (size, xattrs, inline tail,
     // chunkmap). Mutates the tree in place to record FlatInline vs FlatPlain
     // file layout.
     let mut plan: Vec<PlanNode> = Vec::new();
     flatten(root, 0, &mut plan)?;
     plan[0].parent_idx = 0;
+
+    // Detect which non-LZ4 codecs the tree actually uses. LZ4
+    // (algorithmtype 0) is the implicit default and needs no
+    // declaration; LZMA / DEFLATE / ZSTD MUST be advertised in
+    // `available_compr_algs` + the COMPR_CFGS blob, or fsck.erofs
+    // rejects the image with "inconsistent algorithmtype N". This drives
+    // automatic COMPR_CFGS emission even when the caller didn't supply
+    // an explicit `options.compr_cfgs`.
+    let mut used_lzma = false;
+    let mut used_deflate = false;
+    for node in &plan {
+        if let PlanKind::Compressed { algo, .. } = &node.kind {
+            match algo {
+                CompressedAlgo::Lz4 => {}
+                CompressedAlgo::Lzma => used_lzma = true,
+                CompressedAlgo::Deflate => used_deflate = true,
+            }
+        }
+    }
+
+    // The COMPR_CFGS blob (when present) influences how the LZMA encoder
+    // synthesises its on-disk header — we patch the in-stream
+    // `dict_size` field to match what we'll advertise in the blob,
+    // because lzma-rs has no knob for it. Other codecs ignore the
+    // override. An explicit `options.compr_cfgs` LZMA dict_size wins;
+    // otherwise, when LZMA is auto-detected, we pin both the in-stream
+    // header and the advertised cfg to the LZMA1 default (1 << 24) so
+    // the two always agree.
+    let lzma_dict_size_override: Option<u32> = options
+        .compr_cfgs
+        .as_ref()
+        .and_then(|c| c.lzma.as_ref())
+        .map(|cfg| cfg.dict_size)
+        .or(if used_lzma {
+            Some(LzmaCfg::default().dict_size)
+        } else {
+            None
+        });
 
     let mut bodies: Vec<InodeBody> = Vec::with_capacity(plan.len());
     for node in &mut plan {
@@ -576,18 +603,43 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     // Spec: layout described in the public EROFS on-disk-format
     // documentation; per-codec struct layouts from the public
     // `erofs_fs.h` constants. Independent implementation.
+    //
+    // The set of codecs to declare is the union of (a) the codecs an
+    // inode actually references (`used_lzma` / `used_deflate`, detected
+    // above) and (b) any codecs the caller pinned via
+    // `options.compr_cfgs`. A caller-supplied per-codec record wins for
+    // its parameters; auto-detected codecs fall back to the codec
+    // defaults that match native `mkfs.erofs` output (LZMA dict_size
+    // = 1 << 24, DEFLATE windowbits = 15). LZ4 (algorithmtype 0) is the
+    // implicit default and is only declared when the caller explicitly
+    // asks for it.
+    let cfg = options.compr_cfgs.as_ref();
+    let lz4_cfg: Option<u16> = cfg.and_then(|c| c.lz4);
+    let lzma_cfg: Option<LzmaCfg> = cfg.and_then(|c| c.lzma).or(if used_lzma {
+        Some(LzmaCfg::default())
+    } else {
+        None
+    });
+    let deflate_cfg: Option<u8> = cfg.and_then(|c| c.deflate).or(if used_deflate {
+        // 15 == max DEFLATE window (32 KiB); what native mkfs.erofs
+        // advertises and what flate2's default encoder produces.
+        Some(15)
+    } else {
+        None
+    });
+
     let mut sb_u1: u16 = 0;
     let mut compr_cfgs_bytes: Vec<u8> = Vec::new();
-    if let Some(cfg) = options.compr_cfgs.as_ref() {
+    if lz4_cfg.is_some() || lzma_cfg.is_some() || deflate_cfg.is_some() {
         feature_incompat |= EROFS_FEATURE_INCOMPAT_COMPR_CFGS;
-        if let Some(max_distance) = cfg.lz4 {
+        if let Some(max_distance) = lz4_cfg {
             sb_u1 |= 1 << 0; // Z_EROFS_COMPRESSION_LZ4_BIT
                              // LZ4 record: __le16 max_distance; __le16 max_pcluster_blks;
             compr_cfgs_bytes.extend_from_slice(&4u16.to_le_bytes());
             compr_cfgs_bytes.extend_from_slice(&max_distance.to_le_bytes());
             compr_cfgs_bytes.extend_from_slice(&0u16.to_le_bytes()); // max_pcluster_blks
         }
-        if let Some(lzma) = cfg.lzma {
+        if let Some(lzma) = lzma_cfg {
             sb_u1 |= 1 << 1; // Z_EROFS_COMPRESSION_LZMA_BIT
                              // LZMA record: __le32 dict_size; __le16 format; u8 reserved[8];
             compr_cfgs_bytes.extend_from_slice(&14u16.to_le_bytes());
@@ -595,7 +647,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
             compr_cfgs_bytes.extend_from_slice(&0u16.to_le_bytes()); // format
             compr_cfgs_bytes.extend_from_slice(&[0u8; 8]); // reserved
         }
-        if let Some(window_bits) = cfg.deflate {
+        if let Some(window_bits) = deflate_cfg {
             sb_u1 |= 1 << 2; // Z_EROFS_COMPRESSION_DEFLATE_BIT
                              // DEFLATE record: u8 windowbits; u8 reserved[5];
             compr_cfgs_bytes.extend_from_slice(&6u16.to_le_bytes());
