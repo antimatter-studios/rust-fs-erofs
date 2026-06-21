@@ -1,5 +1,6 @@
 /target
-Cargo.lock
+# Cargo.lock is committed: reproducible, locked dependency resolution for
+# the build/test/clippy gates (cargo … --locked). Do not re-ignore.
 *.img
 *audit*
 .history

@@ -67,14 +67,14 @@ jobs:
           fsck.erofs --version | head -1
           dump.erofs --version | head -1
 
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
       # Oracle tests are #[ignore]-gated so a fresh checkout without
       # erofs-utils still passes `cargo test`. The oracle is installed
       # above, so opt them in here — this is the canonical "does the
       # kernel-shipped tooling accept what we emit / can we read what it
       # emits" gate, the strongest signal the release artifact is sound.
-      - run: cargo test --all-targets -- --ignored
+      - run: cargo test --locked --all-targets -- --ignored
 
   publish:
     name: publish to crates.io

@@ -20,7 +20,7 @@ jobs:
       # Clone the sibling repo alongside so cargo can resolve it.
       # Anonymous HTTPS clone — rust-fs-core is public.
       - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: git clone --depth 1 --branch v0.2.2 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -57,12 +57,12 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --release
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --release
       # Oracle tests are #[ignore]-gated so a fresh checkout without
       # erofs-utils still passes `cargo test`. CI installed the oracle
       # above, so we opt them in here.
-      - run: cargo test --release -- --ignored
+      - run: cargo test --locked --release -- --ignored
 
   # Validate the mkfs_erofs CLI binary's output by running upstream's
   # fsck.erofs (from erofs-utils) against an image we generated. This is
@@ -81,7 +81,7 @@ jobs:
       # The crate has a path dep on am-fs-core (../rust-fs-core).
       # Clone the sibling repo alongside so cargo can resolve it.
       - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: git clone --depth 1 --branch v0.2.2 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       # Same 1.9.1-from-source path as the test job: apt's 1.7.1 is too
@@ -109,7 +109,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-mkfs-${{ hashFiles('**/Cargo.lock') }}
       - name: Build mkfs_erofs
-        run: cargo build --release --bin mkfs_erofs
+        run: cargo build --locked --release --bin mkfs_erofs
       - name: Build a small source tree, mkfs it, validate with fsck.erofs
         run: |
           src=/tmp/src
