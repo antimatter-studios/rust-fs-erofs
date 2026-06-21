@@ -1,6 +1,6 @@
 [package]
 name = "am-fs-erofs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust EROFS (Enhanced Read-Only File System) reader and writer. Clean-room implementation; reads everything mkfs.erofs 1.9 emits (LZ4/LZMA/DEFLATE, compacted-2B, ztailpacking, fragments, big_pcluster) and produces fsck.erofs-clean output."
