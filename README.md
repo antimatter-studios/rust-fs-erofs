@@ -2,7 +2,7 @@
 
 A pure-Rust, clean-room implementation of the **EROFS** (Enhanced Read-Only File System) on-disk format. Reads and writes images that the Linux kernel's EROFS driver and `erofs-utils` toolchain accept byte-for-byte.
 
-The repository ships one library crate (published on crates.io as `am-fs-erofs`, library name `fs_erofs`) plus the `mkfs_erofs` CLI binary.
+The repository ships one library crate (published on crates.io as `fs-erofs`, library name `fs_erofs`) plus the `mkfs_erofs` CLI binary.
 
 - **Reader**: every EROFS feature emitted by `mkfs.erofs` 1.9 + AOSP build systems
 - **Writer (`mkfs_erofs`)**: produces images `fsck.erofs` accepts as valid
@@ -90,14 +90,14 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 
 ```toml
 [dependencies]
-am-fs-erofs = "0.1"
+fs-erofs = "0.1"
 ```
 
 ### From source (workspace path-dep)
 
 ```toml
 [dependencies]
-am-fs-erofs = { path = "../rust-fs-erofs" }
+fs-erofs = { path = "../rust-fs-erofs" }
 am-fs-core = { path = "../rust-fs-core" }
 ```
 
@@ -269,7 +269,7 @@ Issues + PRs welcome. Before opening:
 | Crate | License | Purpose |
 |---|---|---|
 | [`am-fs-core`](https://crates.io/crates/am-fs-core) | MIT | Block-device traits (`BlockRead`, `FileDevice`, slice adapters) |
-| [`am-fs-erofs`](https://crates.io/crates/am-fs-erofs) (this) | MIT | EROFS read + write |
+| [`fs-erofs`](https://crates.io/crates/fs-erofs) (this) | MIT | EROFS read + write |
 | [`am-fs-ext4`](https://crates.io/crates/am-fs-ext4) | MIT | ext4 read + write (sister project) |
 
 ## Acknowledgements

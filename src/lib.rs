@@ -34,6 +34,9 @@ pub mod superblock;
 pub mod xattr;
 pub mod zmap;
 
+// C ABI exports — surface defined in `include/fs_erofs.h`.
+pub mod capi;
+
 pub use acl::{AclEntry, AclPerm, AclTag};
 pub use chunked::{ChunkInfo, EROFS_NULL_ADDR};
 pub use decompress::{decompress, decompress_with_config, Algorithm};
