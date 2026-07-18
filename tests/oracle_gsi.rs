@@ -265,7 +265,7 @@ fn open_and_walk_gsi() {
         eprintln!(
             "gsi: build.prop at {bp_path}, {} bytes, head: {:?}",
             inode.size,
-            &text.lines().next().unwrap_or("")
+            text.lines().next().unwrap_or("")
         );
     } else {
         eprintln!(
