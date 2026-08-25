@@ -41,6 +41,7 @@ use fs_core::BlockRead;
 const EIO: c_int = 5;
 const ENOENT: c_int = 2;
 const ENOTDIR: c_int = 20;
+const EACCES: c_int = 13;
 const EINVAL: c_int = 22;
 const ERANGE: c_int = 34;
 
@@ -240,6 +241,23 @@ fn mount_from_device(dev: Arc<dyn BlockRead>, context: &str) -> *mut fs_erofs_fs
 // Lifecycle
 // ===========================================================================
 
+/// Map a device-open failure onto the errno a caller can act on.
+///
+/// Only the cases a caller can actually do something about are
+/// distinguished; anything else stays EIO, which is the honest answer for
+/// "this device did not work and you cannot fix it by changing the path".
+fn errno_for_open_failure(e: &fs_core::Error) -> c_int {
+    use std::io::ErrorKind;
+    match e {
+        fs_core::Error::Io(io) => match io.kind() {
+            ErrorKind::NotFound => ENOENT,
+            ErrorKind::PermissionDenied => EACCES,
+            _ => EIO,
+        },
+        _ => EIO,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn fs_erofs_mount(device_path: *const c_char) -> *mut fs_erofs_fs_t {
     ffi_guard(
@@ -254,7 +272,12 @@ pub unsafe extern "C" fn fs_erofs_mount(device_path: *const c_char) -> *mut fs_e
             let dev = match fs_core::FileDevice::open(path) {
                 Ok(d) => Arc::new(d) as Arc<dyn BlockRead>,
                 Err(e) => {
-                    set_err_msg(&format!("open {path}: {e}"), EIO);
+                    // Report what actually went wrong. A caller
+                    // distinguishes "that path is not there" from "this
+                    // media is damaged" only by the errno, and reporting
+                    // EIO for a mistyped path sends a user looking for a
+                    // hardware fault that does not exist.
+                    set_err_msg(&format!("open {path}: {e}"), errno_for_open_failure(&e));
                     return std::ptr::null_mut();
                 }
             };
