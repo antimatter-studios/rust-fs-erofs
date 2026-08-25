@@ -1352,7 +1352,7 @@ fn synthetic_legacy_big_pcluster_two_block_round_trip() {
     img[file_off + 6..file_off + 8].copy_from_slice(&1u16.to_le_bytes()); // nlink
     img[file_off + 8..file_off + 12].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     // raw_blkaddr (i_u for compressed inodes carries `compressed_blocks`).
-    img[file_off + 16..file_off + 20].copy_from_slice(&(blocks as u32).to_le_bytes());
+    img[file_off + 16..file_off + 20].copy_from_slice(&blocks.to_le_bytes());
 
     // ZMap header at file_off + 32 (= body_end for compact 32-byte
     // inode with zero xattrs).
@@ -1382,7 +1382,7 @@ fn synthetic_legacy_big_pcluster_two_block_round_trip() {
                                                                         // delta[0] (low 16): CBLKCNT marker | blocks. delta[1] (high 16):
                                                                         // 3 (forward distance to next HEAD; no next HEAD here, so any
                                                                         // value would do — we pick 3 to mirror what mkfs.erofs emits).
-    let cblkcnt_lo: u32 = 0x0800u32 | (blocks as u32);
+    let cblkcnt_lo: u32 = 0x0800u32 | blocks;
     let u_raw_nh1: u32 = cblkcnt_lo | (3u32 << 16);
     img[nh1_off + 4..nh1_off + 8].copy_from_slice(&u_raw_nh1.to_le_bytes());
     let nh2_off = idx_off + 16;
