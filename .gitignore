@@ -12,3 +12,10 @@
 tests/fixtures/*.img
 tests/fixtures/*.tar*
 tests/fixtures/*.zip
+
+# chore fingerprint cache (sources:/generates: checksums). Derived data.
+.chore/
+
+# Build output. `chore staticlib` writes the archive and headers here for a
+# consumer to copy out of (`chore artifact` prints this directory).
+/dist/
