@@ -19,3 +19,4 @@ tests/fixtures/*.zip
 # Build output. `chore staticlib` writes the archive and headers here for a
 # consumer to copy out of (`chore artifact` prints this directory).
 /dist/
+.DS_Store
