@@ -443,42 +443,24 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         bodies.push(body);
     }
 
-    // Pass 2: lay out NIDs in 32-byte slots. Each inode body + its
-    // trailers (xattrs, inline tail, chunkmap) consumes contiguous bytes
-    // in the metadata area; the next inode's NID is the next 32-byte
-    // slot boundary.
+    // Pass 2: lay out the metadata area. Each inode body + its trailers
+    // (xattrs, inline tail, chunkmap, zmap) consumes contiguous bytes;
+    // `plan_meta_layout` owns the placement rules and is the single walk
+    // of that area. The NIDs below and the write addresses used by the
+    // emission loop further down are both read out of the same slots.
     let meta_blkaddr: u32 = SB_AREA_END
         .div_ceil(bs)
         .try_into()
         .map_err(|_| Error::BadSuperblock("meta_blkaddr overflow"))?;
     let meta_byte_base = meta_blkaddr as u64 * bs;
 
-    let mut nids: Vec<u64> = Vec::with_capacity(plan.len());
-    let mut meta_cursor: u64 = 0;
-    for body in &bodies {
-        if !meta_cursor.is_multiple_of(COMPACT_INODE_SIZE) {
-            meta_cursor = meta_cursor.div_ceil(COMPACT_INODE_SIZE) * COMPACT_INODE_SIZE;
-        }
-        // Spec invariant: an inode body together with its inline xattrs,
-        // FLAT_INLINE tail and chunkmap MUST live in a single block. If the
-        // combined size won't fit in the remainder of the current metadata
-        // block, advance the cursor to the next block so we re-anchor at
-        // a fresh block boundary. (FLAT_PLAIN inodes without inline tails
-        // tolerate crossings, but it's simplest to enforce the same rule
-        // for everything.)
-        let trailers = body.xattr_bytes.len() as u64
-            + body.inline_tail.len() as u64
-            + body.chunkmap_bytes
-            + body.zmap_bytes;
-        let total = body.body_size + trailers;
-        let block_off = meta_cursor % bs;
-        if trailers > 0 && block_off + total > bs {
-            meta_cursor = meta_cursor.div_ceil(bs) * bs;
-        }
-        nids.push(meta_cursor / COMPACT_INODE_SIZE);
-        meta_cursor += total;
-    }
-    let meta_total_bytes = meta_cursor.div_ceil(COMPACT_INODE_SIZE) * COMPACT_INODE_SIZE;
+    let meta_slots = plan_meta_layout(&bodies, bs);
+    let nids: Vec<u64> = meta_slots.iter().map(MetaSlot::nid).collect();
+    let meta_total_bytes = meta_slots
+        .last()
+        .map_or(0, MetaSlot::end)
+        .div_ceil(COMPACT_INODE_SIZE)
+        * COMPACT_INODE_SIZE;
     let meta_blocks = meta_total_bytes.div_ceil(bs);
 
     // Pass 3: pack each directory's entries into block-sized chunks. The
@@ -736,25 +718,13 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         xattr_prefix_start_div4,
     );
 
-    // Inodes + their inline trailers. The cursor logic must MIRROR the
-    // pass-2 layout loop above (including the block-fit skip) or the
-    // bytes will land at addresses different from the NIDs we recorded.
-    let mut meta_cursor: u64 = 0;
-    for (i, body) in bodies.iter().enumerate() {
-        if !meta_cursor.is_multiple_of(COMPACT_INODE_SIZE) {
-            meta_cursor = meta_cursor.div_ceil(COMPACT_INODE_SIZE) * COMPACT_INODE_SIZE;
-        }
-        let trailers = body.xattr_bytes.len() as u64
-            + body.inline_tail.len() as u64
-            + body.chunkmap_bytes
-            + body.zmap_bytes;
-        let total = body.body_size + trailers;
-        let block_off = meta_cursor % bs;
-        if trailers > 0 && block_off + total > bs {
-            meta_cursor = meta_cursor.div_ceil(bs) * bs;
-        }
-        let nid = nids[i];
-        debug_assert_eq!(meta_cursor / COMPACT_INODE_SIZE, nid);
+    // Inodes + their inline trailers. Every address here comes out of
+    // the pass-2 layout, so an inode's bytes land at exactly the address
+    // its recorded NID names — there is no second cursor walk that could
+    // fall out of step with the first.
+    for (i, (body, slot)) in bodies.iter().zip(&meta_slots).enumerate() {
+        let nid = slot.nid();
+        let mut meta_cursor = slot.start;
         let inode_off = (meta_byte_base + meta_cursor) as usize;
         let inode_buf = encode_inode(
             &plan[i],
@@ -784,7 +754,11 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         if body.chunkmap_bytes > 0 {
             let off = (meta_byte_base + meta_cursor) as usize;
             let map_buf = encode_chunkmap(&plan[i], &chunk_addrs_for_nid, nid);
-            debug_assert_eq!(map_buf.len() as u64, body.chunkmap_bytes);
+            if map_buf.len() as u64 != body.chunkmap_bytes {
+                return Err(Error::BadInode(
+                    "emitted chunkmap length disagrees with the planned trailer size",
+                ));
+            }
             img[off..off + map_buf.len()].copy_from_slice(&map_buf);
             meta_cursor += body.chunkmap_bytes;
         }
@@ -793,9 +767,25 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
             let body_end = meta_byte_base + meta_cursor;
             let zmap_buf =
                 encode_zmap_trailer(&plan[i], &pcluster_addrs_for_nid, nid, body_end, blkszbits);
-            debug_assert_eq!(zmap_buf.len() as u64, body.zmap_bytes);
+            if zmap_buf.len() as u64 != body.zmap_bytes {
+                return Err(Error::BadInode(
+                    "emitted zmap trailer length disagrees with the planned trailer size",
+                ));
+            }
             img[off..off + zmap_buf.len()].copy_from_slice(&zmap_buf);
             meta_cursor += body.zmap_bytes;
+        }
+
+        // The body and its trailers must have filled the slot exactly.
+        // Anything else means the emission above and `body_span` no
+        // longer account for the same set of trailers, which would put
+        // this inode's tail bytes inside the next inode's slot. Checked
+        // for real, not with a `debug_assert!`: CI gates pull requests
+        // with `cargo test --release`, where debug assertions are off.
+        if meta_cursor != slot.end() {
+            return Err(Error::BadInode(
+                "inode emission did not fill its planned metadata span",
+            ));
         }
     }
 
@@ -1690,6 +1680,95 @@ struct InodeBody {
     /// Combined size of the legacy zmap header (16) + lcluster index
     /// array (8 * n_lclusters). Zero for non-compressed inodes.
     zmap_bytes: u64,
+}
+
+/// Where one inode sits in the metadata area.
+///
+/// `start` is a byte offset relative to the start of the metadata area
+/// (`meta_blkaddr * bs`), and is always a multiple of
+/// [`COMPACT_INODE_SIZE`] — so `start / COMPACT_INODE_SIZE` is exactly
+/// the inode's NID, and `nid * COMPACT_INODE_SIZE` is exactly the
+/// address its bytes go to.
+///
+/// That round trip is the point of this type. The NID recorded in
+/// directory entries and the address the inode bytes are written to are
+/// two readings of one number, so they cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetaSlot {
+    start: u64,
+    /// Body + inline xattrs + inline tail + chunkmap + zmap trailer.
+    span: u64,
+}
+
+impl MetaSlot {
+    /// The NID that names this inode. `start` is slot-aligned by
+    /// construction, so this division is exact.
+    fn nid(&self) -> u64 {
+        self.start / COMPACT_INODE_SIZE
+    }
+
+    /// One past the last byte this inode owns.
+    fn end(&self) -> u64 {
+        self.start + self.span
+    }
+}
+
+/// Bytes an inode occupies in the metadata area: the fixed-size body
+/// plus every trailer that must sit immediately behind it.
+///
+/// [`plan_meta_layout`] calls this to place the inode; the emission loop
+/// in [`build_image_with`] calls it (via [`MetaSlot::end`]) to confirm
+/// the bytes it wrote filled exactly the span that was planned. A new
+/// trailer added to one and not the other is caught rather than
+/// silently overwriting the next inode.
+fn body_span(body: &InodeBody) -> u64 {
+    body.body_size
+        + body.xattr_bytes.len() as u64
+        + body.inline_tail.len() as u64
+        + body.chunkmap_bytes
+        + body.zmap_bytes
+}
+
+/// Walk the metadata area once and hand back where every inode goes.
+///
+/// Two placement rules, applied per inode:
+///
+/// 1. An inode starts on a [`COMPACT_INODE_SIZE`]-byte slot boundary,
+///    because a NID *is* a slot index.
+/// 2. Spec invariant: an inode body together with its inline xattrs,
+///    FLAT_INLINE tail and chunkmap MUST live in a single block. If the
+///    combined size will not fit in the remainder of the current
+///    metadata block, skip to the next block so the inode re-anchors at
+///    a fresh block boundary. (FLAT_PLAIN inodes without inline tails
+///    tolerate crossings, but it is simplest to enforce the same rule
+///    for everything.)
+///
+/// This function is the only place those rules exist. Both the NIDs
+/// written into directory entries and the addresses the inode bytes are
+/// written to are read out of the slots it returns, so there is no
+/// second copy to drift away from this one.
+///
+/// `bs` is a power of two no smaller than 512 (blkszbits is validated to
+/// `9..=16` on entry to [`build_image_with`]), hence a multiple of
+/// [`COMPACT_INODE_SIZE`] — so rule 2 can never land a start off a slot
+/// boundary.
+fn plan_meta_layout(bodies: &[InodeBody], bs: u64) -> Vec<MetaSlot> {
+    let mut slots = Vec::with_capacity(bodies.len());
+    let mut cursor: u64 = 0;
+    for body in bodies {
+        cursor = cursor.div_ceil(COMPACT_INODE_SIZE) * COMPACT_INODE_SIZE;
+        let span = body_span(body);
+        let trailers = span - body.body_size;
+        if trailers > 0 && cursor % bs + span > bs {
+            cursor = cursor.div_ceil(bs) * bs;
+        }
+        slots.push(MetaSlot {
+            start: cursor,
+            span,
+        });
+        cursor += span;
+    }
+    slots
 }
 
 fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64> {
@@ -3914,5 +3993,139 @@ mod tests {
         assert_eq!(xattrs.len(), 1);
         assert_eq!(xattrs[0].0, b"user.dataitem.thing");
         assert_eq!(xattrs[0].1, b"value");
+    }
+
+    // --- metadata layout: the single cursor walk ---
+
+    /// An `InodeBody` carrying only the fields `plan_meta_layout` reads.
+    fn meta_body(body_size: u64, inline_tail: usize) -> InodeBody {
+        InodeBody {
+            body_size,
+            is_extended: body_size == EXTENDED_INODE_SIZE,
+            xattr_bytes: Vec::new(),
+            xattr_icount: 0,
+            inline_tail: vec![0u8; inline_tail],
+            chunkmap_bytes: 0,
+            zmap_bytes: 0,
+        }
+    }
+
+    /// Bodies chosen to hit every branch of the walk at `bs` = 4096:
+    /// bare bodies that pack tightly, an unaligned tail that forces the
+    /// next start to round up, tails that fit in the current block, and
+    /// two that do not and must skip to the next one.
+    fn meta_layout_fixture() -> Vec<InodeBody> {
+        vec![
+            meta_body(COMPACT_INODE_SIZE, 0),
+            meta_body(COMPACT_INODE_SIZE, 17),
+            meta_body(EXTENDED_INODE_SIZE, 1000),
+            meta_body(COMPACT_INODE_SIZE, 3000),
+            meta_body(COMPACT_INODE_SIZE, 5),
+            meta_body(EXTENDED_INODE_SIZE, 0),
+            meta_body(COMPACT_INODE_SIZE, 4000),
+        ]
+    }
+
+    #[test]
+    fn meta_layout_starts_on_inode_slots() {
+        for slot in plan_meta_layout(&meta_layout_fixture(), 4096) {
+            assert_eq!(
+                slot.start % COMPACT_INODE_SIZE,
+                0,
+                "{slot:?} does not start on a 32-byte inode slot"
+            );
+        }
+    }
+
+    /// The invariant `build_image_with` used to guard with a
+    /// `debug_assert!`: a NID names the address its inode was written
+    /// to. It holds by construction now — `MetaSlot::nid` and the write
+    /// address are two readings of `start` — and this pins it in a test
+    /// that runs under `--release`, which is what CI gates PRs with.
+    #[test]
+    fn meta_layout_nid_round_trips_to_its_start() {
+        for slot in plan_meta_layout(&meta_layout_fixture(), 4096) {
+            assert_eq!(slot.nid() * COMPACT_INODE_SIZE, slot.start);
+        }
+    }
+
+    #[test]
+    fn meta_layout_slots_never_overlap() {
+        let slots = plan_meta_layout(&meta_layout_fixture(), 4096);
+        for pair in slots.windows(2) {
+            assert!(
+                pair[0].end() <= pair[1].start,
+                "{:?} runs into {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// The spec rule: an inode body plus its trailers lives in one
+    /// block. Deleting the block-fit skip from `plan_meta_layout` fails
+    /// here.
+    #[test]
+    fn meta_layout_keeps_body_and_trailers_in_one_block() {
+        let bs = 4096u64;
+        let bodies = meta_layout_fixture();
+        let slots = plan_meta_layout(&bodies, bs);
+        let mut skips = 0;
+        for (body, slot) in bodies.iter().zip(&slots) {
+            if slot.span == body.body_size {
+                continue; // no trailers: crossing is tolerated
+            }
+            assert!(
+                slot.start % bs + slot.span <= bs,
+                "{slot:?} straddles a {bs}-byte block boundary"
+            );
+            if slot.start % bs == 0 {
+                skips += 1;
+            }
+        }
+        assert!(
+            skips >= 2,
+            "fixture no longer exercises the block-fit skip ({skips} skips)"
+        );
+    }
+
+    /// End to end: files sized so the writer must skip metadata blocks
+    /// to keep each body+tail whole. Every one has to read back at the
+    /// NID its parent directory recorded for it.
+    #[test]
+    fn inline_tails_forcing_block_skips_round_trip() {
+        let bs = 1u64 << 12;
+        let contents: Vec<Vec<u8>> = (0..6u8)
+            .map(|i| vec![b'a' + i; 3000 - (i as usize) * 7])
+            .collect();
+        let entries: Vec<(&str, Node)> = ["f0", "f1", "f2", "f3", "f4", "f5"]
+            .iter()
+            .zip(&contents)
+            .map(|(name, data)| (*name, file(data)))
+            .collect();
+        let img = build_image(dir(entries), 12).unwrap();
+        let fs = open(img);
+        let root = fs.root_inode().unwrap();
+
+        let mut block_aligned = 0;
+        for dirent in fs.read_dir(&root).unwrap() {
+            let name = String::from_utf8(dirent.name.clone()).unwrap();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let idx: usize = name[1..].parse().unwrap();
+            let inode = fs.read_inode(dirent.nid).unwrap();
+            assert_eq!(inode.size, contents[idx].len() as u64, "{name} size");
+            let mut buf = vec![0u8; contents[idx].len()];
+            fs.read_file(&inode, 0, &mut buf).unwrap();
+            assert_eq!(buf, contents[idx], "{name} content");
+            if (dirent.nid * COMPACT_INODE_SIZE).is_multiple_of(bs) {
+                block_aligned += 1;
+            }
+        }
+        assert!(
+            block_aligned >= 2,
+            "fixture no longer forces metadata-block skips ({block_aligned} aligned inodes)"
+        );
     }
 }
