@@ -632,6 +632,38 @@ impl Filesystem {
         }
 
         let extent = zmap.pcluster_extent(&*self.primary, file_offset)?;
+
+        // `pcluster_extent` is supposed to return the extent CONTAINING
+        // `file_offset`, and the two subtractions below both depend on
+        // that without saying so: one underflows if the start is past
+        // the offset, the other if the end is behind it. Neither is a
+        // theoretical worry — the same crafted-image class that produced
+        // the zero-length pcluster (a HEAD whose `clusterofs` exceeds the
+        // lcluster size, making the resolver walk back over a real HEAD)
+        // moves these bounds too. Unguarded, a debug build panics and a
+        // release build wraps to an enormous `usize`, so the failure mode
+        // differs between the tests and the thing that ships.
+        //
+        // Checked rather than clamped. `saturating_sub` would turn a
+        // corrupt image into a silently wrong read, which is the outcome
+        // this crate exists to avoid; a corrupt image should be refused.
+        //
+        // The message cannot name the offending offsets: every variant of
+        // `Error` carries `&'static str`, and the enum is not
+        // `#[non_exhaustive]`, so adding a `String` variant would break
+        // exhaustive matches in every consumer. Naming the broken
+        // invariant is worth more than the numbers here.
+        // Note the strict `>`. `file_offset == source_end_byte` yields a
+        // zero-length take, not an underflow, and that case already has an
+        // owner: the fill loop's zero-progress guard, whose regression test
+        // depends on reaching it. Rejecting it here would silently retire
+        // that test. This check is for the underflows alone.
+        if file_offset < extent.source_start_byte || file_offset > extent.source_end_byte {
+            return Err(Error::BadInode(
+                "pcluster extent does not bracket the requested file offset",
+            ));
+        }
+
         let inline_tail = zmap.tail_inline_offset_and_size();
         let is_inline_tail_pc = extent.is_last_pcluster && inline_tail.is_some();
         let off_in_pcluster = (file_offset - extent.source_start_byte) as usize;
@@ -1260,6 +1292,14 @@ mod tests {
     ///   offset being asked about. Zero bytes remain in the pcluster,
     ///   so the fill copies nothing and the cursor does not move.
     fn build_zero_progress_image() -> Vec<u8> {
+        build_zero_progress_image_with(4196)
+    }
+
+    fn build_zero_progress_image_with(spin_clusterofs: u16) -> Vec<u8> {
+        build_zp4(0, 0, spin_clusterofs, 101)
+    }
+
+    fn build_zp4(c0: u16, c1: u16, c2: u16, c3: u16) -> Vec<u8> {
         const BS: usize = 4096;
         const FILE_SIZE: u32 = 4 * BS as u32;
         // 8 blocks: 0 = SB, 1 = meta (inodes + zmap), 2..6 = data,
@@ -1294,10 +1334,10 @@ mod tests {
         };
         const PLAIN: u16 = Z_EROFS_LCLUSTER_TYPE_PLAIN as u16;
         let entries = [
-            entry(PLAIN, 0, 2),
-            entry(PLAIN, 0, 2),
-            entry(PLAIN, 4196, 3),
-            entry(PLAIN, 101, 4),
+            entry(PLAIN, c0, 2),
+            entry(PLAIN, c1, 2),
+            entry(PLAIN, c2, 3),
+            entry(PLAIN, c3, 4),
         ];
         for (i, e) in entries.iter().enumerate() {
             img[idx + i * 8..idx + i * 8 + 8].copy_from_slice(e);
@@ -1310,6 +1350,77 @@ mod tests {
         let dir = synth_dir_block(&[(1, ftype::REG_FILE, b"spin.bin")], BS);
         img[7 * BS..8 * BS].copy_from_slice(&dir);
         img
+    }
+
+    /// A crafted extent whose end lies BEHIND the requested offset is
+    /// refused, rather than underflowing the length arithmetic.
+    ///
+    /// # How this state is reached
+    ///
+    /// Same class as the zero-progress image below, one step further. A
+    /// HEAD whose `clusterofs` exceeds the lcluster size makes the
+    /// resolver walk back over a real HEAD; with a second oversized
+    /// entry after it, the forward scan that bounds the pcluster lands
+    /// on a head that sits *before* the offset being asked about, so
+    /// `source_end_byte < file_offset`. `mkfs.erofs` never writes this,
+    /// and nothing in the format forbids it.
+    ///
+    /// # Why it is worth a test rather than a `saturating_sub`
+    ///
+    /// Measured against the unguarded code, the two build profiles
+    /// disagreed about what this image is:
+    ///
+    /// ```text
+    /// debug   → panicked at src/fs.rs:670: attempt to subtract with overflow
+    /// release → Ok(4096)
+    /// ```
+    ///
+    /// A release build reported a SUCCESSFUL 4096-byte read of a corrupt
+    /// image. That is the failure this crate exists to prevent, and it
+    /// is invisible to a test suite that runs in debug — which is why
+    /// the assertion below is run in both profiles by CI.
+    #[test]
+    fn an_extent_ending_behind_the_offset_is_refused() {
+        // c2 = 4196 is the oversized clusterofs from the zero-progress
+        // image; c3 = 4095 is the second one that pushes the bound back
+        // past the offset instead of onto it.
+        let img = build_zp4(0, 0, 4196, 4095);
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let fs = Filesystem::open(dev).expect("the image is structurally openable");
+        let inode = fs.lookup_path("/spin.bin").expect("the file resolves");
+        let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).expect("the zmap parses");
+
+        let mut probe = vec![0u8; 4096];
+        let err = fs
+            .fill_from_one_pcluster(inode.nid, &zmap, 15000, &mut probe)
+            .expect_err(
+                "an extent that does not contain the offset must be refused; \
+                 unguarded this panicked in debug and returned Ok(4096) in release",
+            );
+        assert!(
+            format!("{err}").contains("does not bracket"),
+            "the refusal should name the broken invariant, got: {err}"
+        );
+    }
+
+    /// The offsets that are still legitimate keep working, so the guard
+    /// is a check on a broken invariant and not a blanket refusal of the
+    /// crafted image.
+    #[test]
+    fn the_bracket_guard_does_not_reject_valid_offsets() {
+        let img = build_zp4(0, 0, 4196, 4095);
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.lookup_path("/spin.bin").unwrap();
+        let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).unwrap();
+
+        let mut probe = vec![0u8; 4096];
+        for start in [0u64, 4096, 8192] {
+            let n = fs
+                .fill_from_one_pcluster(inode.nid, &zmap, start, &mut probe)
+                .unwrap_or_else(|e| panic!("offset {start} is inside a real extent, but: {e}"));
+            assert!(n > 0, "offset {start} should copy bytes, copied {n}");
+        }
     }
 
     /// The fill really does return zero at `SPIN_ZERO_AT`, and it is
