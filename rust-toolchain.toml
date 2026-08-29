@@ -1,0 +1,9 @@
+[toolchain]
+# Pinned, and it did not used to be. Without this file the crate compiled
+# under whatever `stable` happened to be installed — which is drift with
+# no way to see it, and this crate is linked into an FSKit extension
+# alongside its sibling drivers. Staticlibs built by different rustc
+# versions put two `_rust_eh_personality` symbols into one Mach-O and the
+# link fails. So the pin has to exist, and it has to match the family.
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
