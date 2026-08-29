@@ -561,14 +561,21 @@ impl Filesystem {
         let mut written: usize = 0;
         while written < out.len() {
             let cursor = block_start + written as u64;
-            self.fill_from_one_pcluster(inode.nid, &zmap, cursor, &mut out[written..])
-                .map(|n| written += n)?;
-            if written == 0 {
-                // Defensive: nothing copied means the resolver advanced
-                // past end-of-file. Zero-fill the rest and exit.
+            let n = self.fill_from_one_pcluster(inode.nid, &zmap, cursor, &mut out[written..])?;
+            if n == 0 {
+                // No bytes came back for `cursor`, so the cursor cannot
+                // move and asking again would give the same answer for
+                // ever. Zero-fill the rest of the block and stop.
+                //
+                // The test here must be the PER-CALL return, not the
+                // running `written` total: `written` is non-zero from
+                // the second iteration onwards, so testing it would
+                // catch only a zero on the very first call and turn
+                // every later one into an infinite loop.
                 out[written..].fill(0);
                 break;
             }
+            written += n;
         }
         Ok(())
     }
@@ -1194,6 +1201,191 @@ mod tests {
         assert_eq!(buf[BS - 1], 0x8F);
     }
 
+    // --- zero-progress pcluster (the block-fill loop's exit guard) ------
+    //
+    // `read_compressed_block` fills a block by calling
+    // `fill_from_one_pcluster` in a loop, advancing a cursor by the
+    // bytes each call copied. A call that copies ZERO bytes leaves the
+    // cursor where it was, so the loop must notice and stop; if it
+    // tests the running total instead of the per-call return it only
+    // notices on the very first call, and a zero on any later call
+    // spins forever.
+    //
+    // A zero copy comes out of `pcluster_extent` reporting an extent
+    // whose `source_end_byte` has already been passed by the requested
+    // offset, which is what `PLAIN_ZERO_AT` below is engineered to
+    // produce.
+
+    /// Block whose fill exercises the loop, and the offset inside it at
+    /// which the resolver reports an empty extent. See
+    /// `build_zero_progress_image` for the arithmetic that lands here.
+    const SPIN_BLOCK_START: u64 = 3 * 4096;
+    const SPIN_FIRST_TAKE: usize = 100;
+    const SPIN_ZERO_AT: u64 = SPIN_BLOCK_START + SPIN_FIRST_TAKE as u64;
+
+    /// Build an image whose legacy zmap makes the SECOND fill of one
+    /// block resolve to a zero-length pcluster.
+    ///
+    /// The lever is a HEAD whose `clusterofs` exceeds the lcluster size
+    /// — something `mkfs.erofs` never writes, but nothing in the
+    /// on-disk format prevents an image from carrying. The resolver's
+    /// walk-back ("this HEAD's clusterofs is past my offset, so my
+    /// bytes belong to the previous pcluster") then steps back over a
+    /// real HEAD, and the forward scan that bounds the pcluster picks
+    /// that same stepped-over HEAD as the *next* head — putting
+    /// `source_end_byte` behind, not ahead of, the offset we asked
+    /// about.
+    ///
+    /// Four PLAIN lclusters over a 16 KiB file, block size 4 KiB and
+    /// lcluster size 4 KiB:
+    ///
+    /// | lc | clusterofs | blkaddr |
+    /// |----|------------|---------|
+    /// | 0  | 0          | 2       |
+    /// | 1  | 0          | 2       |
+    /// | 2  | 4196       | 3       |  <- 4196 > lcluster_size (4096)
+    /// | 3  | 101        | 4       |
+    ///
+    /// Reading block 3 (file bytes 12288..16384):
+    ///
+    /// - fill #1 asks about 12288. lc3's clusterofs (101) is past
+    ///   in-lcluster offset 0, so walk back to lc2; lc2's clusterofs
+    ///   (4196) is past a whole lcluster, so walk back again to lc1.
+    ///   Head is lc1 (source starts at 4096); the next head found
+    ///   scanning forward is lc2, so the source ends at
+    ///   `2*4096 + 4196 == 12388`. That is 100 bytes ahead of 12288 —
+    ///   a short but real copy.
+    /// - fill #2 asks about 12388. The same double walk-back lands on
+    ///   the same head with the same bound, 12388 — now exactly the
+    ///   offset being asked about. Zero bytes remain in the pcluster,
+    ///   so the fill copies nothing and the cursor does not move.
+    fn build_zero_progress_image() -> Vec<u8> {
+        const BS: usize = 4096;
+        const FILE_SIZE: u32 = 4 * BS as u32;
+        // 8 blocks: 0 = SB, 1 = meta (inodes + zmap), 2..6 = data,
+        // 7 = dir block.
+        let mut img = vec![0u8; BS * 8];
+        let sb = synth_sb(12, 0, 1, 8);
+        img[EROFS_SUPER_OFFSET as usize..EROFS_SUPER_OFFSET as usize + sb.len()]
+            .copy_from_slice(&sb);
+
+        // Root dir inode at NID 0, dirents at block 7.
+        let root = synth_compact(DataLayout::FlatPlain, 0x41ED, BS as u32, 7);
+        img[BS..BS + 32].copy_from_slice(&root);
+
+        // File inode at NID 1. CompressionLegacy so the zmap is the
+        // plain 8-bytes-per-lcluster full index rather than a compact
+        // bitstream — the entries below are then readable as written.
+        let file = synth_compact(DataLayout::CompressionLegacy, 0x81A4, FILE_SIZE, 0);
+        img[BS + 32..BS + 64].copy_from_slice(&file);
+
+        // zmap header sits at body_end (BS + 64) and is left all-zero:
+        // no advise bits (so no INTERLACED, which would disable the
+        // walk-back), LZ4, and lclusterbits 0 => lcluster size ==
+        // block size. The legacy index array starts 16 bytes further
+        // on (8-byte header + 8-byte reserved gap).
+        let idx = BS + 64 + 16;
+        let entry = |cluster_type: u16, clusterofs: u16, u: u32| -> [u8; 8] {
+            let mut e = [0u8; 8];
+            e[0..2].copy_from_slice(&cluster_type.to_le_bytes());
+            e[2..4].copy_from_slice(&clusterofs.to_le_bytes());
+            e[4..8].copy_from_slice(&u.to_le_bytes());
+            e
+        };
+        const PLAIN: u16 = Z_EROFS_LCLUSTER_TYPE_PLAIN as u16;
+        let entries = [
+            entry(PLAIN, 0, 2),
+            entry(PLAIN, 0, 2),
+            entry(PLAIN, 4196, 3),
+            entry(PLAIN, 101, 4),
+        ];
+        for (i, e) in entries.iter().enumerate() {
+            img[idx + i * 8..idx + i * 8 + 8].copy_from_slice(e);
+        }
+
+        // The 100 bytes fill #1 copies: pcluster at blkaddr 2, 8192
+        // bytes into it => image offset 16384.
+        img[16384..16384 + SPIN_FIRST_TAKE].fill(0xC5);
+
+        let dir = synth_dir_block(&[(1, ftype::REG_FILE, b"spin.bin")], BS);
+        img[7 * BS..8 * BS].copy_from_slice(&dir);
+        img
+    }
+
+    /// The fill really does return zero at `SPIN_ZERO_AT`, and it is
+    /// not the first fill of the block — fill #1 copies 100 bytes
+    /// first. Without this, the loop test below could pass for the
+    /// wrong reason.
+    #[test]
+    fn zero_progress_pcluster_is_reachable_after_a_nonzero_fill() {
+        let img = build_zero_progress_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.lookup_path("/spin.bin").unwrap();
+        let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).unwrap();
+
+        let mut probe = vec![0u8; 4096];
+        let first = fs
+            .fill_from_one_pcluster(inode.nid, &zmap, SPIN_BLOCK_START, &mut probe)
+            .expect("first fill of the block");
+        assert_eq!(
+            first, SPIN_FIRST_TAKE,
+            "fill #1 must copy a short but non-zero run, so the loop is \
+             already past its first iteration when the zero arrives"
+        );
+
+        let second = fs
+            .fill_from_one_pcluster(inode.nid, &zmap, SPIN_ZERO_AT, &mut probe[first..])
+            .expect("second fill of the block");
+        assert_eq!(
+            second, 0,
+            "fill #2 must copy nothing: the resolved pcluster ends exactly \
+             at the offset being asked about"
+        );
+    }
+
+    /// A zero-copy fill on a LATER iteration must end the block-fill
+    /// loop, not spin on the same offset forever.
+    ///
+    /// Run on a worker thread with a deadline: a regression here is an
+    /// infinite loop, and an infinite loop in the test binary would
+    /// hang CI rather than fail it.
+    #[test]
+    fn zero_progress_pcluster_does_not_spin_forever() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let img = build_zero_progress_image();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+            let fs = Filesystem::open(dev).unwrap();
+            let inode = fs.lookup_path("/spin.bin").unwrap();
+            let mut buf = vec![0u8; 4096];
+            let outcome = fs
+                .read_file(&inode, SPIN_BLOCK_START, &mut buf)
+                .map(|()| buf);
+            let _ = tx.send(outcome);
+        });
+
+        let buf = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(outcome) => outcome.expect("read of the crafted block"),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "read_compressed_block did not return within 10s: the block-fill \
+                 loop is spinning on a zero-length pcluster at file offset \
+                 {SPIN_ZERO_AT}"
+            ),
+            Err(e) => panic!("worker thread died: {e:?}"),
+        };
+
+        // What fill #1 copied survives; the rest of the block, which no
+        // pcluster could supply, reads as zeros.
+        assert_eq!(&buf[..SPIN_FIRST_TAKE], &[0xC5u8; SPIN_FIRST_TAKE][..]);
+        assert!(
+            buf[SPIN_FIRST_TAKE..].iter().all(|&b| b == 0),
+            "the unfillable remainder of the block must be zeroed"
+        );
+    }
     #[test]
     fn resolve_path_symlink_loop_caps_at_40() {
         let img = build_loop_image();
