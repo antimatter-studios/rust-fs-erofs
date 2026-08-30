@@ -1,7 +1,8 @@
 //! Top-level read-only EROFS filesystem handle.
 //!
-//! Phase 0: FLAT_PLAIN + FLAT_INLINE only. Compressed and chunked
-//! inodes return `Error::UnsupportedLayout`.
+//! Dispatches every data layout the crate supports: FLAT_PLAIN,
+//! FLAT_INLINE, chunk-based, and compressed clusters via
+//! [`crate::zmap`] and [`crate::decompress`].
 
 use crate::chunked::{self, EROFS_NULL_ADDR};
 use crate::decompress::{self};
@@ -328,9 +329,11 @@ impl Filesystem {
         Ok(out)
     }
 
-    /// Look up a single name in a directory. Linear scan; EROFS sorts
-    /// dirents by name hash on disk for binary search but Phase 0 stays
-    /// simple.
+    /// Look up a single name in a directory.
+    ///
+    /// Linear scan. EROFS sorts dirents by name hash on disk so a
+    /// binary search is possible; this does not do it, which is a cost
+    /// on very large directories and nothing else.
     pub fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Inode> {
         for entry in self.read_dir(dir)? {
             if entry.name == name {
@@ -448,8 +451,11 @@ impl Filesystem {
     }
 
     /// Read `buf.len()` bytes from a regular file inode starting at
-    /// `offset`. Phase 0: FLAT_PLAIN + FLAT_INLINE. Returns `OutOfRange`
-    /// if the read would extend past `inode.size`.
+    /// `offset`.
+    ///
+    /// Handles every layout: FLAT_PLAIN, FLAT_INLINE, chunk-based and
+    /// compressed. Returns `OutOfRange` if the read would extend past
+    /// `inode.size`.
     pub fn read_file(&self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<()> {
         if offset.saturating_add(buf.len() as u64) > inode.size {
             return Err(Error::OutOfRange);

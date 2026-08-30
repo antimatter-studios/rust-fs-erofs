@@ -5,8 +5,8 @@
 //! - bit 0:    inode version. 0 = compact (32 bytes), 1 = extended (64 bytes).
 //! - bits 1..=3: data layout (the `EROFS_INODE_*` constants).
 //! - bits 4..=15: per-layout flags. For compressed layouts, this carries
-//!   the compression algorithm; for chunked, the chunk-bit count. Phase 0
-//!   surfaces it as a raw u16 since we don't decode compressed/chunked.
+//!   the compression algorithm; for chunked, the chunk-bit count. This
+//!   module surfaces it as a raw u16; `zmap` and `chunked` interpret it.
 //!
 //! Field positions defined in `linux/fs/erofs/erofs_fs.h`
 //! (`EROFS_I_VERSION_BIT`, `EROFS_I_DATALAYOUT_BIT`, etc.).
@@ -23,14 +23,14 @@ pub enum InodeVersion {
 pub enum DataLayout {
     /// Contiguous raw blocks starting at `i_u.raw_blkaddr`.
     FlatPlain = 0,
-    /// Legacy compressed layout. Not supported in Phase 0.
+    /// Legacy compressed layout, decoded via `zmap`.
     CompressionLegacy = 1,
     /// Whole blocks plain, last (tail) block inlined immediately after
     /// the inode in the metadata area.
     FlatInline = 2,
-    /// Modern compressed layout. Not supported in Phase 0.
+    /// Modern compressed layout, decoded via `zmap`.
     Compression = 3,
-    /// Chunk-based; for sparse / huge files. Not supported in Phase 0.
+    /// Chunk-based, for sparse and huge files; decoded via `chunked`.
     ChunkBased = 4,
 }
 
@@ -59,7 +59,7 @@ impl DataLayout {
 pub struct InodeFormat {
     pub version: InodeVersion,
     pub layout: DataLayout,
-    /// Per-layout flag bits (4..=15). Phase 0 only reads this for
+    /// Per-layout flag bits (4..=15). This module only reads this for
     /// diagnostics.
     pub flags: u16,
 }

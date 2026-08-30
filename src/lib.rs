@@ -1,9 +1,16 @@
 //! Pure-Rust EROFS (Enhanced Read-Only File System) reader.
 //!
-//! **Phase 0 scope** — uncompressed images only. Reads superblock,
-//! both compact and extended inode shapes, and FLAT_PLAIN /
-//! FLAT_INLINE data layouts. Compressed (LZ4 / LZMA / DEFLATE) and
-//! chunk-based inodes return `Error::UnsupportedLayout`.
+//! Reads everything `mkfs.erofs` 1.9 emits: compact and extended
+//! inodes, FLAT_PLAIN and FLAT_INLINE, chunk-based inodes, and
+//! compressed clusters in LZ4, LZMA and DEFLATE — including
+//! compacted-2B cluster maps, ztailpacking, fragments and
+//! big_pcluster. It also builds images; see [`mkfs`].
+//!
+//! This block used to say "Phase 0 scope — uncompressed images only",
+//! with compressed and chunked inodes returning
+//! `Error::UnsupportedLayout`. That stopped being true several
+//! thousand lines of `zmap.rs` and `chunked.rs` ago, and `Cargo.toml`'s
+//! own description already contradicted it.
 //!
 //! Generate a test image with `mkfs.erofs` (no `-z` flag = no
 //! compression):

@@ -9,11 +9,15 @@ pub enum Error {
     /// Superblock parse rejected the on-disk values (impossible block size,
     /// truncated, etc.). The string carries a short reason for diagnostics.
     BadSuperblock(&'static str),
-    /// Inode at the requested NID is malformed or its declared layout
-    /// is one Phase 0 doesn't implement (compression, chunked).
+    /// Inode at the requested NID is malformed.
     BadInode(&'static str),
-    /// Layout requested isn't supported in this build. Compression layouts
-    /// (1, 3) and chunk-based (4) all surface as this in Phase 0.
+    /// A compression algorithm id this build does not decode.
+    ///
+    /// The name says "layout" for a historical reason and is kept
+    /// because it is `pub`: the variant once covered the compressed and
+    /// chunk-based DATA LAYOUTS, which are all decoded now. What
+    /// reaches it today is `Algorithm::from_id` meeting an id outside
+    /// LZ4 (0), LZMA (1) and DEFLATE (2).
     UnsupportedLayout(u8),
     /// A directory block didn't pass dirent-array sanity checks.
     BadDirent(&'static str),
@@ -43,7 +47,8 @@ impl std::fmt::Display for Error {
             Error::UnsupportedLayout(n) => {
                 write!(
                     f,
-                    "data layout {n} not supported in Phase 0 (compression/chunked)"
+                    "compression algorithm {n} is not one this build decodes \
+                     (expected 0 = LZ4, 1 = LZMA, 2 = DEFLATE)"
                 )
             }
             Error::BadDirent(s) => write!(f, "malformed directory: {s}"),
@@ -96,10 +101,25 @@ mod tests {
         assert!(s.contains("buffer shorter than 32 bytes"));
     }
 
+    /// The message names the offending id and what the valid ones are.
+    ///
+    /// It used to say "data layout 7 not supported in Phase 0
+    /// (compression/chunked)", which described the variant's original
+    /// meaning. What reaches it now is an unknown COMPRESSION
+    /// ALGORITHM id — every data layout is decoded — so the old text
+    /// told a user the crate could not do something it does.
     #[test]
     fn display_unsupported_layout() {
         let s = Error::UnsupportedLayout(7).to_string();
-        assert!(s.contains("data layout 7"));
+        assert!(s.contains('7'), "the message should name the id: {s}");
+        assert!(
+            s.contains("compression algorithm"),
+            "the message should say what 7 is: {s}"
+        );
+        assert!(
+            !s.contains("Phase 0"),
+            "the message should not describe a scope the crate outgrew: {s}"
+        );
     }
 
     #[test]

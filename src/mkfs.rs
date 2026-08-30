@@ -1,7 +1,8 @@
 //! EROFS image builder.
 //!
-//! Phase 1 (W1) scope: every reader-supported feature except compressed
-//! data layouts. Emits compact + extended inodes; FLAT_PLAIN and
+//! Writes every layout the reader supports EXCEPT compressed data —
+//! the one place a scope note is still accurate, and it is about the
+//! writer alone. The reader decodes LZ4, LZMA and DEFLATE. Emits compact + extended inodes; FLAT_PLAIN and
 //! FLAT_INLINE for regular files; multi-block directories; chunked
 //! files (compact + indexed chunkmap, with hole sentinels); inline
 //! xattrs (with POSIX-ACL helper); special files (chr/blk/fifo/sock).
