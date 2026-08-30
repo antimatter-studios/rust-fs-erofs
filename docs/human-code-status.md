@@ -119,14 +119,44 @@ replace, over a full period and beyond so an off-by-one has nowhere to hide.
 The `vcnt` row was **zero** before, in one of the four copies. The refactor moved
 a value out of a position where nothing could see it wrong.
 
-### M7, M8, M9, M10, M11, M12, M17, M22 — repeated encodings and unnamed values — **fixable, not yet done**
+### M12 — the xattr entry header decoded three times by hand — **fixed**
+
+`XATTR_ENTRY_HEADER_SIZE` was named; the decode inside it was not, and was
+open-coded at three sites.
+
+**The third was the odd one out twice over.** `read_shared_xattrs` reads a header
+only to learn how far to read again, and it dropped `name_index` entirely and
+summed the body length with a plain `+` where the other two used `checked_add`.
+Neither is reachable — a `u8` and a `u16` cannot overflow a 64-bit `usize` — but
+a third copy that validates less than its siblings is how the reachable version
+eventually arrives. That is the same shape as the NTFS `".."` bug, where the
+fifth copy of a basename check was the weak one.
+
+`XattrEntryHeader` with `parse`, `total_len` and `is_padding` is the one
+definition now. `total_len` is checked, so the arithmetic is the same at every
+site rather than at two of three.
+
+**All three sites were covered before, which is what made this safe rather than
+merely tidy** — flipping the byte order at each in turn failed 5, 3 and 3 tests.
+Four new tests pin the shape once, and mutating the single definition now fails:
+
+| mutation | tests failing |
+|---|---|
+| byte order | 8 |
+| `name_index` offset | 7 |
+| padding predicate widened | 2 |
+
+The byte-order test asserts against literal bytes rather than `from_le_bytes`,
+because a slip there is invisible to a round trip through this crate: writer and
+reader would agree while disagreeing with `mkfs.erofs`.
+
+### M7, M8, M9, M10, M11, M17, M22 — repeated encodings and unnamed values — **fixable, not yet done**
 
 A constant defined twice and another in the wrong module; the block-size range
 stated three times in two encodings; three encodings of the file-type taxonomy;
 inode sizes 32 and 64 bare despite a named constant; the codec preamble three
-times; the xattr entry header decoded three times by hand; alignment hand-rolled
-four times in two idioms and two widths; and **117 inline hex slice ranges with
-no named-offset convention at all**.
+times; alignment hand-rolled four times in two idioms and two widths; and **117
+inline hex slice ranges with no named-offset convention at all**.
 
 M22 is the largest and would change how the whole crate reads.
 
