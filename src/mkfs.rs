@@ -44,9 +44,10 @@ use crate::superblock::{
 pub use crate::xattr::XattrLongPrefix;
 use crate::xattr::XATTR_HEADER_SIZE;
 use crate::zmap::{
-    Z_EROFS_ADVISE_COMPACTED_2B, Z_EROFS_ADVISE_INLINE_PCLUSTER, Z_EROFS_COMPACT_MAP_HEADER_SIZE,
-    Z_EROFS_LCLUSTER_INDEX_SIZE, Z_EROFS_LCLUSTER_TYPE_HEAD1, Z_EROFS_LCLUSTER_TYPE_NONHEAD,
-    Z_EROFS_LCLUSTER_TYPE_PLAIN, Z_EROFS_LEGACY_MAP_HEADER_SIZE,
+    CompactPackShape, COMPACT_2B, COMPACT_4B, Z_EROFS_ADVISE_COMPACTED_2B,
+    Z_EROFS_ADVISE_INLINE_PCLUSTER, Z_EROFS_COMPACT_MAP_HEADER_SIZE, Z_EROFS_LCLUSTER_INDEX_SIZE,
+    Z_EROFS_LCLUSTER_TYPE_HEAD1, Z_EROFS_LCLUSTER_TYPE_NONHEAD, Z_EROFS_LCLUSTER_TYPE_PLAIN,
+    Z_EROFS_LEGACY_MAP_HEADER_SIZE,
 };
 use std::collections::BTreeMap;
 
@@ -1236,41 +1237,43 @@ fn encode_compact2b_index(geom: &CompactGeom, entries: &[CompactEntry], lobits: 
     let mut entry_cursor = 0usize;
     let mut byte_cursor = 0usize;
 
-    let mut emit_pack =
-        |entries_slice: &[CompactEntry], pack_bytes: usize, vcnt: usize, encodebits: usize| {
-            let bitstream_len = pack_bytes - 4;
-            // base = (first HEAD/PLAIN entry's blkaddr) - 1 (its nblk
-            // is 1). All-NONHEAD packs use 0 as a deterministic stub.
-            let base = entries_slice
-                .iter()
-                .find(|e| e.cluster_type != Z_EROFS_LCLUSTER_TYPE_NONHEAD)
-                .map(|e| e.pcluster_blkaddr.saturating_sub(1))
-                .unwrap_or(0);
-            let pack_dst = &mut out[byte_cursor..byte_cursor + pack_bytes];
-            // Bitstream first.
-            let bitstream = &mut pack_dst[..bitstream_len];
-            for (i, e) in entries_slice.iter().enumerate() {
-                pack_write_entry(bitstream, i * encodebits, lobits, e.cluster_type, e.lo);
-            }
-            // Trailing slots inside the same pack: leave as zeros (the
-            // mask above already zero-initialised the buffer). The
-            // reader never reads past totalidx so these don't matter.
-            let _ = vcnt;
-            // Trailing __le32 base blkaddr.
-            pack_dst[bitstream_len..bitstream_len + 4].copy_from_slice(&base.to_le_bytes());
-            byte_cursor += pack_bytes;
-        };
+    // One pack of `shape`, holding `entries_slice`.
+    //
+    // The shape used to arrive as three unlabelled integers — and the
+    // third, `vcnt`, was discarded on the next line but one. It looked
+    // like it governed how many entries the pack takes; the caller's
+    // `take` does that, and `entries_slice.len()` is the real count.
+    // A `let _ = vcnt;` is not a use.
+    let mut emit_pack = |entries_slice: &[CompactEntry], shape: CompactPackShape| {
+        let pack_bytes = shape.pack_bytes as usize;
+        let encodebits = shape.encodebits as usize;
+        let bitstream_len = pack_bytes - 4;
+        // base = (first HEAD/PLAIN entry's blkaddr) - 1 (its nblk
+        // is 1). All-NONHEAD packs use 0 as a deterministic stub.
+        let base = entries_slice
+            .iter()
+            .find(|e| e.cluster_type != Z_EROFS_LCLUSTER_TYPE_NONHEAD)
+            .map(|e| e.pcluster_blkaddr.saturating_sub(1))
+            .unwrap_or(0);
+        let pack_dst = &mut out[byte_cursor..byte_cursor + pack_bytes];
+        // Bitstream first.
+        let bitstream = &mut pack_dst[..bitstream_len];
+        for (i, e) in entries_slice.iter().enumerate() {
+            pack_write_entry(bitstream, i * encodebits, lobits, e.cluster_type, e.lo);
+        }
+        // Trailing slots inside the same pack: leave as zeros (the
+        // mask above already zero-initialised the buffer). The
+        // reader never reads past totalidx so these don't matter.
+        // Trailing __le32 base blkaddr.
+        pack_dst[bitstream_len..bitstream_len + 4].copy_from_slice(&base.to_le_bytes());
+        byte_cursor += pack_bytes;
+    };
 
     // Initial 4B region.
     let mut remaining_initial = geom.initial as usize;
     while remaining_initial > 0 {
-        let take = remaining_initial.min(2);
-        emit_pack(
-            &entries[entry_cursor..entry_cursor + take],
-            8,
-            2,
-            16, // 4B encodebits
-        );
+        let take = remaining_initial.min(COMPACT_4B.vcnt as usize);
+        emit_pack(&entries[entry_cursor..entry_cursor + take], COMPACT_4B);
         entry_cursor += take;
         remaining_initial -= take;
     }
@@ -1278,13 +1281,8 @@ fn encode_compact2b_index(geom: &CompactGeom, entries: &[CompactEntry], lobits: 
     if geom.use_2b_middle {
         let mut remaining_middle = geom.middle as usize;
         while remaining_middle > 0 {
-            let take = remaining_middle.min(16);
-            emit_pack(
-                &entries[entry_cursor..entry_cursor + take],
-                32,
-                16,
-                14, // 2B encodebits
-            );
+            let take = remaining_middle.min(COMPACT_2B.vcnt as usize);
+            emit_pack(&entries[entry_cursor..entry_cursor + take], COMPACT_2B);
             entry_cursor += take;
             remaining_middle -= take;
         }
@@ -1292,8 +1290,8 @@ fn encode_compact2b_index(geom: &CompactGeom, entries: &[CompactEntry], lobits: 
     // Trailing 4B region.
     let mut remaining_tail = geom.tail as usize;
     while remaining_tail > 0 {
-        let take = remaining_tail.min(2);
-        emit_pack(&entries[entry_cursor..entry_cursor + take], 8, 2, 16);
+        let take = remaining_tail.min(COMPACT_4B.vcnt as usize);
+        emit_pack(&entries[entry_cursor..entry_cursor + take], COMPACT_4B);
         entry_cursor += take;
         remaining_tail -= take;
     }

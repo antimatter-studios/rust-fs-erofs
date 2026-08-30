@@ -74,18 +74,59 @@ It now names the id and the valid set. The variant keeps its name because it is
 `pub`; its doc explains the mismatch. Its test asserts the new text **and** that
 "Phase 0" does not reappear.
 
-### M6, M7, M8, M9, M10, M11, M12, M17, M22 — repeated encodings and unnamed values — **fixable, not yet done**
+### M6 — compacted-pack geometry in four encodings — **fixed**
 
-Compacted-pack geometry in four encodings *one of which is correct*; a constant
-defined twice and another in the wrong module; the block-size range stated three
-times in two encodings; three encodings of the file-type taxonomy; inode sizes
-32 and 64 bare despite a named constant; the codec preamble three times; the
-xattr entry header decoded three times by hand; alignment hand-rolled four times
-in two idioms and two widths; and **117 inline hex slice ranges with no
-named-offset convention at all**.
+EROFS has two pack shapes: 4-byte (`vcnt = 2`, `pack_bytes = 8`,
+`encodebits = 16`) and 2-byte (`vcnt = 16`, `pack_bytes = 32`,
+`encodebits = 14`). `PackGeom` named all six values; three other places
+re-hardcoded them, including one holding a `PackGeom` in scope while writing the
+numbers by hand two lines later.
 
-M6 is the one to do first — four encodings of one geometry, only one right, is a
-bug waiting for someone to reach for the wrong one.
+**Probing the coverage first turned up something the report did not have.** The
+writer's `emit_pack(slice, 8, 2, 16)` takes `vcnt` as its third argument — and
+discards it on the next line but one:
+
+```rust
+let _ = vcnt;
+```
+
+So that argument was **dead at all three call sites**, and mutating it broke
+nothing: `16 → 8` in the 2B call left every test passing. It read as though it
+governed how many entries the pack holds; the caller's `take` does that, and
+`entries_slice.len()` is the real count. The parameter is gone.
+
+`CompactPackShape` with `COMPACT_4B` / `COMPACT_2B` is the one definition now,
+with `bytes_per_lcluster()` and `bytes_for()` for the derived values.
+`compact_alignment_pad` replaces the kernel's `((32 - ebase % 32) / 4) & 7`,
+whose three numbers are all this geometry wearing no names: 32 is the 2B pack, 4
+is the 4B shape's bytes per lcluster, 7 is one less than the number of them that
+fit in a 2B pack.
+
+Four tests, **written before the shapes existed and red until they did**. Each
+states the format independently rather than restating the code: `encodebits` is
+`(pack_bytes - 4) * 8 / vcnt` so a typo in any one field contradicts the other
+two; the pad and both region sizes are checked against the literal formulas they
+replace, over a full period and beyond so an off-by-one has nowhere to hide.
+
+**Coverage before and after** — mutating each field of the definition:
+
+| field | tests that fail now |
+|---|---|
+| `COMPACT_2B.encodebits` | 5 |
+| `COMPACT_2B.vcnt` | 6 |
+| `COMPACT_2B.pack_bytes` | 7 |
+
+The `vcnt` row was **zero** before, in one of the four copies. The refactor moved
+a value out of a position where nothing could see it wrong.
+
+### M7, M8, M9, M10, M11, M12, M17, M22 — repeated encodings and unnamed values — **fixable, not yet done**
+
+A constant defined twice and another in the wrong module; the block-size range
+stated three times in two encodings; three encodings of the file-type taxonomy;
+inode sizes 32 and 64 bare despite a named constant; the codec preamble three
+times; the xattr entry header decoded three times by hand; alignment hand-rolled
+four times in two idioms and two widths; and **117 inline hex slice ranges with
+no named-offset convention at all**.
 
 M22 is the largest and would change how the whole crate reads.
 
