@@ -428,6 +428,83 @@ enum IndexFormat {
     Compact,
 }
 
+/// The shape of a compacted-index pack: how big it is, how many
+/// lclusters it covers, and how wide each entry is.
+///
+/// EROFS defines exactly two, and every one of the three numbers in
+/// each is fixed by the other two — a pack spends its last 4 bytes on
+/// an `__le32` base blkaddr and divides the rest evenly among its
+/// entries:
+///
+/// ```text
+/// encodebits = (pack_bytes - 4) * 8 / vcnt
+/// ```
+///
+/// These lived as bare integers in four places: here, twice more in
+/// [`ZMap::locate_compact_pack`], inside the alignment-pad formula in
+/// [`ZMap::open`], and as three unlabelled arguments per call at three
+/// sites in the writer. Four encodings of one geometry is a bug waiting
+/// for somebody to reach for the wrong one, which is why they are one
+/// thing now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactPackShape {
+    /// On-disk bytes per pack, bitstream plus the trailing base
+    /// blkaddr.
+    pub pack_bytes: u32,
+    /// Lclusters covered by one pack.
+    pub vcnt: u32,
+    /// Bits per entry in the pack's bitstream.
+    pub encodebits: u32,
+}
+
+impl CompactPackShape {
+    /// On-disk bytes each lcluster of this shape costs.
+    ///
+    /// Not a spec field — it is `pack_bytes / vcnt`, and it is what
+    /// gives the two shapes their names: 4 bytes per lcluster for
+    /// compacted-4B, 2 for compacted-2B.
+    pub const fn bytes_per_lcluster(self) -> u32 {
+        self.pack_bytes / self.vcnt
+    }
+
+    /// Bytes a region of `lclusters` of this shape occupies.
+    ///
+    /// Rounds **up**: a partial last pack still takes a whole pack on
+    /// disk, and a region that under-counted it would put every later
+    /// region at the wrong offset.
+    pub const fn bytes_for(self, lclusters: u64) -> u64 {
+        lclusters.div_ceil(self.vcnt as u64) * self.pack_bytes as u64
+    }
+}
+
+/// Compacted-4B: `amortizedshift = 2`.
+pub(crate) const COMPACT_4B: CompactPackShape = CompactPackShape {
+    pack_bytes: 8,
+    vcnt: 2,
+    encodebits: 16,
+};
+
+/// Compacted-2B: `amortizedshift = 1`.
+pub(crate) const COMPACT_2B: CompactPackShape = CompactPackShape {
+    pack_bytes: 32,
+    vcnt: 16,
+    encodebits: 14,
+};
+
+/// Lclusters of 4B packing that precede the first 2B pack, so the 2B
+/// region starts on a [`COMPACT_2B`] boundary.
+///
+/// The kernel writes this as `((32 - ebase % 32) / 4) & 7`. Every one
+/// of those three numbers belongs to the geometry above: 32 is the 2B
+/// pack, 4 is the 4B shape's bytes per lcluster, and 7 is one less than
+/// the number of them that fit in a 2B pack.
+pub(crate) fn compact_alignment_pad(ebase: u64) -> u32 {
+    let align = COMPACT_2B.pack_bytes as u64;
+    let per_lcluster = COMPACT_4B.bytes_per_lcluster() as u64;
+    let lclusters_per_align = align / per_lcluster;
+    (((align - (ebase % align)) / per_lcluster) & (lclusters_per_align - 1)) as u32
+}
+
 /// Geometry of one pack in the compact bitstream.
 ///
 /// A pack covers `vcnt` lclusters and occupies `pack_bytes` on-disk
@@ -455,23 +532,21 @@ struct PackGeom {
 impl PackGeom {
     /// Pack geometry for compacted-4B (`amortizedshift = 2`).
     fn four_byte(z_lclusterbits: u32) -> Self {
-        let lobits = z_lclusterbits.max(12);
-        PackGeom {
-            pack_bytes: 8,
-            vcnt: 2,
-            encodebits: 16,
-            lobits,
-        }
+        PackGeom::from_shape(COMPACT_4B, z_lclusterbits)
     }
 
     /// Pack geometry for compacted-2B (`amortizedshift = 1`).
     fn two_byte(z_lclusterbits: u32) -> Self {
-        let lobits = z_lclusterbits.max(12);
+        PackGeom::from_shape(COMPACT_2B, z_lclusterbits)
+    }
+
+    /// A shape plus the `lobits` the inode's lcluster size implies.
+    fn from_shape(shape: CompactPackShape, z_lclusterbits: u32) -> Self {
         PackGeom {
-            pack_bytes: 32,
-            vcnt: 16,
-            encodebits: 14,
-            lobits,
+            pack_bytes: shape.pack_bytes,
+            vcnt: shape.vcnt,
+            encodebits: shape.encodebits,
+            lobits: z_lclusterbits.max(12),
         }
     }
 }
@@ -596,15 +671,16 @@ impl<'a> ZMap<'a> {
             .map_err(|_| Error::BadInode("inode too large for compact zmap"))?;
 
         let (compact_4b_initial, compact_2b) = if format == IndexFormat::Compact {
-            // 32-byte alignment pad, in lclusters: same formula as
-            // `((32 - ebase%32)/4) & 7` from the kernel. Capped at
-            // totalidx in case the file is tiny.
-            let pad = (((32 - (ebase % 32)) / 4) & 7) as u32;
-            let initial = pad.min(totalidx);
+            // Lclusters of 4B packing before the 2B region, so it
+            // starts on a pack boundary. Capped at totalidx in case the
+            // file is tiny.
+            let initial = compact_alignment_pad(ebase).min(totalidx);
             let middle = if (header.advise & Z_EROFS_ADVISE_COMPACTED_2B) != 0 && initial < totalidx
             {
+                // Whole 2B packs only — the remainder goes back to 4B
+                // packing in the trailing region.
                 let remaining = totalidx - initial;
-                remaining - (remaining % 16)
+                remaining - (remaining % COMPACT_2B.vcnt)
             } else {
                 0
             };
@@ -915,9 +991,8 @@ impl<'a> ZMap<'a> {
         }
         let after_initial = i - initial;
         // Bytes past index_start_offset for the start of the middle
-        // region: each initial pack is 8 bytes (vcnt=2). Round UP because
-        // a partial last pack still occupies a full pack.
-        let initial_bytes = (initial.div_ceil(2)) * 8;
+        // region.
+        let initial_bytes = COMPACT_4B.bytes_for(initial);
         if after_initial < middle {
             let geom = PackGeom::two_byte(z_lcb);
             let pack_idx = after_initial / geom.vcnt as u64;
@@ -931,9 +1006,7 @@ impl<'a> ZMap<'a> {
             });
         }
         let after_middle = after_initial - middle;
-        // Middle bytes: each pack covers 16 lclusters, 32 bytes per pack.
-        // Round UP for a partial last 2B pack.
-        let middle_bytes = (middle.div_ceil(16)) * 32;
+        let middle_bytes = COMPACT_2B.bytes_for(middle);
         let geom = PackGeom::four_byte(z_lcb);
         let pack_idx = after_middle / geom.vcnt as u64;
         let intra = (after_middle % geom.vcnt as u64) as u32;
@@ -1446,6 +1519,97 @@ fn is_head_or_plain(t: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    // --- compact pack geometry -------------------------------------------
+    //
+    // Written before the shapes existed, against the literals that were
+    // spread over four places. Each is an independent statement of the
+    // format, so they stay meaningful once one definition replaces the
+    // four.
+
+    /// `encodebits` is not a free parameter: a pack spends its last 4
+    /// bytes on the base blkaddr and divides the rest evenly among
+    /// `vcnt` entries.
+    ///
+    /// So a typo in any one of the three fields makes the other two
+    /// disagree with it. That is the whole reason the three belong
+    /// together rather than being passed as three unlabelled integers.
+    #[test]
+    fn a_pack_shape_is_internally_consistent() {
+        for shape in [COMPACT_4B, COMPACT_2B] {
+            assert_eq!(
+                shape.encodebits,
+                (shape.pack_bytes - 4) * 8 / shape.vcnt,
+                "{shape:?}: encodebits must be the bitstream split vcnt ways"
+            );
+            assert_eq!(
+                shape.pack_bytes % shape.vcnt,
+                0,
+                "{shape:?}: a pack covers a whole number of lclusters"
+            );
+        }
+    }
+
+    /// The two shapes are the two the format defines, by their names.
+    #[test]
+    fn the_two_pack_shapes_are_the_formats_own() {
+        assert_eq!(
+            (
+                COMPACT_4B.pack_bytes,
+                COMPACT_4B.vcnt,
+                COMPACT_4B.encodebits
+            ),
+            (8, 2, 16),
+            "compacted-4B"
+        );
+        assert_eq!(
+            (
+                COMPACT_2B.pack_bytes,
+                COMPACT_2B.vcnt,
+                COMPACT_2B.encodebits
+            ),
+            (32, 16, 14),
+            "compacted-2B"
+        );
+        assert_eq!(COMPACT_4B.bytes_per_lcluster(), 4);
+        assert_eq!(COMPACT_2B.bytes_per_lcluster(), 2);
+    }
+
+    /// The alignment pad, against the literal formula it replaces.
+    ///
+    /// `(((32 - (ebase % 32)) / 4) & 7)` is the kernel's, and it is
+    /// three constants of this geometry wearing no names: 32 is the 2B
+    /// pack, 4 is the 4B pack's bytes per lcluster, and 7 is one less
+    /// than the number of 4B lclusters that fit in a 2B pack.
+    ///
+    /// Checked across a full period plus change, so an off-by-one in
+    /// the rewrite has nowhere to hide.
+    #[test]
+    fn the_alignment_pad_matches_the_formula_it_replaces() {
+        for ebase in 0u64..200 {
+            let literal = (((32 - (ebase % 32)) / 4) & 7) as u32;
+            assert_eq!(compact_alignment_pad(ebase), literal, "ebase {ebase}");
+        }
+    }
+
+    /// Region sizing, against the literals it replaces. A partial last
+    /// pack still occupies a whole pack, which is why both round up.
+    #[test]
+    fn region_sizes_match_the_formulas_they_replace() {
+        for lclusters in 0u64..80 {
+            assert_eq!(
+                COMPACT_4B.bytes_for(lclusters),
+                lclusters.div_ceil(2) * 8,
+                "4B region of {lclusters} lclusters"
+            );
+            assert_eq!(
+                COMPACT_2B.bytes_for(lclusters),
+                lclusters.div_ceil(16) * 32,
+                "2B region of {lclusters} lclusters"
+            );
+        }
+    }
+
     use super::*;
     use crate::inode::tests::synth_compact;
     use crate::layout::DataLayout;
