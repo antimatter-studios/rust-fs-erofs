@@ -142,6 +142,14 @@ pub const Z_EROFS_LEGACY_MAP_HEADER_SIZE: u64 = 16;
 /// (no reserved gap; `ebase = sizeof(map_header) + round_up(end, 8)`).
 pub const Z_EROFS_COMPACT_MAP_HEADER_SIZE: u64 = 8;
 
+/// The compacted map's entry base is 8-byte aligned.
+///
+/// It shares its value with [`Z_EROFS_COMPACT_MAP_HEADER_SIZE`] and is
+/// a different quantity: one is a header's length, the other an
+/// alignment the header happens to satisfy. Written as `(x + 7) & !7`
+/// at three sites before this.
+pub const COMPACT_MAP_EBASE_ALIGN: u64 = 8;
+
 pub const Z_EROFS_LCLUSTER_INDEX_SIZE: u64 = 8;
 
 pub const Z_EROFS_LCLUSTER_TYPE_PLAIN: u8 = 0;
@@ -658,7 +666,7 @@ impl<'a> ZMap<'a> {
         // compact this is the start of pack 0; for legacy we add
         // another 8-byte gap to land at the first lcluster_index entry
         // (per Z_EROFS_FULL_INDEX_START).
-        let ebase = (header_off + 7) & !7u64;
+        let ebase = header_off.next_multiple_of(COMPACT_MAP_EBASE_ALIGN);
         let ebase = ebase + Z_EROFS_COMPACT_MAP_HEADER_SIZE;
         let index_start_offset = match format {
             IndexFormat::Legacy => ebase + 8,

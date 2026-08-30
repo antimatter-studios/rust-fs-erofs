@@ -43,6 +43,32 @@ pub mod ftype {
     pub const SYMLINK: u8 = 7;
 }
 
+/// The dirent type byte for a POSIX mode.
+///
+/// The crate had three independent encodings of this taxonomy: the
+/// `S_IF*` bits in `inode.rs`, the `ftype` values above, and — in
+/// `capi.rs` — a third table that re-derived the mapping between them
+/// in *octal*, referring to both sets by name in comments because it
+/// referenced neither in code. This is that mapping, once, in the
+/// module that owns the values it produces.
+///
+/// An unrecognised type is [`ftype::UNKNOWN`] rather than an error: a
+/// dirent whose type byte disagrees with its inode's mode is something
+/// a reader reports, not something it refuses to list.
+pub fn dirent_type_for_mode(mode: u16) -> u8 {
+    use crate::inode::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK};
+    match mode & S_IFMT {
+        S_IFREG => ftype::REG_FILE,
+        S_IFDIR => ftype::DIR,
+        S_IFCHR => ftype::CHRDEV,
+        S_IFBLK => ftype::BLKDEV,
+        S_IFIFO => ftype::FIFO,
+        S_IFSOCK => ftype::SOCK,
+        S_IFLNK => ftype::SYMLINK,
+        _ => ftype::UNKNOWN,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub nid: u64,

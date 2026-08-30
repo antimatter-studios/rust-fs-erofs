@@ -20,7 +20,75 @@ use crate::layout::{InodeFormat, InodeVersion};
 use crate::superblock::Superblock;
 use fs_core::BlockRead;
 
+/// The stride NIDs are counted in: an inode's byte offset is its NID
+/// times this.
+///
+/// It shares its value with [`COMPACT_INODE_SIZE`] and is **not the
+/// same quantity** — one is an addressing unit, the other a structure
+/// size. They agree at 32 because a compact inode fills exactly one
+/// slot; an extended inode occupies two. Naming both is the point;
+/// collapsing them would lose the distinction that makes the extended
+/// case legible.
 pub const EROFS_INODE_SLOT_SIZE: u64 = 32;
+
+/// Size of a compact (v1) on-disk inode.
+pub const COMPACT_INODE_SIZE: u64 = 32;
+
+/// Size of an extended (v2) on-disk inode — two slots.
+pub const EXTENDED_INODE_SIZE: u64 = 64;
+
+/// Bytes per superblock extension slot, counted by
+/// `Superblock::sb_extslots`.
+pub const SB_EXTSLOT_SIZE: u64 = 16;
+
+/// Byte offsets within a compact (v1) on-disk inode, per
+/// `struct erofs_inode_compact`.
+///
+/// Named for the reason given in [`crate::superblock::offsets`]: the
+/// crate carried 117 unnamed inline hex ranges, and matching one
+/// against the kernel header meant counting bytes.
+///
+/// The compact and extended layouts **diverge after offset 0x08**, and
+/// they are separate tables here rather than one with exceptions —
+/// `SIZE` is a `u32` at 0x08 in one and a `u64` at 0x08 in the other,
+/// and `UID` is two bytes in one and four in the other. A single table
+/// would have to encode that, and the encoding would be harder to
+/// check against the header than two plain lists.
+pub mod compact_offsets {
+    use std::ops::Range;
+
+    pub const FORMAT: Range<usize> = 0x00..0x02;
+    pub const XATTR_ICOUNT: Range<usize> = 0x02..0x04;
+    pub const MODE: Range<usize> = 0x04..0x06;
+    pub const NLINK: Range<usize> = 0x06..0x08;
+    pub const SIZE: Range<usize> = 0x08..0x0C;
+    /// The format-dependent union: block address, raw device, or inline
+    /// tail offset.
+    pub const RAW_U: Range<usize> = 0x10..0x14;
+    pub const INO: Range<usize> = 0x14..0x18;
+    pub const UID: Range<usize> = 0x18..0x1A;
+    pub const GID: Range<usize> = 0x1A..0x1C;
+}
+
+/// Byte offsets within an extended (v2) on-disk inode, per
+/// `struct erofs_inode_extended`. See [`compact_offsets`] on why these
+/// are two tables.
+pub mod extended_offsets {
+    use std::ops::Range;
+
+    pub const FORMAT: Range<usize> = 0x00..0x02;
+    pub const XATTR_ICOUNT: Range<usize> = 0x02..0x04;
+    pub const MODE: Range<usize> = 0x04..0x06;
+    pub const SIZE: Range<usize> = 0x08..0x10;
+    /// The format-dependent union — same offset as the compact layout.
+    pub const RAW_U: Range<usize> = 0x10..0x14;
+    pub const INO: Range<usize> = 0x14..0x18;
+    pub const UID: Range<usize> = 0x18..0x1C;
+    pub const GID: Range<usize> = 0x1C..0x20;
+    pub const MTIME: Range<usize> = 0x20..0x28;
+    pub const MTIME_NSEC: Range<usize> = 0x28..0x2C;
+    pub const NLINK: Range<usize> = 0x2C..0x30;
+}
 
 /// Linux POSIX `S_IF*` mode-type bits. Carried locally so we don't need
 /// libc as a dep. Source: `linux/include/uapi/linux/stat.h`.
@@ -81,24 +149,29 @@ impl Inode {
     /// Parse from a buffer beginning at the inode's first byte. The
     /// buffer must hold at least `on_disk_size` bytes (32 or 64).
     pub fn parse(nid: u64, bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 32 {
+        if (bytes.len() as u64) < COMPACT_INODE_SIZE {
             return Err(Error::BadInode("buffer shorter than 32 bytes"));
         }
-        let raw_format = u16::from_le_bytes(bytes[0x00..0x02].try_into().unwrap());
+        let raw_format = u16::from_le_bytes(bytes[compact_offsets::FORMAT].try_into().unwrap());
         let format = InodeFormat::parse(raw_format)?;
-        let xattr_icount = u16::from_le_bytes(bytes[0x02..0x04].try_into().unwrap());
-        let mode = u16::from_le_bytes(bytes[0x04..0x06].try_into().unwrap());
-        let raw_u = u32::from_le_bytes(bytes[0x10..0x14].try_into().unwrap());
+        let xattr_icount =
+            u16::from_le_bytes(bytes[compact_offsets::XATTR_ICOUNT].try_into().unwrap());
+        let mode = u16::from_le_bytes(bytes[compact_offsets::MODE].try_into().unwrap());
+        let raw_u = u32::from_le_bytes(bytes[compact_offsets::RAW_U].try_into().unwrap());
 
         match format.version {
             InodeVersion::Compact => {
                 // size at 0x08 (u32), nlink at 0x06 (u16), uid at 0x18 (u16),
                 // gid at 0x1A (u16), no mtime fields.
-                let size = u32::from_le_bytes(bytes[0x08..0x0C].try_into().unwrap()) as u64;
-                let nlink = u16::from_le_bytes(bytes[0x06..0x08].try_into().unwrap()) as u32;
-                let ino = u32::from_le_bytes(bytes[0x14..0x18].try_into().unwrap());
-                let uid = u16::from_le_bytes(bytes[0x18..0x1A].try_into().unwrap()) as u32;
-                let gid = u16::from_le_bytes(bytes[0x1A..0x1C].try_into().unwrap()) as u32;
+                let size =
+                    u32::from_le_bytes(bytes[compact_offsets::SIZE].try_into().unwrap()) as u64;
+                let nlink =
+                    u16::from_le_bytes(bytes[compact_offsets::NLINK].try_into().unwrap()) as u32;
+                let ino = u32::from_le_bytes(bytes[compact_offsets::INO].try_into().unwrap());
+                let uid =
+                    u16::from_le_bytes(bytes[compact_offsets::UID].try_into().unwrap()) as u32;
+                let gid =
+                    u16::from_le_bytes(bytes[compact_offsets::GID].try_into().unwrap()) as u32;
                 Ok(Inode {
                     nid,
                     format,
@@ -112,22 +185,23 @@ impl Inode {
                     mtime_nsec: 0,
                     ino,
                     raw_u,
-                    on_disk_size: 32,
+                    on_disk_size: COMPACT_INODE_SIZE as u8,
                 })
             }
             InodeVersion::Extended => {
-                if bytes.len() < 64 {
+                if (bytes.len() as u64) < EXTENDED_INODE_SIZE {
                     return Err(Error::BadInode("extended inode buffer < 64 bytes"));
                 }
                 // size at 0x08 (u64), uid at 0x18 (u32), gid at 0x1C (u32),
                 // mtime at 0x20 (u64), mtime_nsec 0x28 (u32), nlink 0x2C (u32).
-                let size = u64::from_le_bytes(bytes[0x08..0x10].try_into().unwrap());
-                let ino = u32::from_le_bytes(bytes[0x14..0x18].try_into().unwrap());
-                let uid = u32::from_le_bytes(bytes[0x18..0x1C].try_into().unwrap());
-                let gid = u32::from_le_bytes(bytes[0x1C..0x20].try_into().unwrap());
-                let mtime = u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap());
-                let mtime_nsec = u32::from_le_bytes(bytes[0x28..0x2C].try_into().unwrap());
-                let nlink = u32::from_le_bytes(bytes[0x2C..0x30].try_into().unwrap());
+                let size = u64::from_le_bytes(bytes[extended_offsets::SIZE].try_into().unwrap());
+                let ino = u32::from_le_bytes(bytes[extended_offsets::INO].try_into().unwrap());
+                let uid = u32::from_le_bytes(bytes[extended_offsets::UID].try_into().unwrap());
+                let gid = u32::from_le_bytes(bytes[extended_offsets::GID].try_into().unwrap());
+                let mtime = u64::from_le_bytes(bytes[extended_offsets::MTIME].try_into().unwrap());
+                let mtime_nsec =
+                    u32::from_le_bytes(bytes[extended_offsets::MTIME_NSEC].try_into().unwrap());
+                let nlink = u32::from_le_bytes(bytes[extended_offsets::NLINK].try_into().unwrap());
                 Ok(Inode {
                     nid,
                     format,
@@ -141,7 +215,7 @@ impl Inode {
                     mtime_nsec,
                     ino,
                     raw_u,
-                    on_disk_size: 64,
+                    on_disk_size: EXTENDED_INODE_SIZE as u8,
                 })
             }
         }
@@ -171,7 +245,9 @@ impl Inode {
     /// Read this inode by NID.
     pub fn read<R: BlockRead + ?Sized>(dev: &R, sb: &Superblock, nid: u64) -> Result<Self> {
         let off = Inode::iloc(sb, nid);
-        let mut buf = [0u8; 64];
+        // Read a full extended inode: the version is only knowable
+        // after parsing, and a compact one simply ignores the tail.
+        let mut buf = [0u8; EXTENDED_INODE_SIZE as usize];
         dev.read_at(off, &mut buf)?;
         Inode::parse(nid, &buf)
     }
@@ -245,6 +321,106 @@ impl Inode {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// The inode offset tables, checked against the kernel header.
+    ///
+    /// A deliberate second copy, for the reason given in
+    /// [`crate::superblock`]'s equivalent. The compact and extended
+    /// layouts are asserted separately because they genuinely diverge
+    /// after 0x08 — `SIZE` is four bytes in one and eight in the other,
+    /// `UID` two and four.
+    #[test]
+    fn inode_offsets_match_the_kernel_header() {
+        use super::{compact_offsets as ci, extended_offsets as xi};
+
+        assert_eq!(ci::FORMAT, 0x00..0x02);
+        assert_eq!(ci::XATTR_ICOUNT, 0x02..0x04);
+        assert_eq!(ci::MODE, 0x04..0x06);
+        assert_eq!(ci::NLINK, 0x06..0x08);
+        assert_eq!(ci::SIZE, 0x08..0x0C);
+        assert_eq!(ci::RAW_U, 0x10..0x14);
+        assert_eq!(ci::INO, 0x14..0x18);
+        assert_eq!(ci::UID, 0x18..0x1A);
+        assert_eq!(ci::GID, 0x1A..0x1C);
+
+        assert_eq!(xi::FORMAT, 0x00..0x02);
+        assert_eq!(xi::XATTR_ICOUNT, 0x02..0x04);
+        assert_eq!(xi::MODE, 0x04..0x06);
+        assert_eq!(xi::SIZE, 0x08..0x10);
+        assert_eq!(xi::RAW_U, 0x10..0x14);
+        assert_eq!(xi::INO, 0x14..0x18);
+        assert_eq!(xi::UID, 0x18..0x1C);
+        assert_eq!(xi::GID, 0x1C..0x20);
+        assert_eq!(xi::MTIME, 0x20..0x28);
+        assert_eq!(xi::MTIME_NSEC, 0x28..0x2C);
+        assert_eq!(xi::NLINK, 0x2C..0x30);
+    }
+
+    /// The fields the two layouts share sit at the same offsets.
+    ///
+    /// `format`, `xattr_icount`, `mode`, the union at 0x10 and `ino`
+    /// are read *before* the version is known — the parser reads
+    /// `format` to find out which layout it has. If those five ever
+    /// diverged, the parser could not work at all, and this says so.
+    #[test]
+    fn the_two_inode_layouts_agree_on_the_fields_read_before_the_version() {
+        use super::{compact_offsets as ci, extended_offsets as xi};
+        assert_eq!(ci::FORMAT, xi::FORMAT);
+        assert_eq!(ci::XATTR_ICOUNT, xi::XATTR_ICOUNT);
+        assert_eq!(ci::MODE, xi::MODE);
+        assert_eq!(ci::RAW_U, xi::RAW_U);
+        assert_eq!(ci::INO, xi::INO);
+    }
+
+    /// Neither layout has a field running past the structure it lives
+    /// in, and neither overlaps itself.
+    #[test]
+    fn no_inode_field_overlaps_its_neighbour() {
+        use super::{compact_offsets as ci, extended_offsets as xi};
+
+        let compact = [
+            (ci::FORMAT.start, ci::FORMAT.len()),
+            (ci::XATTR_ICOUNT.start, ci::XATTR_ICOUNT.len()),
+            (ci::MODE.start, ci::MODE.len()),
+            (ci::NLINK.start, ci::NLINK.len()),
+            (ci::SIZE.start, ci::SIZE.len()),
+            (ci::RAW_U.start, ci::RAW_U.len()),
+            (ci::INO.start, ci::INO.len()),
+            (ci::UID.start, ci::UID.len()),
+            (ci::GID.start, ci::GID.len()),
+        ];
+        check_layout(&compact, COMPACT_INODE_SIZE as usize, "compact inode");
+
+        let extended = [
+            (xi::FORMAT.start, xi::FORMAT.len()),
+            (xi::XATTR_ICOUNT.start, xi::XATTR_ICOUNT.len()),
+            (xi::MODE.start, xi::MODE.len()),
+            (xi::SIZE.start, xi::SIZE.len()),
+            (xi::RAW_U.start, xi::RAW_U.len()),
+            (xi::INO.start, xi::INO.len()),
+            (xi::UID.start, xi::UID.len()),
+            (xi::GID.start, xi::GID.len()),
+            (xi::MTIME.start, xi::MTIME.len()),
+            (xi::MTIME_NSEC.start, xi::MTIME_NSEC.len()),
+            (xi::NLINK.start, xi::NLINK.len()),
+        ];
+        check_layout(&extended, EXTENDED_INODE_SIZE as usize, "extended inode");
+    }
+
+    fn check_layout(fields: &[(usize, usize)], size: usize, what: &str) {
+        let mut reached = 0usize;
+        for (start, width) in fields {
+            assert!(
+                *start >= reached,
+                "{what}: field at {start:#x} overlaps the one ending at {reached:#x}"
+            );
+            reached = start + width;
+            assert!(
+                reached <= size,
+                "{what}: field at {start:#x} runs past {size} bytes"
+            );
+        }
+    }
+
     use super::*;
     use crate::layout::DataLayout;
 

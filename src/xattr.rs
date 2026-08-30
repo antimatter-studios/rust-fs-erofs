@@ -156,6 +156,20 @@ pub struct XattrLongPrefix {
 /// opposite order from what an early reading of the kernel doc might
 /// suggest -- the on-disk reality is shared-indices-first, confirmed by
 /// inspecting `mkfs.erofs` (erofs-utils 1.9) output byte-for-byte.
+/// Round up to the 4-byte boundary an xattr entry starts on.
+///
+/// Written as `(x + 3) & !3` at three sites and as a
+/// `while !len.is_multiple_of(4) { push(0) }` loop at two more — three
+/// spellings of one rule, and the bit-twiddle silently wraps on a value
+/// near `u64::MAX` where `next_multiple_of` panics instead. Neither
+/// case is reachable from a real image, but only one of them says so.
+fn align_to_xattr_entry(n: u64) -> u64 {
+    n.next_multiple_of(XATTR_ENTRY_ALIGN)
+}
+
+/// Every xattr entry begins on a 4-byte boundary.
+pub const XATTR_ENTRY_ALIGN: u64 = 4;
+
 pub fn parse_inline_xattrs(buf: &[u8]) -> Result<(Vec<u32>, Vec<XattrEntry>)> {
     if buf.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -212,7 +226,7 @@ pub fn parse_inline_xattrs(buf: &[u8]) -> Result<(Vec<u32>, Vec<XattrEntry>)> {
         });
 
         // Advance to next entry, padded up to a 4-byte boundary.
-        cur = (entry_body_end + 3) & !3;
+        cur = align_to_xattr_entry(entry_body_end as u64) as usize;
     }
 
     Ok((shared, out))
@@ -405,7 +419,7 @@ pub fn read_xattr_prefix_dictionary<R: BlockRead + ?Sized>(
         // Advance past size header + body, then 4-byte align.
         let consumed = 2 + size as u64;
         cursor += consumed;
-        cursor = (cursor + 3) & !3;
+        cursor = align_to_xattr_entry(cursor);
     }
     Ok(out)
 }
@@ -489,7 +503,7 @@ mod tests {
         buf.extend_from_slice(&(value.len() as u16).to_le_bytes());
         buf.extend_from_slice(name);
         buf.extend_from_slice(value);
-        while !buf.len().is_multiple_of(4) {
+        while !buf.len().is_multiple_of(XATTR_ENTRY_ALIGN as usize) {
             buf.push(0);
         }
     }

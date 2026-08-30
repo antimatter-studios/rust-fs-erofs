@@ -11,6 +11,7 @@
 //! Not derived from any GPL'd EROFS codebase.
 
 use fs_erofs::mkfs::{build_image, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE};
+use fs_erofs::superblock::{is_valid_blkszbits, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
@@ -22,10 +23,24 @@ Phase 0: uncompressed, compact inodes, FLAT_PLAIN. Symlinks, hardlinks,
 and special files are skipped (warned to stderr).
 
 Options:
-  --block-size N    Block size in bytes. Power of 2, 512..=65536.
+  --block-size N    Block size in bytes. Power of 2, {MIN}..={MAX}.
                     Default: 4096.
   -h, --help        This help.
 ";
+
+/// The usage text with the block-size range filled in from
+/// [`fs_erofs::superblock`].
+///
+/// The range used to be typed out here as `512..=65536` and again in
+/// the error message below, in bytes, while the same rule was stated
+/// twice more as shifts in the library — five copies in three files in
+/// two units. Now the text is generated from the one definition, so it
+/// cannot describe a range the program does not enforce.
+fn usage() -> String {
+    USAGE
+        .replace("{MIN}", &MIN_BLOCK_SIZE.to_string())
+        .replace("{MAX}", &MAX_BLOCK_SIZE.to_string())
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -35,7 +50,7 @@ fn main() -> ExitCode {
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{}", usage());
                 return ExitCode::from(0);
             }
             "--block-size" => {
@@ -63,13 +78,13 @@ fn main() -> ExitCode {
         }
     }
     if positional.len() != 2 {
-        eprint!("{USAGE}");
+        eprint!("{}", usage());
         return ExitCode::from(2);
     }
     let blkszbits = match block_size_to_bits(block_size) {
         Some(b) => b,
         None => {
-            eprintln!("--block-size must be a power of 2 in 512..=65536");
+            eprintln!("--block-size must be a power of 2 in {MIN_BLOCK_SIZE}..={MAX_BLOCK_SIZE}");
             return ExitCode::from(2);
         }
     };
@@ -112,7 +127,7 @@ fn block_size_to_bits(bs: u64) -> Option<u8> {
         return None;
     }
     let bits = bs.trailing_zeros() as u8;
-    if (9..=16).contains(&bits) {
+    if is_valid_blkszbits(bits) {
         Some(bits)
     } else {
         None
