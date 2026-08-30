@@ -366,6 +366,7 @@ pub fn read_xattr_prefix_dictionary<R: BlockRead + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_device::MemDev;
 
     /// Append a single entry (header + name + value) to `buf`, padding
     /// the result to a 4-byte boundary.
@@ -553,29 +554,6 @@ mod tests {
         assert!(matches!(err, Error::BadXattr(_)));
     }
 
-    /// In-memory `BlockRead` for unit tests in this module. Tiny and
-    /// dependency-free so we can synthesize shared-block / dictionary
-    /// images without spinning up the full `mkfs` writer.
-    struct MemDev(Vec<u8>);
-    impl BlockRead for MemDev {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
-            let s = offset as usize;
-            let e = s + buf.len();
-            if e > self.0.len() {
-                return Err(fs_core::Error::ShortRead {
-                    offset,
-                    want: buf.len(),
-                    got: self.0.len().saturating_sub(s),
-                });
-            }
-            buf.copy_from_slice(&self.0[s..e]);
-            Ok(())
-        }
-        fn size_bytes(&self) -> u64 {
-            self.0.len() as u64
-        }
-    }
-
     /// Build a synthetic image whose shared-xattr block area at byte 0
     /// (xattr_blkaddr = 0) holds two shared entries. Returns the device
     /// and the indices for each.
@@ -596,7 +574,7 @@ mod tests {
         img[off1 as usize + 2..off1 as usize + 4].copy_from_slice(&3u16.to_le_bytes());
         img[off1 as usize + 4..off1 as usize + 7].copy_from_slice(b"foo");
         img[off1 as usize + 7..off1 as usize + 10].copy_from_slice(b"bar");
-        (MemDev(img), [off0 / 4, off1 / 4])
+        (MemDev::new(img), [off0 / 4, off1 / 4])
     }
 
     /// Build a Superblock with `xattr_blkaddr = 0` (so shared offset =
@@ -650,7 +628,7 @@ mod tests {
     #[test]
     fn read_dictionary_two_entries() {
         let img = synth_dict_image();
-        let dev = MemDev(img);
+        let dev = MemDev::new(img);
         // Hand-build a superblock buffer with xattr_prefix_count=2 and
         // xattr_prefix_start=2 (byte offset 8).
         let mut sb_buf = crate::superblock::tests::synth_sb(12, 0, 0, 1);
@@ -668,7 +646,7 @@ mod tests {
     #[test]
     fn read_dictionary_empty_when_count_zero() {
         let img = synth_dict_image();
-        let dev = MemDev(img);
+        let dev = MemDev::new(img);
         let sb_buf = crate::superblock::tests::synth_sb(12, 0, 0, 1);
         let sb = Superblock::parse(&sb_buf).unwrap();
         // count=0 (default) -> empty dict, no read.
@@ -687,7 +665,7 @@ mod tests {
         img[off + 2..off + 4].copy_from_slice(&1u16.to_le_bytes()); // val_size=1
         img[off + 4..off + 10].copy_from_slice(b".thing");
         img[off + 10] = b'v';
-        let dev = MemDev(img);
+        let dev = MemDev::new(img);
         let sb = synth_sb_for_shared();
         let entries = read_shared_xattrs(&dev, &sb, &[(off / 4) as u32]).unwrap();
         assert_eq!(entries.len(), 1);

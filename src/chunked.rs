@@ -133,30 +133,7 @@ pub(crate) mod tests {
     use crate::inode::tests::synth_compact;
     use crate::layout::DataLayout;
     use crate::superblock::tests::synth_sb;
-    use fs_core::{BlockRead, Result as BlockResult};
-    use std::sync::Mutex;
-
-    /// In-memory device for tests.
-    pub(crate) struct MemDev(pub Mutex<Vec<u8>>);
-    impl BlockRead for MemDev {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> BlockResult<()> {
-            let v = self.0.lock().unwrap();
-            let start = offset as usize;
-            let end = start + buf.len();
-            if end > v.len() {
-                return Err(fs_core::Error::ShortRead {
-                    offset,
-                    want: buf.len(),
-                    got: v.len().saturating_sub(start),
-                });
-            }
-            buf.copy_from_slice(&v[start..end]);
-            Ok(())
-        }
-        fn size_bytes(&self) -> u64 {
-            self.0.lock().unwrap().len() as u64
-        }
-    }
+    use crate::test_device::MemDev;
 
     /// Build a synthetic compact ChunkBased inode buffer with a given
     /// per-layout `flags` value. Layout occupies bits 1..=3, flags occupy
@@ -226,7 +203,7 @@ pub(crate) mod tests {
     #[test]
     fn lookup_compact_chunkmap_present_and_hole() {
         let img = build_compact_chunkmap_image([0x1234_5678, EROFS_NULL_ADDR]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let (a0, d0) = lookup_chunk_blkaddr(&dev, &sb, &inode, 0).unwrap();
@@ -260,7 +237,7 @@ pub(crate) mod tests {
         img[map_off + 10..map_off + 12].copy_from_slice(&0u16.to_le_bytes());
         img[map_off + 12..map_off + 16].copy_from_slice(&EROFS_NULL_ADDR.to_le_bytes());
 
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         assert_eq!(lookup_chunk_blkaddr(&dev, &sb, &inode, 0).unwrap(), (7, 0));
@@ -292,7 +269,7 @@ pub(crate) mod tests {
         img[map_off + 10..map_off + 12].copy_from_slice(&2u16.to_le_bytes());
         img[map_off + 12..map_off + 16].copy_from_slice(&17u32.to_le_bytes());
 
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let (a0, d0) = lookup_chunk_blkaddr(&dev, &sb, &inode, 0).unwrap();
@@ -304,7 +281,7 @@ pub(crate) mod tests {
     #[test]
     fn lookup_out_of_range_chunk() {
         let img = build_compact_chunkmap_image([5, 6]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         assert!(matches!(

@@ -130,7 +130,36 @@ no named-offset convention at all**.
 
 M22 is the largest and would change how the whole crate reads.
 
-### M13 — `MemDev` defined seven times — **fixable, not yet done**
+### M13 — `MemDev` defined seven times — **fixed, six of the seven**
+
+Six copies inside `src/` — `chunked`, `mkfs`, `superblock`, `zmap`, `fs`,
+`xattr` — plus one in `tests/common/mod.rs`. The bodies differed only in whether
+the buffer sat behind a `Mutex` and whether the locals were `start`/`end` or
+`s`/`e`.
+
+Test scaffolding duplicates more readily than production code precisely because
+nobody is looking for it: each module needed a device, twenty lines was quicker
+than finding the one next door, and no reviewer notices a helper only tests use.
+The cost is the same as anywhere else — **seven chances for the short-read
+behaviour to differ**, and that is the one behaviour a device under test is being
+asked about. A device that quietly zero-fills makes a parser reading past its
+structure look correct.
+
+`src/test_device.rs` is the one now, with `MemDev::new(bytes)` so callers do not
+each spell the `Mutex`. Three tests pin the behaviour the six copies each
+restated: a read past the end is a `ShortRead` carrying how much was available
+and **leaves the buffer untouched**; an offset past the end reports zero rather
+than a wrapped subtraction.
+
+**`tests/common/mod.rs` keeps its copy, deliberately.** Integration tests compile
+as a separate crate and cannot see a `#[cfg(test)]` item, so sharing with them
+would mean exporting this from the public API behind a feature — changing what
+the crate offers the world for the convenience of its own tests. Two copies
+across a compilation boundary is a real boundary; seven inside one module tree
+was not.
+
+Mutation-checked: making the shared device stop refusing short reads fails 5
+tests. 129 lines net removed.
 
 ### M14, M15, M25, M26, M27 — structure and API surface — **needs your decision**
 
