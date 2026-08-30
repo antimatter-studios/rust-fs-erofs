@@ -480,6 +480,7 @@ pub fn read_compr_cfgs<R: BlockRead + ?Sized>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_device::MemDev;
 
     /// Build a minimal valid superblock buffer for tests.
     pub(crate) fn synth_sb(
@@ -536,27 +537,6 @@ pub(crate) mod tests {
         ));
     }
 
-    /// In-memory device for synthetic device-table tests.
-    struct MemDev(Vec<u8>);
-    impl BlockRead for MemDev {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
-            let start = offset as usize;
-            let end = start + buf.len();
-            if end > self.0.len() {
-                return Err(fs_core::Error::ShortRead {
-                    offset,
-                    want: buf.len(),
-                    got: self.0.len().saturating_sub(start),
-                });
-            }
-            buf.copy_from_slice(&self.0[start..end]);
-            Ok(())
-        }
-        fn size_bytes(&self) -> u64 {
-            self.0.len() as u64
-        }
-    }
-
     /// Build a synthetic SB buffer with `extra_devices` and `devt_slotoff`
     /// populated.
     fn synth_sb_with_devices(extra: u16, devt_slotoff: u16) -> [u8; EROFS_SUPER_BLOCK_SIZE] {
@@ -570,7 +550,7 @@ pub(crate) mod tests {
     fn device_table_empty_when_extra_devices_zero() {
         let buf = synth_sb_with_devices(0, 0);
         let sb = Superblock::parse(&buf).unwrap();
-        let dev = MemDev(buf.to_vec());
+        let dev = MemDev::new(buf.to_vec());
         let slots = read_device_table(&dev, &sb).unwrap();
         assert!(slots.is_empty());
     }
@@ -597,7 +577,7 @@ pub(crate) mod tests {
         img[s1 + 68..s1 + 72].copy_from_slice(&5u32.to_le_bytes());
 
         let sb = Superblock::parse(&sb_buf).unwrap();
-        let dev = MemDev(img);
+        let dev = MemDev::new(img);
         let slots = read_device_table(&dev, &sb).unwrap();
         assert_eq!(slots.len(), 2);
         assert_eq!(slots[0].tag_str(), "first");
@@ -619,7 +599,7 @@ pub(crate) mod tests {
         img[EROFS_SUPER_OFFSET as usize..EROFS_SUPER_OFFSET as usize + sb_buf.len()]
             .copy_from_slice(&sb_buf);
         let sb = Superblock::parse(&sb_buf).unwrap();
-        let dev = MemDev(img);
+        let dev = MemDev::new(img);
         let err = read_device_table(&dev, &sb).unwrap_err();
         assert!(matches!(err, Error::Block(_)));
     }

@@ -1519,6 +1519,7 @@ fn is_head_or_plain(t: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_device::MemDev;
 
     // --- compact pack geometry -------------------------------------------
     //
@@ -1614,31 +1615,7 @@ mod tests {
     use crate::inode::tests::synth_compact;
     use crate::layout::DataLayout;
     use crate::superblock::tests::synth_sb;
-    use fs_core::{BlockRead, Result as BlockResult};
-    use std::sync::Mutex;
-
-    /// In-memory device for tests (modelled after the MemDev in
-    /// chunked / fs).
-    struct MemDev(Mutex<Vec<u8>>);
-    impl BlockRead for MemDev {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> BlockResult<()> {
-            let v = self.0.lock().unwrap();
-            let start = offset as usize;
-            let end = start + buf.len();
-            if end > v.len() {
-                return Err(fs_core::Error::ShortRead {
-                    offset,
-                    want: buf.len(),
-                    got: v.len().saturating_sub(start),
-                });
-            }
-            buf.copy_from_slice(&v[start..end]);
-            Ok(())
-        }
-        fn size_bytes(&self) -> u64 {
-            self.0.lock().unwrap().len() as u64
-        }
-    }
+    use fs_core::BlockRead;
 
     /// Build a synthetic CompressionLegacy (layout id 1) inode buffer.
     /// Used to drive the legacy/full-index path. `i_u` carries
@@ -1823,7 +1800,7 @@ mod tests {
         let nonhead = encode_lcluster(/*advise=NONHEAD*/ 2, 0, 1 /*delta[0]=1*/);
         let head2 = encode_lcluster(1, 0, 200);
         let img = build_zmap_image(3 * 4096, 0, 0, &[head1, nonhead, head2]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -1857,7 +1834,7 @@ mod tests {
     fn plain_cluster_passes_blkaddr_through() {
         let plain = encode_lcluster(/*advise=PLAIN*/ 0, 0, 42);
         let img = build_zmap_image(4096, 0, 0, &[plain]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -1885,7 +1862,7 @@ mod tests {
             99,
         );
         let img = build_compact_4b_image(2 * 4096, 0, 0, &[pack0], 0, &[]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -1918,7 +1895,7 @@ mod tests {
             99,
         );
         let img = build_compact_4b_image(2 * 4096, 0, 0, &[pack0], 0, &[]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2004,7 +1981,7 @@ mod tests {
         img[off..off + 32].copy_from_slice(&middle_pack);
         // off += 32; (no trailing region in this fixture)
 
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2079,7 +2056,7 @@ mod tests {
             off += 8;
         }
 
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2117,7 +2094,7 @@ mod tests {
             17,
             &inline_payload,
         );
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2153,7 +2130,7 @@ mod tests {
         for (i, b) in img[inline_at..inline_at + 9].iter_mut().enumerate() {
             *b = (0xA0 + i) as u8;
         }
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2179,7 +2156,7 @@ mod tests {
         const BS: usize = 4096;
         let hdr_off = BS + 32;
         img[hdr_off..hdr_off + 4].copy_from_slice(&0x1234u32.to_le_bytes());
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).expect("fragments must open");
@@ -2214,7 +2191,7 @@ mod tests {
         const BS: usize = 4096;
         let hdr_off = BS + 32;
         img[hdr_off..hdr_off + 4].copy_from_slice(&0xCAFEu32.to_le_bytes());
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2250,7 +2227,7 @@ mod tests {
         const BS: usize = 4096;
         let hdr_off = BS + 32;
         img[hdr_off..hdr_off + 4].copy_from_slice(&42u32.to_le_bytes());
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2282,7 +2259,7 @@ mod tests {
         img[hdr_off + 4..hdr_off + 6].copy_from_slice(&0u16.to_le_bytes());
         // h_clusterbits: low 4 bits = 0 (lclusterbits=0), high bit set.
         img[hdr_off + 7] = Z_EROFS_FRAGMENT_INODE_BIT;
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2314,7 +2291,7 @@ mod tests {
         const BS: usize = 4096;
         let hdr_off = BS + 32;
         img[hdr_off..hdr_off + 4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2338,7 +2315,7 @@ mod tests {
     fn big_pcluster_advise_bit_accepted() {
         let only = encode_lcluster(0, 0, 7); // PLAIN @ blkaddr 7
         let img = build_zmap_image(4096, Z_EROFS_ADVISE_BIG_PCLUSTER_1, 0, &[only]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).expect("open with BIG_PCLUSTER_1");
@@ -2369,7 +2346,7 @@ mod tests {
             0,
             &[head, nonhead_cblkcnt, nonhead_regular],
         );
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).expect("open BIG_PCLUSTER");
@@ -2397,7 +2374,7 @@ mod tests {
     fn out_of_range_file_offset_rejected() {
         let head = encode_lcluster(1, 0, 100);
         let img = build_zmap_image(4096, 0, 0, &[head]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2409,7 +2386,7 @@ mod tests {
     fn nonhead_with_zero_delta_is_bad_inode() {
         let bad = encode_lcluster(/*NONHEAD*/ 2, 0, 0);
         let img = build_zmap_image(4096, 0, 0, &[bad]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2424,7 +2401,7 @@ mod tests {
         let hdr_off = BS + 32;
         // byte 7 = h_clusterbits; only low 4 bits = lclusterbits.
         img[hdr_off + 7] = 0xF0;
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2436,7 +2413,7 @@ mod tests {
     fn no_inline_tail_returns_none() {
         let head = encode_lcluster(1, 0, 100);
         let img = build_zmap_image(4096, 0, 0, &[head]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2454,7 +2431,7 @@ mod tests {
         let head = encode_lcluster(1, 0, 5);
         let nonhead = encode_lcluster(2, 0, 1);
         let img = build_zmap_image(2 * 4096, 0, 0, &[head, nonhead]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2485,7 +2462,7 @@ mod tests {
         let nonhead = encode_lcluster(2, 0, 1);
         let head2 = encode_lcluster(1, 0, 200);
         let img = build_zmap_image(3 * 4096, 0, 0, &[head1, nonhead, head2]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2517,7 +2494,7 @@ mod tests {
         let head1 = encode_lcluster(1, 0, 100);
         let head2 = encode_lcluster(1, 500, 200);
         let img = build_zmap_image(2 * 4096, 0, 0, &[head1, head2]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2546,7 +2523,7 @@ mod tests {
     fn interlaced_advise_bit_decoded() {
         let head = encode_lcluster(/*PLAIN*/ 0, 0, 7);
         let img = build_zmap_image(4096, Z_EROFS_ADVISE_INTERLACED_PCLUSTER, 0, &[head]);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2568,7 +2545,7 @@ mod tests {
         // LZ4 (low nibble = 0) and HEAD2 = LZMA (high nibble = 1):
         // packed byte = 0x10.
         img[hdr_off + 6] = 0x10;
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
@@ -2625,7 +2602,7 @@ mod tests {
         img[lzma_off + 2..lzma_off + 6].copy_from_slice(&(1u32 << 20).to_le_bytes());
         // 10 bytes of zero padding follow (already zero).
 
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb_parsed = crate::superblock::read(&dev).unwrap();
         let cfgs = read_compr_cfgs(&dev, &sb_parsed).unwrap().expect("cfgs");
         assert!(cfgs.lz4.is_some(), "LZ4 record must be marked present");
@@ -2655,7 +2632,7 @@ mod tests {
         entries.push(encode_lcluster(0, 3392, 0));
         // Pretend the file is 52544 bytes; n_lclusters = 13.
         let img = build_zmap_image(52544, 0, 0, &entries);
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let sb = crate::superblock::read(&dev).unwrap();
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();

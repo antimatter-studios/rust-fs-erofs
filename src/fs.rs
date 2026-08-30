@@ -825,32 +825,8 @@ mod tests {
     use crate::layout::DataLayout;
     use crate::superblock::tests::synth_sb;
     use crate::superblock::EROFS_SUPER_OFFSET;
-    use fs_core::{BlockRead, Result as BlockResult};
-    use std::sync::Mutex;
-
-    /// Tiny in-memory block device for tests. fs_core's SliceReader is a
-    /// sub-range view, not an owner; FileDevice needs a tempfile. This is
-    /// a pure-RAM owner backed by a Vec.
-    struct MemDev(Mutex<Vec<u8>>);
-    impl BlockRead for MemDev {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> BlockResult<()> {
-            let v = self.0.lock().unwrap();
-            let start = offset as usize;
-            let end = start + buf.len();
-            if end > v.len() {
-                return Err(fs_core::Error::ShortRead {
-                    offset,
-                    want: buf.len(),
-                    got: v.len().saturating_sub(start),
-                });
-            }
-            buf.copy_from_slice(&v[start..end]);
-            Ok(())
-        }
-        fn size_bytes(&self) -> u64 {
-            self.0.lock().unwrap().len() as u64
-        }
-    }
+    use crate::test_device::MemDev;
+    use fs_core::BlockRead;
 
     /// Build a tiny image with:
     /// - blocksize 4 KiB
@@ -892,7 +868,7 @@ mod tests {
     #[test]
     fn open_and_read_root() {
         let img = build_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let root = fs.root_inode().unwrap();
         assert!(root.is_dir());
@@ -901,7 +877,7 @@ mod tests {
     #[test]
     fn lookup_and_read_file() {
         let img = build_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.lookup_path("/hello.txt").unwrap();
         assert!(inode.is_regular_file());
@@ -914,7 +890,7 @@ mod tests {
     #[test]
     fn out_of_range_read_rejected() {
         let img = build_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.lookup_path("/hello.txt").unwrap();
         let mut buf = [0u8; 16];
@@ -972,7 +948,7 @@ mod tests {
     #[test]
     fn chunked_read_present_chunks() {
         let img = build_chunked_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.read_inode(0).unwrap();
         assert!(inode.is_regular_file());
@@ -989,7 +965,7 @@ mod tests {
     #[test]
     fn chunked_read_hole_returns_zeros() {
         let img = build_chunked_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.read_inode(0).unwrap();
         // chunk 1 (offset 4096..8192) is a hole.
@@ -1001,7 +977,7 @@ mod tests {
     #[test]
     fn chunked_read_spanning_chunk_boundary() {
         let img = build_chunked_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.read_inode(0).unwrap();
         // Span the chunk0 -> chunk1 boundary: last 4 bytes of chunk 0
@@ -1055,7 +1031,7 @@ mod tests {
     #[test]
     fn read_symlink_target_returns_target_string() {
         let img = build_symlink_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let link = fs.lookup_path("/link").unwrap();
         assert!(link.is_symlink());
@@ -1066,7 +1042,7 @@ mod tests {
     #[test]
     fn read_symlink_target_rejects_non_symlink() {
         let img = build_symlink_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let regular = fs.lookup_path("/target.txt").unwrap();
         assert!(matches!(
@@ -1078,7 +1054,7 @@ mod tests {
     #[test]
     fn resolve_path_no_follow_returns_symlink_inode() {
         let img = build_symlink_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.resolve_path("/link", false).unwrap();
         assert!(inode.is_symlink());
@@ -1087,7 +1063,7 @@ mod tests {
     #[test]
     fn resolve_path_follow_resolves_to_target() {
         let img = build_symlink_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.resolve_path("/link", true).unwrap();
         assert!(inode.is_regular_file());
@@ -1223,7 +1199,7 @@ mod tests {
         let dir = synth_dir_block(&[(1, ftype::REG_FILE, b"rotate.bin")], BS);
         img[3 * BS..4 * BS].copy_from_slice(&dir);
 
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.lookup_path("/rotate.bin").unwrap();
         assert_eq!(inode.size as usize, BS);
@@ -1391,7 +1367,7 @@ mod tests {
         // image; c3 = 4095 is the second one that pushes the bound back
         // past the offset instead of onto it.
         let img = build_zp4(0, 0, 4196, 4095);
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).expect("the image is structurally openable");
         let inode = fs.lookup_path("/spin.bin").expect("the file resolves");
         let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).expect("the zmap parses");
@@ -1415,7 +1391,7 @@ mod tests {
     #[test]
     fn the_bracket_guard_does_not_reject_valid_offsets() {
         let img = build_zp4(0, 0, 4196, 4095);
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.lookup_path("/spin.bin").unwrap();
         let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).unwrap();
@@ -1436,7 +1412,7 @@ mod tests {
     #[test]
     fn zero_progress_pcluster_is_reachable_after_a_nonzero_fill() {
         let img = build_zero_progress_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.lookup_path("/spin.bin").unwrap();
         let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).unwrap();
@@ -1475,7 +1451,7 @@ mod tests {
         let img = build_zero_progress_image();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+            let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
             let fs = Filesystem::open(dev).unwrap();
             let inode = fs.lookup_path("/spin.bin").unwrap();
             let mut buf = vec![0u8; 4096];
@@ -1506,7 +1482,7 @@ mod tests {
     #[test]
     fn resolve_path_symlink_loop_caps_at_40() {
         let img = build_loop_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let err = fs.resolve_path("/a", true).unwrap_err();
         match err {
@@ -1572,7 +1548,7 @@ mod tests {
         let bs = 4096usize;
         let payload = vec![b'X'; 5 * bs];
         let img = build_compressed_image_for_cache("c.bin", &payload);
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.lookup_path("/c.bin").unwrap();
 
@@ -1628,7 +1604,7 @@ mod tests {
 
         // File A: read once with cap=1 to populate, then verify hit.
         let img_a = build_compressed_image_for_cache("a.bin", &payload_a);
-        let dev_a: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img_a)));
+        let dev_a: Arc<dyn BlockRead> = Arc::new(MemDev::new(img_a));
         let fs_a = Filesystem::open(dev_a).unwrap();
         fs_a.set_pcluster_cache_capacity(1);
         let inode_a = fs_a.lookup_path("/a.bin").unwrap();
@@ -1689,7 +1665,7 @@ mod tests {
             12,
         )
         .unwrap();
-        let dev_c: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img_combined)));
+        let dev_c: Arc<dyn BlockRead> = Arc::new(MemDev::new(img_combined));
         let fs = Filesystem::open(dev_c).unwrap();
         fs.set_pcluster_cache_capacity(1);
         let i_a = fs.lookup_path("/a.bin").unwrap();
@@ -1719,7 +1695,7 @@ mod tests {
         let bs = 4096usize;
         let payload = vec![b'Z'; 5 * bs];
         let img = build_compressed_image_for_cache("c.bin", &payload);
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         fs.set_pcluster_cache_capacity(0);
         let inode = fs.lookup_path("/c.bin").unwrap();
@@ -1788,7 +1764,7 @@ mod tests {
             12,
         )
         .unwrap();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let i_a = fs.lookup_path("/a.bin").unwrap();
         let i_b = fs.lookup_path("/b.bin").unwrap();
@@ -1819,7 +1795,7 @@ mod tests {
         // Builder-style override at open time is honoured, and stats
         // reflect the chosen capacity.
         let img = build_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev)
             .unwrap()
             .with_pcluster_cache_capacity(7);
@@ -1833,7 +1809,7 @@ mod tests {
         // a FLAT_PLAIN file end-to-end and confirm the cache is still
         // empty afterwards (no hits, no misses, no entries).
         let img = build_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         let inode = fs.lookup_path("/hello.txt").unwrap();
         let mut buf = [0u8; 3];
@@ -1922,7 +1898,7 @@ mod tests {
     fn open_with_devices_validates_extras_count() {
         // SB advertises 1 extra device but caller passes none -> error.
         let (primary, _extra) = build_two_device_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(primary)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(primary));
         match Filesystem::open_with_devices(dev, Vec::new()) {
             Err(Error::BadSuperblock(msg)) => {
                 assert!(msg.contains("extra device"), "msg = {msg:?}");
@@ -1936,8 +1912,8 @@ mod tests {
     fn open_with_devices_rejects_too_many_extras() {
         // Single-device image opened with a stray extra -> mismatch.
         let img = build_image();
-        let primary: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
-        let extra: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(vec![0u8; 4096])));
+        let primary: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let extra: Arc<dyn BlockRead> = Arc::new(MemDev::new(vec![0u8; 4096]));
         match Filesystem::open_with_devices(primary, vec![extra]) {
             Err(Error::BadSuperblock(_)) => {}
             Err(other) => panic!("expected BadSuperblock, got {other:?}"),
@@ -1950,7 +1926,7 @@ mod tests {
         // The legacy single-device `open` continues to work after the
         // multi-device refactor (extras stays empty internally).
         let img = build_image();
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev).unwrap();
         assert!(fs.read_device_table().unwrap().is_empty());
     }
@@ -1958,8 +1934,8 @@ mod tests {
     #[test]
     fn read_device_table_surfaces_tags() {
         let (primary, extra) = build_two_device_image();
-        let primary_dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(primary)));
-        let extra_dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(extra)));
+        let primary_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(primary));
+        let extra_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(extra));
         let fs = Filesystem::open_with_devices(primary_dev, vec![extra_dev]).unwrap();
         let slots = fs.read_device_table().unwrap();
         assert_eq!(slots.len(), 1);
@@ -1971,8 +1947,8 @@ mod tests {
     fn read_routes_to_correct_device() {
         // Chunk 0 -> primary ('A's), chunk 1 -> extra device ('B's).
         let (primary, extra) = build_two_device_image();
-        let primary_dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(primary)));
-        let extra_dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(extra)));
+        let primary_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(primary));
+        let extra_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(extra));
         let fs = Filesystem::open_with_devices(primary_dev, vec![extra_dev]).unwrap();
         let inode = fs.read_inode(0).unwrap();
         assert!(inode.is_regular_file());
@@ -2001,8 +1977,8 @@ mod tests {
         // Stamp a recognisable byte at offset 100 of the primary.
         primary_img[100] = b'P';
 
-        let primary_dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(primary_img)));
-        let extra_dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(extra_bytes.clone())));
+        let primary_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(primary_img));
+        let extra_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(extra_bytes.clone()));
         let fs = Filesystem::open_with_devices(primary_dev, vec![extra_dev]).unwrap();
 
         let mut buf = [0u8; 1];

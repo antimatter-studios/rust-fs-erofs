@@ -2764,30 +2764,10 @@ fn encode_chunkmap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_device::MemDev;
     use crate::Filesystem;
     use fs_core::BlockRead;
-    use std::sync::{Arc, Mutex};
-
-    struct MemDev(Mutex<Vec<u8>>);
-    impl BlockRead for MemDev {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
-            let v = self.0.lock().unwrap();
-            let s = offset as usize;
-            let e = s + buf.len();
-            if e > v.len() {
-                return Err(fs_core::Error::ShortRead {
-                    offset,
-                    want: buf.len(),
-                    got: v.len().saturating_sub(s),
-                });
-            }
-            buf.copy_from_slice(&v[s..e]);
-            Ok(())
-        }
-        fn size_bytes(&self) -> u64 {
-            self.0.lock().unwrap().len() as u64
-        }
-    }
+    use std::sync::Arc;
 
     fn dir(entries: Vec<(&str, Node)>) -> Node {
         let mut m = BTreeMap::new();
@@ -2811,7 +2791,7 @@ mod tests {
     }
 
     fn open(img: Vec<u8>) -> Filesystem {
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev(Mutex::new(img)));
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
         Filesystem::open(dev).unwrap()
     }
 
@@ -3828,7 +3808,7 @@ mod tests {
         assert_eq!(sb.xattr_prefix_count, 2);
         assert!(sb.xattr_prefix_start > 0);
 
-        let dev = MemDev(Mutex::new(img));
+        let dev = MemDev::new(img);
         let dict = read_xattr_prefix_dictionary(&dev, &sb).expect("read dict");
         assert_eq!(dict.len(), 2);
         assert_eq!(dict[0].base_index, ns::USER);
