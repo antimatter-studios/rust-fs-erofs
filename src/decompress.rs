@@ -87,20 +87,7 @@ fn decompress_lz4(input: &[u8], output: &mut [u8]) -> Result<()> {
     if input.is_empty() && output.is_empty() {
         return Ok(());
     }
-    // EROFS_FEATURE_INCOMPAT_LZ4_0PADDING right-aligns the LZ4 frame
-    // within the on-disk block, padding the LEADING bytes with zeros.
-    // We don't plumb the feature bit down here; instead we skip any
-    // leading zero bytes before calling the codec. lz4_flex's first
-    // input byte is a token whose low 4 bits are the literal length;
-    // a token of `0x00` would mean "literal_length=0, match_length=0"
-    // which decodes nothing -- so a true compressed frame never
-    // legitimately starts with a zero byte. Skipping leading zeros is
-    // therefore lossless against non-padded inputs too.
-    let inputmargin = input.iter().take_while(|&&b| b == 0).count();
-    let real_input = &input[inputmargin..];
-    if real_input.is_empty() {
-        return Err(Error::BadInode("LZ4 input is all zeros"));
-    }
+    let real_input = strip_leading_pad(input, "LZ4")?;
     let written = lz4_flex::block::decompress_into(real_input, output)
         .map_err(|_| Error::BadInode("LZ4 decompression failed"))?;
     // Caller sized `output` to the exact decompressed length; a short
@@ -111,19 +98,55 @@ fn decompress_lz4(input: &[u8], output: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+/// Strip the zero pad EROFS puts *before* a compressed frame, and
+/// refuse a block that is nothing but pad.
+///
+/// # Why the pad is at the front
+///
+/// `EROFS_FEATURE_INCOMPAT_ZERO_PADDING` right-aligns a codec frame
+/// inside its on-disk block, so the *leading* bytes are the zeros. The
+/// feature bit is not plumbed down here; the pad is skipped
+/// unconditionally instead, which is lossless against un-padded input
+/// as long as a genuine frame never starts with a zero byte. That holds
+/// for all three codecs this crate reads, for a different reason each
+/// time:
+///
+/// * **LZ4** — the first byte is a token whose nibbles are the literal
+///   and match lengths. `0x00` means "no literals, no match", which
+///   decodes nothing, so no real frame begins with it.
+/// * **DEFLATE** — a first byte of `0x00` means BFINAL=0, BTYPE=00, a
+///   *stored* (uncompressed) block. mkfs.erofs never emits one, because
+///   a stored block does not compress; it always uses fixed or dynamic
+///   Huffman.
+/// * **LZMA** — the first byte is the packed properties byte, which
+///   encodes `(pb * 5 + lp) * 9 + lc`. Zero would mean lc=lp=pb=0,
+///   which no EROFS encoder emits.
+///
+/// So the assumption is per-codec, not universal, and each codec's
+/// reason is recorded here rather than restated in three places with
+/// different emphasis — which is how it was before, at 14, 4 and 8
+/// lines.
+///
+/// `codec` names the codec in the error, so an all-zero block still
+/// says which decoder rejected it.
+fn strip_leading_pad<'a>(input: &'a [u8], codec: &'static str) -> Result<&'a [u8]> {
+    let pad = input.iter().take_while(|&&b| b == 0).count();
+    let frame = &input[pad..];
+    if frame.is_empty() {
+        return Err(Error::BadInode(match codec {
+            "LZ4" => "LZ4 input is all zeros",
+            "LZMA" => "LZMA input is all zeros",
+            _ => "DEFLATE input is all zeros",
+        }));
+    }
+    Ok(frame)
+}
+
 fn decompress_lzma(input: &[u8], output: &mut [u8], cfg: &LzmaCfg) -> Result<()> {
     if input.is_empty() && output.is_empty() {
         return Ok(());
     }
-    // EROFS right-aligns codec frames within the on-disk block (the
-    // `EROFS_FEATURE_INCOMPAT_LZ4_0PADDING` design generalised to all
-    // codecs). Skip any leading zero pad before handing the stream to
-    // the codec.
-    let inputmargin = input.iter().take_while(|&&b| b == 0).count();
-    let real_input = &input[inputmargin..];
-    if real_input.is_empty() {
-        return Err(Error::BadInode("LZMA input is all zeros"));
-    }
+    let real_input = strip_leading_pad(input, "LZMA")?;
 
     // Two on-disk dialects coexist:
     // (a) Our writer emits the standard 13-byte LZMA1 header (5-byte
@@ -202,19 +225,7 @@ fn decompress_deflate(input: &[u8], output: &mut [u8]) -> Result<()> {
     if input.is_empty() && output.is_empty() {
         return Ok(());
     }
-    // EROFS right-aligns codec frames within the on-disk block. Strip
-    // any leading zero pad. A raw DEFLATE block header's BFINAL/BTYPE
-    // bits are encoded in the LSBs of the first byte; for the first
-    // block of a stream BTYPE=00 (stored) gives a first byte of 0x00,
-    // which would collide with our zero-strip. mkfs.erofs never emits
-    // BTYPE=00 (it always uses fixed/dynamic Huffman because stored
-    // blocks don't compress), so a true frame's first byte is always
-    // non-zero.
-    let inputmargin = input.iter().take_while(|&&b| b == 0).count();
-    let real_input = &input[inputmargin..];
-    if real_input.is_empty() {
-        return Err(Error::BadInode("DEFLATE input is all zeros"));
-    }
+    let real_input = strip_leading_pad(input, "DEFLATE")?;
     // `false` selects raw DEFLATE (no zlib header/checksum), which is
     // what EROFS stores.
     let mut decoder = Decompress::new(false);

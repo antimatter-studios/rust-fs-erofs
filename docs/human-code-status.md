@@ -16,11 +16,17 @@ predates the work; this is the current position. Updated 2026-08-30.
 
 ## High
 
-### H1 — the metadata cursor rule is written twice, 280 lines apart — **fixable, not yet done**
+### H1 — the metadata cursor rule is written twice, 280 lines apart — **fixed**
 
-Two copies kept in sync by a comment saying they must be. Real, and the fix is
-to express the rule once — worth its own change, since getting it wrong
-mis-reads every inode.
+This entry was stale: it was fixed and never re-marked. `plan_meta_layout`
+returns `MetaSlot`s and is the single walk of the metadata area; pass 2 reads the
+NIDs out of them, and pass 5 zips over the same slots rather than re-deriving
+addresses with a second cursor. The comment that used to say the two loops "must
+MIRROR" each other is gone, because there is no second loop to mirror.
+
+The invariant is now structural: an inode's bytes land at the address its
+recorded NID names because both come out of the same slot, not because two
+walks agree.
 
 ### H2 — `build_image_with` is 473 lines, its stages named only in comments — **needs your decision**
 
@@ -150,15 +156,68 @@ The byte-order test asserts against literal bytes rather than `from_le_bytes`,
 because a slip there is invisible to a round trip through this crate: writer and
 reader would agree while disagreeing with `mkfs.erofs`.
 
-### M7, M8, M9, M10, M11, M17, M22 — repeated encodings and unnamed values — **fixable, not yet done**
+### M7, M8, M9, M10, M11, M17 — repeated encodings and unnamed values — **fixed**
 
-A constant defined twice and another in the wrong module; the block-size range
-stated three times in two encodings; three encodings of the file-type taxonomy;
-inode sizes 32 and 64 bare despite a named constant; the codec preamble three
-times; alignment hand-rolled four times in two idioms and two widths; and **117
-inline hex slice ranges with no named-offset convention at all**.
+- **M7** — both feature bits now live in `superblock.rs`, which already held
+  three others. `EROFS_FEATURE_INCOMPAT_ZERO_PADDING` moving there matters more
+  than the tidiness: the *reader* implements the behaviour it names, at three
+  sites in `decompress.rs`, and each of those could previously only refer to the
+  bit in prose because it was private to the writer.
+- **M8** — `MIN_BLKSZBITS` / `MAX_BLKSZBITS` are `pub`, with `MIN_BLOCK_SIZE` /
+  `MAX_BLOCK_SIZE` derived from them and `is_valid_blkszbits`. The CLI's usage
+  text and error message are now *generated* from those, so the five copies in
+  three files and two units are one definition. The binary can no longer
+  advertise a range it does not enforce.
+- **M9** — one `dir::dirent_type_for_mode`. `capi.rs`'s third table — the one
+  written in octal, whose comments named the `S_IF*` constants and whose return
+  values were the `ftype` constants, while referencing neither — is now an import.
+  The writer's two device/special arms go through the same function and filter
+  its result, which is where the `PlanKind` genuinely adds something.
+- **M10** — `COMPACT_INODE_SIZE`, `EXTENDED_INODE_SIZE` and `SB_EXTSLOT_SIZE`
+  live in `inode.rs` and the writer imports them. `EROFS_INODE_SLOT_SIZE` stays
+  separate with a doc saying why: it shares the value 32 with the compact inode
+  size and is a *different quantity* — an addressing stride against a structure
+  size — and collapsing them would lose exactly the distinction that makes the
+  extended case legible.
+- **M11** — one `strip_leading_pad(input, codec)`, holding one copy of the
+  explanation that was written three times at 14, 4 and 8 lines. The
+  consolidated doc is longer than any of them, because it records the *separate*
+  reason each codec's first byte is never zero — LZ4's token, DEFLATE's
+  BFINAL/BTYPE bits, LZMA's packed properties byte. The assumption is per-codec,
+  and the old comments each stated only their own.
+- **M17** — `align_to_xattr_entry` / `XATTR_ENTRY_ALIGN` and
+  `COMPACT_MAP_EBASE_ALIGN`, via `next_multiple_of`. Three spellings of one rule
+  became one, and the bit-twiddle's silent wrap near `u64::MAX` became a panic —
+  neither is reachable from a real image, but only one of them says so.
 
-M22 is the largest and would change how the whole crate reads.
+### M22 — 117 inline hex slice ranges with no named-offset convention — **the two structural layouts done, the rest deliberately not**
+
+`superblock::offsets`, `inode::compact_offsets` and `inode::extended_offsets`
+name every field of the two structures whose layouts are fixed by the kernel
+header, and **both the parser and the writer index them** — so a field can no
+longer move on one side without moving on the other. That is 52 of the ranges in
+the two parsers plus 27 in the writer.
+
+The compact and extended inodes are two tables, not one with exceptions: they
+genuinely diverge after 0x08 (`SIZE` is four bytes in one and eight in the
+other, `UID` two and four), and encoding that in a single table would be harder
+to check against the header than two plain lists. A test asserts the five fields
+read *before* the version is known sit at the same offsets in both — the parser
+reads `format` to find out which layout it has, so if those diverged it could
+not work at all.
+
+The remaining ranges — 6 in `fs.rs`, 4 in `zmap.rs`, 1 each in `xattr.rs` and
+`chunked.rs` — are left. They are not one structure's layout; they are local
+byte manipulation inside routines that already name what they are doing, and a
+table for them would be a table of one entry each.
+
+**The test fixtures keep their literal offsets**, as in rust-img-vhd and
+rust-img-qcow2, and for the same measured reason: moving the superblock's
+`META_BLKADDR` by a byte fails 44 tests, the compact inode's `MODE` 145, the
+extended inode's `MTIME` 3 — all because the fixtures were written from the
+kernel header and do not import the tables. `superblock_offsets_match_the_kernel_header`,
+`inode_offsets_match_the_kernel_header` and the two overlap tests write that
+intent down where a later tidy-up will meet it.
 
 ### M13 — `MemDev` defined seven times — **fixed, six of the seven**
 

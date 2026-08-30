@@ -39,37 +39,19 @@ use crate::inode::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOC
 use crate::layout::DataLayout;
 pub use crate::superblock::LzmaCfg;
 use crate::superblock::{
-    EROFS_FEATURE_INCOMPAT_COMPR_CFGS, EROFS_SUPER_MAGIC_V1, EROFS_SUPER_OFFSET,
+    EROFS_FEATURE_COMPAT_SB_CHKSUM, EROFS_FEATURE_INCOMPAT_COMPR_CFGS,
+    EROFS_FEATURE_INCOMPAT_ZERO_PADDING, EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_MAGIC_V1,
+    EROFS_SUPER_OFFSET,
 };
 pub use crate::xattr::XattrLongPrefix;
-use crate::xattr::XATTR_HEADER_SIZE;
+use crate::xattr::{XATTR_ENTRY_ALIGN, XATTR_HEADER_SIZE};
 use crate::zmap::{
-    CompactPackShape, COMPACT_2B, COMPACT_4B, Z_EROFS_ADVISE_COMPACTED_2B,
+    CompactPackShape, COMPACT_2B, COMPACT_4B, COMPACT_MAP_EBASE_ALIGN, Z_EROFS_ADVISE_COMPACTED_2B,
     Z_EROFS_ADVISE_INLINE_PCLUSTER, Z_EROFS_COMPACT_MAP_HEADER_SIZE, Z_EROFS_LCLUSTER_INDEX_SIZE,
     Z_EROFS_LCLUSTER_TYPE_HEAD1, Z_EROFS_LCLUSTER_TYPE_NONHEAD, Z_EROFS_LCLUSTER_TYPE_PLAIN,
     Z_EROFS_LEGACY_MAP_HEADER_SIZE,
 };
 use std::collections::BTreeMap;
-
-/// `EROFS_FEATURE_INCOMPAT_LZ4_0PADDING` (bit 0 of `feature_incompat`).
-/// When set, LZ4 frames are RIGHT-aligned in their pcluster block(s),
-/// with the leading bytes of the block zero-padded. The reader's LZ4
-/// dispatch skips leading zeros before invoking `decompress_into`.
-///
-/// Spec: `linux/fs/erofs/erofs_fs.h::EROFS_FEATURE_INCOMPAT_ZERO_PADDING`.
-/// Independent implementation. Modern fsck.erofs (>= erofs-utils 1.6)
-/// only accepts compressed images that set this bit; the "ancient
-/// !lz4_0padding layout" is no longer supported.
-const EROFS_FEATURE_INCOMPAT_ZERO_PADDING: u32 = 0x0000_0001;
-
-/// `EROFS_FEATURE_COMPAT_SB_CHKSUM` (bit 0 of `feature_compat`). When
-/// set, the SB's `checksum` field at offset 0x04 holds CRC32C of the
-/// entire 128-byte superblock with the checksum field itself treated
-/// as zeros during computation.
-///
-/// Spec: `linux/fs/erofs/erofs_fs.h::EROFS_FEATURE_COMPAT_SB_CHKSUM`.
-/// Independent implementation.
-const EROFS_FEATURE_COMPAT_SB_CHKSUM: u32 = 0x0000_0001;
 
 // --- public API --------------------------------------------------------
 
@@ -345,9 +327,12 @@ pub struct ComprCfgsConfig {
     pub deflate: Option<u8>,
 }
 
-const COMPACT_INODE_SIZE: u64 = 32;
-const EXTENDED_INODE_SIZE: u64 = 64;
-const SB_AREA_END: u64 = EROFS_SUPER_OFFSET + 128; // 1024 + 128 = 1152
+use crate::inode::compact_offsets as ci;
+use crate::inode::extended_offsets as xi;
+use crate::inode::{COMPACT_INODE_SIZE, EXTENDED_INODE_SIZE};
+/// First byte past the superblock, and so the first byte the metadata
+/// area may use.
+const SB_AREA_END: u64 = EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE as u64;
 
 /// Encode a POSIX ACL value. Returns the wire bytes you stuff into a
 /// `XattrSpec.value` with `name_index` = 2 (access) or 3 (default).
@@ -389,7 +374,7 @@ pub fn build_image(root: Node, blkszbits: u8) -> Result<Vec<u8>> {
 /// `EROFS_FEATURE_INCOMPAT_COMPR_CFGS`, and advertises the included
 /// codecs in the SB's `available_compr_algs` (`u1`) field.
 pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Result<Vec<u8>> {
-    if !(9..=16).contains(&blkszbits) {
+    if !crate::superblock::is_valid_blkszbits(blkszbits) {
         return Err(Error::BadSuperblock("blkszbits out of range"));
     }
     let bs: u64 = 1u64 << blkszbits;
@@ -665,7 +650,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
             xattr_prefix_bytes.push(prefix.base_index);
             xattr_prefix_bytes.extend_from_slice(&prefix.infix);
             // 4-byte align the cursor before the next entry.
-            while !xattr_prefix_bytes.len().is_multiple_of(4) {
+            while !(xattr_prefix_bytes.len() as u64).is_multiple_of(XATTR_ENTRY_ALIGN) {
                 xattr_prefix_bytes.push(0);
             }
         }
@@ -692,7 +677,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     }
     if !xattr_prefix_bytes.is_empty() {
         // 4-byte-align the start so the divided-by-4 encoding is exact.
-        gap_cursor = (gap_cursor + 3) & !3;
+        gap_cursor = gap_cursor.next_multiple_of(XATTR_ENTRY_ALIGN);
         let dict_byte_off = gap_cursor;
         if dict_byte_off / 4 > u32::MAX as u64 {
             return Err(Error::BadXattr("xattr_prefix_start overflows u32"));
@@ -2029,7 +2014,7 @@ fn plan_body(n: &mut PlanNode, bs: u64, lzma_dict_size_override: Option<u32>) ->
         // >= 512) and nid * 32 is also 32-aligned. So we can reason
         // about ebase % 32 here without knowing the final NID.
         let body_end_mod_32 = (body_size_for_inode + xattr_bytes.len() as u64) % 32;
-        let ebase_mod_32 = ((body_end_mod_32 + 7) & !7u64) % 32 + 8;
+        let ebase_mod_32 = body_end_mod_32.next_multiple_of(COMPACT_MAP_EBASE_ALIGN) % 32 + 8;
         let ebase_mod_32 = ebase_mod_32 % 32;
 
         // Index-area bytes (no header, just the packs / entries).
@@ -2191,7 +2176,7 @@ fn encode_inline_xattrs(xattrs: &[XattrSpec]) -> Result<(Vec<u8>, u16)> {
         buf.extend_from_slice(&(x.value.len() as u16).to_le_bytes());
         buf.extend_from_slice(&x.name);
         buf.extend_from_slice(&x.value);
-        while !buf.len().is_multiple_of(4) {
+        while !(buf.len() as u64).is_multiple_of(XATTR_ENTRY_ALIGN) {
             buf.push(0);
         }
     }
@@ -2215,24 +2200,35 @@ fn write_superblock(
     xattr_prefix_count: u8,
     xattr_prefix_start: u32,
 ) {
+    // Every field below is placed through `superblock::offsets`, the
+    // same table the parser reads — so a field cannot move on the write
+    // side without moving on the read side.
+    use crate::superblock::offsets as sb;
     let off = EROFS_SUPER_OFFSET as usize;
-    img[off..off + 4].copy_from_slice(&EROFS_SUPER_MAGIC_V1.to_le_bytes());
-    img[off + 0x0C] = blkszbits;
-    img[off + 0x0E..off + 0x10].copy_from_slice(&0u16.to_le_bytes()); // root_nid = 0
-    img[off + 0x10..off + 0x18].copy_from_slice(&n_inodes.to_le_bytes());
-    img[off + 0x24..off + 0x28].copy_from_slice(&total_blocks.to_le_bytes());
-    img[off + 0x28..off + 0x2C].copy_from_slice(&meta_blkaddr.to_le_bytes());
+    let put = |img: &mut [u8], r: std::ops::Range<usize>, v: &[u8]| {
+        img[off + r.start..off + r.end].copy_from_slice(v);
+    };
+    put(img, sb::MAGIC, &EROFS_SUPER_MAGIC_V1.to_le_bytes());
+    img[off + sb::BLKSZBITS] = blkszbits;
+    put(img, sb::ROOT_NID, &0u16.to_le_bytes());
+    put(img, sb::INOS, &n_inodes.to_le_bytes());
+    put(img, sb::BLOCKS, &total_blocks.to_le_bytes());
+    put(img, sb::META_BLKADDR, &meta_blkaddr.to_le_bytes());
     let label = b"rsmkfs";
-    img[off + 0x40..off + 0x40 + label.len()].copy_from_slice(label);
-    img[off + 0x50..off + 0x54].copy_from_slice(&feature_incompat.to_le_bytes());
+    img[off + sb::VOLUME_NAME.start..off + sb::VOLUME_NAME.start + label.len()]
+        .copy_from_slice(label);
+    put(img, sb::FEATURE_INCOMPAT, &feature_incompat.to_le_bytes());
     // u1 (`available_compr_algs` when COMPR_CFGS is set, otherwise the
     // `lz4_max_distance` union arm — left zero for non-cfgs images).
-    img[off + 0x54..off + 0x56].copy_from_slice(&u1.to_le_bytes());
-    // xattr_prefix_count (1 byte at 0x5B) and xattr_prefix_start (4
-    // bytes at 0x5C). Empty / 0 by default; non-zero only when the
-    // writer emits a custom xattr prefix dictionary.
-    img[off + 0x5B] = xattr_prefix_count;
-    img[off + 0x5C..off + 0x60].copy_from_slice(&xattr_prefix_start.to_le_bytes());
+    put(img, sb::U1, &u1.to_le_bytes());
+    // Empty / 0 by default; non-zero only when the writer emits a
+    // custom xattr prefix dictionary.
+    img[off + sb::XATTR_PREFIX_COUNT] = xattr_prefix_count;
+    put(
+        img,
+        sb::XATTR_PREFIX_START,
+        &xattr_prefix_start.to_le_bytes(),
+    );
 
     // feature_compat: advertise SB_CHKSUM and compute the CRC32C over
     // the bytes from EROFS_SUPER_OFFSET to the end of the block that
@@ -2248,12 +2244,16 @@ fn write_superblock(
     // 0xFFFFFFFF), so we undo that XOR to match. The checksum field
     // is already zero in `img` here -- nothing has written into it --
     // so we can compute over `img` directly without a temporary copy.
-    img[off + 0x08..off + 0x0C].copy_from_slice(&EROFS_FEATURE_COMPAT_SB_CHKSUM.to_le_bytes());
+    put(
+        img,
+        sb::FEATURE_COMPAT,
+        &EROFS_FEATURE_COMPAT_SB_CHKSUM.to_le_bytes(),
+    );
     let block_size = 1usize << blkszbits;
     let crc_len = block_size - off % block_size;
     let sb_to_block_end = &img[off..off + crc_len];
     let csum = crc32c::crc32c(sb_to_block_end) ^ 0xFFFF_FFFF;
-    img[off + 0x04..off + 0x08].copy_from_slice(&csum.to_le_bytes());
+    put(img, sb::CHECKSUM, &csum.to_le_bytes());
 }
 
 /// Encode one inode's body bytes (32 for compact, 64 for extended).
@@ -2278,13 +2278,13 @@ fn encode_inode(
     let (layout, flags) = inode_layout_and_flags(&n.kind);
     let raw_format: u16 =
         (if body.is_extended { 1 } else { 0 }) | ((layout as u16) << 1) | ((flags & 0x0FFF) << 4);
-    buf[0x00..0x02].copy_from_slice(&raw_format.to_le_bytes());
+    buf[ci::FORMAT].copy_from_slice(&raw_format.to_le_bytes());
 
-    buf[0x02..0x04].copy_from_slice(&body.xattr_icount.to_le_bytes());
-    buf[0x04..0x06].copy_from_slice(&n.mode.to_le_bytes());
+    buf[ci::XATTR_ICOUNT].copy_from_slice(&body.xattr_icount.to_le_bytes());
+    buf[ci::MODE].copy_from_slice(&n.mode.to_le_bytes());
 
     let raw_u = inode_raw_u(n, nid, dir_block_for_nid, data_block_for_nid);
-    buf[0x10..0x14].copy_from_slice(&raw_u.to_le_bytes());
+    buf[ci::RAW_U].copy_from_slice(&raw_u.to_le_bytes());
 
     let size = match &n.kind {
         PlanKind::Dir { .. } => *dir_size_for_nid.get(&nid).unwrap_or(&0),
@@ -2303,19 +2303,19 @@ fn encode_inode(
     let nlink = inode_nlink(n, idx, plan);
 
     if body.is_extended {
-        buf[0x08..0x10].copy_from_slice(&size.to_le_bytes());
-        buf[0x14..0x18].copy_from_slice(&((nid as u32).wrapping_add(1)).to_le_bytes());
-        buf[0x18..0x1C].copy_from_slice(&n.meta.uid.to_le_bytes());
-        buf[0x1C..0x20].copy_from_slice(&n.meta.gid.to_le_bytes());
-        buf[0x20..0x28].copy_from_slice(&n.meta.mtime.to_le_bytes());
-        buf[0x28..0x2C].copy_from_slice(&n.meta.mtime_nsec.to_le_bytes());
-        buf[0x2C..0x30].copy_from_slice(&nlink.to_le_bytes());
+        buf[xi::SIZE].copy_from_slice(&size.to_le_bytes());
+        buf[xi::INO].copy_from_slice(&((nid as u32).wrapping_add(1)).to_le_bytes());
+        buf[xi::UID].copy_from_slice(&n.meta.uid.to_le_bytes());
+        buf[xi::GID].copy_from_slice(&n.meta.gid.to_le_bytes());
+        buf[xi::MTIME].copy_from_slice(&n.meta.mtime.to_le_bytes());
+        buf[xi::MTIME_NSEC].copy_from_slice(&n.meta.mtime_nsec.to_le_bytes());
+        buf[xi::NLINK].copy_from_slice(&nlink.to_le_bytes());
     } else {
-        buf[0x06..0x08].copy_from_slice(&(nlink as u16).to_le_bytes());
-        buf[0x08..0x0C].copy_from_slice(&(size as u32).to_le_bytes());
-        buf[0x14..0x18].copy_from_slice(&((nid as u32).wrapping_add(1)).to_le_bytes());
-        buf[0x18..0x1A].copy_from_slice(&(n.meta.uid as u16).to_le_bytes());
-        buf[0x1A..0x1C].copy_from_slice(&(n.meta.gid as u16).to_le_bytes());
+        buf[ci::NLINK].copy_from_slice(&(nlink as u16).to_le_bytes());
+        buf[ci::SIZE].copy_from_slice(&(size as u32).to_le_bytes());
+        buf[ci::INO].copy_from_slice(&((nid as u32).wrapping_add(1)).to_le_bytes());
+        buf[ci::UID].copy_from_slice(&(n.meta.uid as u16).to_le_bytes());
+        buf[ci::GID].copy_from_slice(&(n.meta.gid as u16).to_le_bytes());
     }
 
     let _ = nids; // reserved for future: hardlink-aware nlink computation.
@@ -2535,14 +2535,17 @@ fn file_type_byte(n: &PlanNode) -> u8 {
         }
         PlanKind::Dir { .. } => ftype::DIR,
         PlanKind::Symlink { .. } => ftype::SYMLINK,
-        PlanKind::Device { .. } => match n.mode & 0xF000 {
-            S_IFCHR => ftype::CHRDEV,
-            S_IFBLK => ftype::BLKDEV,
+        // A device or special node's type comes from its mode, which
+        // is the same question `dirent_type_for_mode` answers. The
+        // `PlanKind` narrows what is acceptable — a Device that is not
+        // a char or block device is a planning error, not a FIFO — so
+        // the result is filtered rather than trusted wholesale.
+        PlanKind::Device { .. } => match crate::dir::dirent_type_for_mode(n.mode) {
+            t @ (ftype::CHRDEV | ftype::BLKDEV) => t,
             _ => ftype::UNKNOWN,
         },
-        PlanKind::Special => match n.mode & 0xF000 {
-            S_IFIFO => ftype::FIFO,
-            S_IFSOCK => ftype::SOCK,
+        PlanKind::Special => match crate::dir::dirent_type_for_mode(n.mode) {
+            t @ (ftype::FIFO | ftype::SOCK) => t,
             _ => ftype::UNKNOWN,
         },
     }
@@ -2654,7 +2657,8 @@ fn encode_zmap_trailer(
         CompressedIndexFormat::Compacted2B => {
             // Compute geometry from the actual ebase. The reader
             // does the same, so we MUST mirror it byte for byte.
-            let ebase = ((body_end + 7) & !7u64) + Z_EROFS_COMPACT_MAP_HEADER_SIZE;
+            let ebase = body_end.next_multiple_of(COMPACT_MAP_EBASE_ALIGN)
+                + Z_EROFS_COMPACT_MAP_HEADER_SIZE;
             let totalidx = lcluster_entries.len() as u32;
             // For totalidx == 0 the geometry is trivially empty; for
             // totalidx >= 16 we'd benefit from the 2B middle region.

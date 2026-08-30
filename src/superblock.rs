@@ -16,6 +16,63 @@ pub const EROFS_SUPER_OFFSET: u64 = 1024;
 pub const EROFS_SUPER_BLOCK_SIZE: usize = 128;
 pub const EROFS_SUPER_MAGIC_V1: u32 = 0xE0F5_E1E2;
 
+/// Byte offsets of the superblock's fields, per
+/// `struct erofs_super_block`.
+///
+/// The layout was written out as inline hex ranges at the parse site
+/// and again at the write site — one of 117 such ranges across the
+/// crate, none of them named, so a reader matching code against the
+/// kernel header had to count bytes. Naming them makes the parser and
+/// the writer index the same table, so a field cannot move in one
+/// without moving in the other.
+///
+/// The *test fixtures* deliberately keep their literals: they are the
+/// crate's independent statement of the format, and a wrong constant
+/// here should fail a test rather than be agreed with. See
+/// [`tests::superblock_offsets_match_the_kernel_header`].
+pub mod offsets {
+    use std::ops::Range;
+
+    pub const MAGIC: Range<usize> = 0x00..0x04;
+    pub const CHECKSUM: Range<usize> = 0x04..0x08;
+    pub const FEATURE_COMPAT: Range<usize> = 0x08..0x0C;
+    pub const BLKSZBITS: usize = 0x0C;
+    pub const SB_EXTSLOTS: usize = 0x0D;
+    pub const ROOT_NID: Range<usize> = 0x0E..0x10;
+    pub const INOS: Range<usize> = 0x10..0x18;
+    pub const BUILD_TIME: Range<usize> = 0x18..0x20;
+    pub const BUILD_TIME_NSEC: Range<usize> = 0x20..0x24;
+    pub const BLOCKS: Range<usize> = 0x24..0x28;
+    pub const META_BLKADDR: Range<usize> = 0x28..0x2C;
+    pub const XATTR_BLKADDR: Range<usize> = 0x2C..0x30;
+    pub const UUID: Range<usize> = 0x30..0x40;
+    pub const VOLUME_NAME: Range<usize> = 0x40..0x50;
+    pub const FEATURE_INCOMPAT: Range<usize> = 0x50..0x54;
+    /// `available_compr_algs` when COMPR_CFGS is set, otherwise
+    /// `lz4_max_distance` — the kernel's `u1` union.
+    pub const U1: Range<usize> = 0x54..0x56;
+    pub const EXTRA_DEVICES: Range<usize> = 0x56..0x58;
+    pub const DEVT_SLOTOFF: Range<usize> = 0x58..0x5A;
+    pub const DIRBLKBITS: usize = 0x5A;
+    pub const XATTR_PREFIX_COUNT: usize = 0x5B;
+    pub const XATTR_PREFIX_START: Range<usize> = 0x5C..0x60;
+    pub const PACKED_NID: Range<usize> = 0x60..0x68;
+}
+
+/// `feature_incompat` bit 0. When set, LZ4 frames are RIGHT-aligned in
+/// their pcluster block(s), with the leading bytes zero-padded, and a
+/// reader must skip those zeros before decompressing.
+///
+/// It lives here rather than in the writer because the *reader* depends
+/// on the behaviour it names — `decompress.rs` implements the skip at
+/// three sites, and before this each of them could only refer to the
+/// bit in prose. Modern fsck.erofs (>= erofs-utils 1.6) accepts only
+/// compressed images that set it; the ancient un-padded layout is gone.
+///
+/// Spec: `linux/fs/erofs/erofs_fs.h::EROFS_FEATURE_INCOMPAT_ZERO_PADDING`.
+/// Independent implementation.
+pub const EROFS_FEATURE_INCOMPAT_ZERO_PADDING: u32 = 0x0000_0001;
+
 /// `feature_compat` bit 0. When set, [`Superblock::checksum`] holds the
 /// CRC32C of the 128-byte superblock with the checksum field itself
 /// treated as zeros during computation.
@@ -104,11 +161,29 @@ impl Default for LzmaCfg {
     }
 }
 
-/// Maximum reasonable block size shift. EROFS supports 9..=16 in theory
-/// (512 B .. 64 KiB blocks); the common case is 12 (4 KiB). We reject
-/// values outside this range to catch corrupt headers cheaply.
-const MIN_BLKSZBITS: u8 = 9;
-const MAX_BLKSZBITS: u8 = 16;
+/// The block-size shifts EROFS defines: 9..=16, i.e. 512 B .. 64 KiB
+/// blocks. The common case is 12 (4 KiB).
+///
+/// `pub` because the same rule was being restated in the writer and in
+/// the CLI — five times across three files in two different units
+/// (shifts here, byte counts in the binary's usage text). The reader
+/// rejects values outside it to catch a corrupt header cheaply; the
+/// writer refuses to *emit* one; they are the same rule and it lives
+/// here.
+pub const MIN_BLKSZBITS: u8 = 9;
+/// See [`MIN_BLKSZBITS`].
+pub const MAX_BLKSZBITS: u8 = 16;
+
+/// The block sizes those shifts describe, in bytes. Derived, so the two
+/// encodings of the rule cannot drift apart.
+pub const MIN_BLOCK_SIZE: u64 = 1 << MIN_BLKSZBITS;
+/// See [`MIN_BLOCK_SIZE`].
+pub const MAX_BLOCK_SIZE: u64 = 1 << MAX_BLKSZBITS;
+
+/// True for a shift EROFS can express.
+pub fn is_valid_blkszbits(bits: u8) -> bool {
+    (MIN_BLKSZBITS..=MAX_BLKSZBITS).contains(&bits)
+}
 
 #[derive(Debug, Clone)]
 pub struct Superblock {
@@ -156,44 +231,50 @@ impl Superblock {
             return Err(Error::BadSuperblock("buffer shorter than 128 bytes"));
         }
 
-        let magic = u32::from_le_bytes(bytes[0x00..0x04].try_into().unwrap());
+        let magic = u32::from_le_bytes(bytes[offsets::MAGIC].try_into().unwrap());
         if magic != EROFS_SUPER_MAGIC_V1 {
             return Err(Error::NotErofs);
         }
 
-        let blkszbits = bytes[0x0C];
+        let blkszbits = bytes[offsets::BLKSZBITS];
         if !(MIN_BLKSZBITS..=MAX_BLKSZBITS).contains(&blkszbits) {
             return Err(Error::BadSuperblock("blkszbits out of range"));
         }
 
         let mut uuid = [0u8; 16];
-        uuid.copy_from_slice(&bytes[0x30..0x40]);
+        uuid.copy_from_slice(&bytes[offsets::UUID]);
         let mut volume_name = [0u8; 16];
-        volume_name.copy_from_slice(&bytes[0x40..0x50]);
+        volume_name.copy_from_slice(&bytes[offsets::VOLUME_NAME]);
 
         Ok(Superblock {
             magic,
-            checksum: u32::from_le_bytes(bytes[0x04..0x08].try_into().unwrap()),
-            feature_compat: u32::from_le_bytes(bytes[0x08..0x0C].try_into().unwrap()),
+            checksum: u32::from_le_bytes(bytes[offsets::CHECKSUM].try_into().unwrap()),
+            feature_compat: u32::from_le_bytes(bytes[offsets::FEATURE_COMPAT].try_into().unwrap()),
             blkszbits,
-            sb_extslots: bytes[0x0D],
-            root_nid: u16::from_le_bytes(bytes[0x0E..0x10].try_into().unwrap()),
-            inos: u64::from_le_bytes(bytes[0x10..0x18].try_into().unwrap()),
-            build_time: u64::from_le_bytes(bytes[0x18..0x20].try_into().unwrap()),
-            build_time_nsec: u32::from_le_bytes(bytes[0x20..0x24].try_into().unwrap()),
-            blocks: u32::from_le_bytes(bytes[0x24..0x28].try_into().unwrap()),
-            meta_blkaddr: u32::from_le_bytes(bytes[0x28..0x2C].try_into().unwrap()),
-            xattr_blkaddr: u32::from_le_bytes(bytes[0x2C..0x30].try_into().unwrap()),
+            sb_extslots: bytes[offsets::SB_EXTSLOTS],
+            root_nid: u16::from_le_bytes(bytes[offsets::ROOT_NID].try_into().unwrap()),
+            inos: u64::from_le_bytes(bytes[offsets::INOS].try_into().unwrap()),
+            build_time: u64::from_le_bytes(bytes[offsets::BUILD_TIME].try_into().unwrap()),
+            build_time_nsec: u32::from_le_bytes(
+                bytes[offsets::BUILD_TIME_NSEC].try_into().unwrap(),
+            ),
+            blocks: u32::from_le_bytes(bytes[offsets::BLOCKS].try_into().unwrap()),
+            meta_blkaddr: u32::from_le_bytes(bytes[offsets::META_BLKADDR].try_into().unwrap()),
+            xattr_blkaddr: u32::from_le_bytes(bytes[offsets::XATTR_BLKADDR].try_into().unwrap()),
             uuid,
             volume_name,
-            feature_incompat: u32::from_le_bytes(bytes[0x50..0x54].try_into().unwrap()),
-            u1: u16::from_le_bytes(bytes[0x54..0x56].try_into().unwrap()),
-            extra_devices: u16::from_le_bytes(bytes[0x56..0x58].try_into().unwrap()),
-            devt_slotoff: u16::from_le_bytes(bytes[0x58..0x5A].try_into().unwrap()),
-            dirblkbits: bytes[0x5A],
-            xattr_prefix_count: bytes[0x5B],
-            xattr_prefix_start: u32::from_le_bytes(bytes[0x5C..0x60].try_into().unwrap()),
-            packed_nid: u64::from_le_bytes(bytes[0x60..0x68].try_into().unwrap()),
+            feature_incompat: u32::from_le_bytes(
+                bytes[offsets::FEATURE_INCOMPAT].try_into().unwrap(),
+            ),
+            u1: u16::from_le_bytes(bytes[offsets::U1].try_into().unwrap()),
+            extra_devices: u16::from_le_bytes(bytes[offsets::EXTRA_DEVICES].try_into().unwrap()),
+            devt_slotoff: u16::from_le_bytes(bytes[offsets::DEVT_SLOTOFF].try_into().unwrap()),
+            dirblkbits: bytes[offsets::DIRBLKBITS],
+            xattr_prefix_count: bytes[offsets::XATTR_PREFIX_COUNT],
+            xattr_prefix_start: u32::from_le_bytes(
+                bytes[offsets::XATTR_PREFIX_START].try_into().unwrap(),
+            ),
+            packed_nid: u64::from_le_bytes(bytes[offsets::PACKED_NID].try_into().unwrap()),
         })
     }
 
@@ -244,7 +325,7 @@ impl Superblock {
         }
         let mut tmp = raw_sb_to_block_end[..want_len].to_vec();
         // Zero the checksum field for recomputation.
-        tmp[0x04..0x08].fill(0);
+        tmp[offsets::CHECKSUM].fill(0);
         (crc32c::crc32c(&tmp) ^ 0xFFFF_FFFF) == self.checksum
     }
 }
@@ -353,7 +434,9 @@ pub fn read_device_table<R: BlockRead + ?Sized>(
 /// Byte offset of the post-superblock COMPR_CFGS blob: immediately
 /// after the 128-byte SB plus any extension slots.
 pub fn compr_cfgs_offset(sb: &Superblock) -> u64 {
-    EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE as u64 + (sb.sb_extslots as u64) * 16
+    EROFS_SUPER_OFFSET
+        + EROFS_SUPER_BLOCK_SIZE as u64
+        + (sb.sb_extslots as u64) * crate::inode::SB_EXTSLOT_SIZE
 }
 
 /// Hard cap on the size of the COMPR_CFGS blob we'll walk. Each
@@ -479,6 +562,90 @@ pub fn read_compr_cfgs<R: BlockRead + ?Sized>(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// The offset table, checked against `struct erofs_super_block`.
+    ///
+    /// A deliberate second copy of every number in
+    /// [`super::offsets`] — the only kind of test that can catch a
+    /// wrong constant, now that the parser and the writer both read it.
+    /// The literals come from the kernel header, reproduced in this
+    /// module's doc comment.
+    ///
+    /// If this and the table disagree, re-read the header before
+    /// changing either: this is the half with independent provenance.
+    #[test]
+    fn superblock_offsets_match_the_kernel_header() {
+        use super::offsets as at;
+        assert_eq!(at::MAGIC, 0x00..0x04);
+        assert_eq!(at::CHECKSUM, 0x04..0x08);
+        assert_eq!(at::FEATURE_COMPAT, 0x08..0x0C);
+        assert_eq!(at::BLKSZBITS, 0x0C);
+        assert_eq!(at::SB_EXTSLOTS, 0x0D);
+        assert_eq!(at::ROOT_NID, 0x0E..0x10);
+        assert_eq!(at::INOS, 0x10..0x18);
+        assert_eq!(at::BUILD_TIME, 0x18..0x20);
+        assert_eq!(at::BUILD_TIME_NSEC, 0x20..0x24);
+        assert_eq!(at::BLOCKS, 0x24..0x28);
+        assert_eq!(at::META_BLKADDR, 0x28..0x2C);
+        assert_eq!(at::XATTR_BLKADDR, 0x2C..0x30);
+        assert_eq!(at::UUID, 0x30..0x40);
+        assert_eq!(at::VOLUME_NAME, 0x40..0x50);
+        assert_eq!(at::FEATURE_INCOMPAT, 0x50..0x54);
+        assert_eq!(at::U1, 0x54..0x56);
+        assert_eq!(at::EXTRA_DEVICES, 0x56..0x58);
+        assert_eq!(at::DEVT_SLOTOFF, 0x58..0x5A);
+        assert_eq!(at::DIRBLKBITS, 0x5A);
+        assert_eq!(at::XATTR_PREFIX_COUNT, 0x5B);
+        assert_eq!(at::XATTR_PREFIX_START, 0x5C..0x60);
+        assert_eq!(at::PACKED_NID, 0x60..0x68);
+    }
+
+    /// No superblock field overlaps the next, and none runs past the
+    /// 128-byte structure.
+    ///
+    /// The table above pins each offset alone; this checks they still
+    /// describe one layout. A field widened without its neighbour
+    /// moving satisfies every assertion above and fails here.
+    #[test]
+    fn no_superblock_field_overlaps_its_neighbour() {
+        use super::offsets as at;
+        let fields = [
+            (at::MAGIC.start, at::MAGIC.len()),
+            (at::CHECKSUM.start, at::CHECKSUM.len()),
+            (at::FEATURE_COMPAT.start, at::FEATURE_COMPAT.len()),
+            (at::BLKSZBITS, 1),
+            (at::SB_EXTSLOTS, 1),
+            (at::ROOT_NID.start, at::ROOT_NID.len()),
+            (at::INOS.start, at::INOS.len()),
+            (at::BUILD_TIME.start, at::BUILD_TIME.len()),
+            (at::BUILD_TIME_NSEC.start, at::BUILD_TIME_NSEC.len()),
+            (at::BLOCKS.start, at::BLOCKS.len()),
+            (at::META_BLKADDR.start, at::META_BLKADDR.len()),
+            (at::XATTR_BLKADDR.start, at::XATTR_BLKADDR.len()),
+            (at::UUID.start, at::UUID.len()),
+            (at::VOLUME_NAME.start, at::VOLUME_NAME.len()),
+            (at::FEATURE_INCOMPAT.start, at::FEATURE_INCOMPAT.len()),
+            (at::U1.start, at::U1.len()),
+            (at::EXTRA_DEVICES.start, at::EXTRA_DEVICES.len()),
+            (at::DEVT_SLOTOFF.start, at::DEVT_SLOTOFF.len()),
+            (at::DIRBLKBITS, 1),
+            (at::XATTR_PREFIX_COUNT, 1),
+            (at::XATTR_PREFIX_START.start, at::XATTR_PREFIX_START.len()),
+            (at::PACKED_NID.start, at::PACKED_NID.len()),
+        ];
+        let mut reached = 0usize;
+        for (start, width) in fields {
+            assert!(
+                start >= reached,
+                "field at {start:#x} overlaps the one ending at {reached:#x}"
+            );
+            reached = start + width;
+            assert!(
+                reached <= EROFS_SUPER_BLOCK_SIZE,
+                "field at {start:#x} runs past the 128-byte superblock"
+            );
+        }
+    }
+
     use super::*;
     use crate::test_device::MemDev;
 

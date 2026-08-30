@@ -184,22 +184,14 @@ pub struct fs_erofs_dir_iter_t {
 // Helpers
 // ===========================================================================
 
-// Standard S_IFMT → ABI file-type byte (UNKNOWN=0, REG=1, DIR=2, CHR=3,
-// BLK=4, FIFO=5, SOCK=6, LNK=7). EROFS stores a POSIX mode; its dirent
-// type byte already uses this same encoding, so directory entries pass
-// through unchanged.
-fn mode_to_abi(mode: u16) -> u8 {
-    match mode & 0o170000 {
-        0o100000 => 1, // S_IFREG
-        0o040000 => 2, // S_IFDIR
-        0o020000 => 3, // S_IFCHR
-        0o060000 => 4, // S_IFBLK
-        0o010000 => 5, // S_IFIFO
-        0o140000 => 6, // S_IFSOCK
-        0o120000 => 7, // S_IFLNK
-        _ => 0,
-    }
-}
+// The C ABI's file-type byte is EROFS's dirent type byte — same values,
+// so directory entries pass through unchanged and an inode's mode
+// converts with the crate's own mapping.
+//
+// This used to be a third, independent table written in octal, whose
+// comments named the `S_IF*` constants and whose return values were the
+// `ftype` constants, while referencing neither.
+use crate::dir::dirent_type_for_mode as mode_to_abi;
 
 fn fill_attr(out: &mut fs_erofs_attr_t, inode: &Inode) {
     out.inode = inode.nid;
