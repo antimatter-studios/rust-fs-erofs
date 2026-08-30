@@ -118,7 +118,7 @@ pub struct Superblock {
     /// log2(block size). Block size in bytes is `1 << blkszbits`.
     pub blkszbits: u8,
     /// Extension slots beyond the 128-byte base. Total SB size is
-    /// `128 + sb_extslots * 16`. Phase 0 ignores extension slots.
+    /// `128 + sb_extslots * 16`. Extension slots are not read.
     pub sb_extslots: u8,
     /// NID of the root directory inode.
     pub root_nid: u16,
@@ -135,7 +135,7 @@ pub struct Superblock {
     pub volume_name: [u8; 16],
     pub feature_incompat: u32,
     /// Either `available_compr_algs` (compression bits) or
-    /// `lz4_max_distance` -- a union in the C header. Phase 0 keeps the
+    /// `lz4_max_distance` -- a union in the C header. This keeps the
     /// raw u16 and lets higher layers interpret as needed.
     pub u1: u16,
     pub extra_devices: u16,
