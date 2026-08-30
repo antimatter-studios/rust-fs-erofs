@@ -43,6 +43,66 @@ use fs_core::BlockRead;
 pub const XATTR_HEADER_SIZE: usize = 12;
 const XATTR_ENTRY_HEADER_SIZE: usize = 4;
 
+/// The four-byte header every `erofs_xattr_entry` begins with.
+///
+/// `XATTR_ENTRY_HEADER_SIZE` was named; the decode inside it was not,
+/// and was open-coded at three sites. The third — `read_shared_xattrs`,
+/// which reads a header only to learn how far to read again — was the
+/// odd one out twice over: it dropped `name_index` entirely, and it
+/// summed the body length with plain `+` where the other two used
+/// `checked_add`. Neither can overflow a 64-bit `usize` given a `u8`
+/// and a `u16`, so nothing was reachable; but a third copy that
+/// validates less than its siblings is how the reachable version
+/// eventually arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XattrEntryHeader {
+    /// Length of the attribute name, in bytes. Never longer than 255,
+    /// because the field is one byte.
+    name_len: usize,
+    /// Namespace prefix index, with the long-prefix bit still set —
+    /// callers mask it themselves.
+    name_index: u8,
+    /// Length of the attribute value, in bytes.
+    value_size: usize,
+}
+
+impl XattrEntryHeader {
+    /// Decode the header at the start of `buf`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadXattr`] if `buf` is shorter than the header.
+    fn parse(buf: &[u8]) -> Result<Self> {
+        if buf.len() < XATTR_ENTRY_HEADER_SIZE {
+            return Err(Error::BadXattr("xattr entry header truncated"));
+        }
+        Ok(XattrEntryHeader {
+            name_len: buf[0] as usize,
+            name_index: buf[1],
+            value_size: u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize,
+        })
+    }
+
+    /// Bytes this entry occupies in total: header, name and value.
+    ///
+    /// Checked, so the arithmetic is the same at every site rather than
+    /// at two of three.
+    fn total_len(self) -> Result<usize> {
+        XATTR_ENTRY_HEADER_SIZE
+            .checked_add(self.name_len)
+            .and_then(|p| p.checked_add(self.value_size))
+            .ok_or(Error::BadXattr("entry size overflow"))
+    }
+
+    /// True when all three fields are zero.
+    ///
+    /// The inline area may be padded with zeros, and no real entry has
+    /// zero in all three — an ACL slot always has `value_size > 0`.
+    fn is_padding(self) -> bool {
+        self.name_len == 0 && self.value_size == 0 && self.name_index == 0
+    }
+}
+
 /// Bit set in `e_name_index` to flag a custom-prefix-dictionary entry.
 /// When set, the low 7 bits (`name_index & EROFS_XATTR_LONG_PREFIX_MASK`)
 /// are an index into the dictionary at `sb.xattr_prefix_start * 4`.
@@ -128,20 +188,16 @@ pub fn parse_inline_xattrs(buf: &[u8]) -> Result<(Vec<u32>, Vec<XattrEntry>)> {
         if entries_end - cur < XATTR_ENTRY_HEADER_SIZE {
             break;
         }
-        let name_len = buf[cur] as usize;
-        let name_index = buf[cur + 1];
-        let value_size = u16::from_le_bytes(buf[cur + 2..cur + 4].try_into().unwrap()) as usize;
+        let header = XattrEntryHeader::parse(&buf[cur..])?;
+        let (name_len, name_index) = (header.name_len, header.name_index);
 
-        if name_len == 0 && value_size == 0 && name_index == 0 {
-            // Treat as terminal padding -- no real entry has zero in all
-            // three fields (ACL slots have value_size > 0).
+        if header.is_padding() {
             break;
         }
 
         let entry_body_start = cur + XATTR_ENTRY_HEADER_SIZE;
-        let entry_body_end = entry_body_start
-            .checked_add(name_len)
-            .and_then(|p| p.checked_add(value_size))
+        let entry_body_end = cur
+            .checked_add(header.total_len()?)
             .ok_or(Error::BadXattr("entry size overflow"))?;
         if entry_body_end > entries_end {
             return Err(Error::BadXattr("entry runs past inline area"));
@@ -168,17 +224,10 @@ pub fn parse_inline_xattrs(buf: &[u8]) -> Result<(Vec<u32>, Vec<XattrEntry>)> {
 /// is left to the caller -- shared entries are addressed individually by
 /// their start offset, so the trailing pad is unobserved.
 fn parse_shared_entry(buf: &[u8]) -> Result<XattrEntry> {
-    if buf.len() < XATTR_ENTRY_HEADER_SIZE {
-        return Err(Error::BadXattr("shared entry header truncated"));
-    }
-    let name_len = buf[0] as usize;
-    let name_index = buf[1];
-    let value_size = u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize;
+    let header = XattrEntryHeader::parse(buf)?;
+    let (name_len, name_index) = (header.name_len, header.name_index);
     let body_start = XATTR_ENTRY_HEADER_SIZE;
-    let body_end = body_start
-        .checked_add(name_len)
-        .and_then(|p| p.checked_add(value_size))
-        .ok_or(Error::BadXattr("shared entry size overflow"))?;
+    let body_end = header.total_len()?;
     if body_end > buf.len() {
         return Err(Error::BadXattr("shared entry runs past read"));
     }
@@ -292,11 +341,9 @@ pub fn read_shared_xattrs<R: BlockRead + ?Sized>(
             )
             .ok_or(Error::BadXattr("shared xattr offset overflow"))?;
         // Read the header to learn the entry's total length.
-        let mut header = [0u8; XATTR_ENTRY_HEADER_SIZE];
-        dev.read_at(off, &mut header)?;
-        let name_len = header[0] as usize;
-        let value_size = u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize;
-        let total = XATTR_ENTRY_HEADER_SIZE + name_len + value_size;
+        let mut raw = [0u8; XATTR_ENTRY_HEADER_SIZE];
+        dev.read_at(off, &mut raw)?;
+        let total = XattrEntryHeader::parse(&raw)?.total_len()?;
         let mut buf = vec![0u8; total];
         dev.read_at(off, &mut buf)?;
         out.push(parse_shared_entry(&buf)?);
@@ -365,6 +412,70 @@ pub fn read_xattr_prefix_dictionary<R: BlockRead + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+
+    // --- XattrEntryHeader -------------------------------------------------
+    //
+    // The decode was open-coded at three sites, and the third validated
+    // less than the other two. These pin the shape once.
+
+    /// The three fields, at their offsets, in the format's byte order.
+    ///
+    /// Asserted against literal bytes rather than against
+    /// `from_le_bytes`, which would restate the implementation. A
+    /// byte-order slip here is invisible to a round trip through this
+    /// crate: the writer and reader would agree while disagreeing with
+    /// `mkfs.erofs`.
+    #[test]
+    fn the_header_fields_sit_where_the_format_puts_them() {
+        let h = XattrEntryHeader::parse(&[0x05, 0x02, 0x34, 0x12]).unwrap();
+        assert_eq!(h.name_len, 5, "e_name_len is byte 0");
+        assert_eq!(h.name_index, 2, "e_name_index is byte 1");
+        assert_eq!(
+            h.value_size, 0x1234,
+            "e_value_size is little-endian at 2..4"
+        );
+    }
+
+    /// A buffer shorter than the header is refused, not indexed into.
+    #[test]
+    fn a_truncated_header_is_refused() {
+        for len in 0..XATTR_ENTRY_HEADER_SIZE {
+            assert!(
+                XattrEntryHeader::parse(&vec![0u8; len]).is_err(),
+                "{len} bytes is too short for a {XATTR_ENTRY_HEADER_SIZE}-byte header"
+            );
+        }
+        assert!(XattrEntryHeader::parse(&[0u8; XATTR_ENTRY_HEADER_SIZE]).is_ok());
+    }
+
+    /// `total_len` covers header, name and value — the arithmetic the
+    /// third site used to do with a plain `+`.
+    #[test]
+    fn total_len_is_the_whole_entry() {
+        let h = XattrEntryHeader::parse(&[0xFF, 0x00, 0xFF, 0xFF]).unwrap();
+        assert_eq!(h.name_len, 255);
+        assert_eq!(h.value_size, 65535);
+        assert_eq!(
+            h.total_len().unwrap(),
+            XATTR_ENTRY_HEADER_SIZE + 255 + 65535,
+            "the widest entry the fields can describe"
+        );
+    }
+
+    /// Only an all-zero header is padding.
+    ///
+    /// The inline area may be zero-padded, and no real entry has zero
+    /// in all three fields — an ACL slot always has `value_size > 0`.
+    /// Treating a merely-nameless entry as padding would truncate the
+    /// list.
+    #[test]
+    fn only_an_all_zero_header_reads_as_padding() {
+        assert!(XattrEntryHeader::parse(&[0, 0, 0, 0]).unwrap().is_padding());
+        assert!(!XattrEntryHeader::parse(&[1, 0, 0, 0]).unwrap().is_padding());
+        assert!(!XattrEntryHeader::parse(&[0, 1, 0, 0]).unwrap().is_padding());
+        assert!(!XattrEntryHeader::parse(&[0, 0, 1, 0]).unwrap().is_padding());
+    }
+
     use super::*;
     use crate::test_device::MemDev;
 
