@@ -6,6 +6,18 @@ never does.
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-09-06
+
+### Fixed
+
+- The sizes an image declares are bounded before anything is allocated
+  on them: a symlink's length and a pcluster's compressed size are both
+  the image's own numbers.
+- The lcluster walk stops where a pcluster can no longer reach, rather
+  than running to the end of the map.
+- A pcluster's decoded span is bounded by its size on disk rather than
+  by what it claims to decode to.
+
 ## [0.1.4] — 2026-09-04
 
 ### Changed
