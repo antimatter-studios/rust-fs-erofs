@@ -222,8 +222,18 @@ impl Inode {
     }
 
     /// On-disk byte offset of this inode's first byte.
+    ///
+    /// Saturating, not wrapping. `nid` comes straight out of a directory
+    /// entry, so it is whatever the image says; multiplied by the slot
+    /// size it can leave a `u64`, which in release -- where these crates
+    /// ship with `overflow-checks` off -- wrapped to a small offset and
+    /// read some unrelated inode as though it were the one asked for.
+    /// Saturating instead produces an offset no device reaches, so the
+    /// read fails and says so.
     pub fn iloc(sb: &Superblock, nid: u64) -> u64 {
-        sb.meta_blkaddr as u64 * sb.block_size() + nid * EROFS_INODE_SLOT_SIZE
+        (sb.meta_blkaddr as u64)
+            .saturating_mul(sb.block_size())
+            .saturating_add(nid.saturating_mul(EROFS_INODE_SLOT_SIZE))
     }
 
     /// Offset of the byte that immediately follows the inode body and
@@ -239,7 +249,9 @@ impl Inode {
             // sizeof(erofs_xattr_ibody_header) + (icount - 1) * 4
             12 + (self.xattr_icount as u64 - 1) * 4
         };
-        inode_off + self.on_disk_size as u64 + xattr_size
+        inode_off
+            .saturating_add(self.on_disk_size as u64)
+            .saturating_add(xattr_size)
     }
 
     /// Read this inode by NID.
