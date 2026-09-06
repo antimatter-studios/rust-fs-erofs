@@ -28,6 +28,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// the cache without unbounded growth.
 pub const DEFAULT_PCLUSTER_CACHE_CAPACITY: usize = 256;
 
+/// Default capacity, in device blocks, of the metadata cache.
+///
+/// A different cache from the one above and for a different thing: that
+/// one holds decompressed pclusters, this one holds raw blocks, and the
+/// blocks it holds are the ones the codec never sees — inodes,
+/// directory blocks, xattr tables, extent maps. 512 blocks is 2 MiB at
+/// a 4 KiB block size, sized to hold the metadata a directory walk
+/// touches rather than to hold data, which passes straight through.
+pub const DEFAULT_METADATA_CACHE_BLOCKS: usize = 512;
+
 /// Internal state of the decompressed-pcluster LRU cache. Keyed by
 /// `(inode.nid, pcluster_blkaddr)` so the same compressed payload at
 /// the same on-disk blkaddr referenced by two different inodes never
@@ -168,6 +178,39 @@ impl Filesystem {
     /// zmap header claims a fragment but `packed_nid` is still zero
     /// we return `Error::BadInode` from [`Self::packed_inode`].
     pub fn open(dev: Arc<dyn BlockRead>) -> Result<Self> {
+        Self::open_with_cache(dev, DEFAULT_METADATA_CACHE_BLOCKS)
+    }
+
+    /// Open an image, caching `blocks` metadata blocks.
+    ///
+    /// # This is a second cache, not the first
+    ///
+    /// [`Filesystem`] already holds `pcluster_cache`, which keeps
+    /// **decompressed** pclusters: a hit there skips a decompression as
+    /// well as a read, which is why it sits above the codec.
+    ///
+    /// What that cache does not hold is anything the codec never
+    /// touched — the superblock, inodes, directory blocks, the xattr
+    /// tables, the extent maps. Every one of those was read from the
+    /// device each time it was wanted, including the same directory
+    /// re-read for every path resolved through it.
+    ///
+    /// This cache is keyed by device block and sits underneath both:
+    /// the pcluster cache's own misses are served from it when the
+    /// blocks are still held.
+    ///
+    /// `blocks` of zero disables it, which is what the measurement in
+    /// `tests/read_path_cost.rs` uses to take its baseline.
+    pub fn open_with_cache(dev: Arc<dyn BlockRead>, blocks: usize) -> Result<Self> {
+        if blocks == 0 {
+            return Self::open_with_devices(dev, Vec::new());
+        }
+        // The block size is not known until the superblock has been
+        // read, and the superblock is at a fixed offset, so this one
+        // read goes to the device directly.
+        let sb = superblock::read(&*dev)?;
+        let block_size = 1u64 << sb.blkszbits;
+        let dev: Arc<dyn BlockRead> = fs_core::CachingDevice::read_only(dev, block_size, blocks);
         Self::open_with_devices(dev, Vec::new())
     }
 
