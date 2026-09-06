@@ -17,7 +17,7 @@ pub enum Error {
     /// because it is `pub`: the variant once covered the compressed and
     /// chunk-based DATA LAYOUTS, which are all decoded now. What
     /// reaches it today is `Algorithm::from_id` meeting an id outside
-    /// LZ4 (0), LZMA (1) and DEFLATE (2).
+    /// LZ4 (0), LZMA (1), DEFLATE (2) and ZSTD (3).
     UnsupportedLayout(u8),
     /// A directory block didn't pass dirent-array sanity checks.
     BadDirent(&'static str),

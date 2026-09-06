@@ -182,9 +182,13 @@ pub struct ComprCfgs {
 ///
 /// It is parsed and kept anyway, for two reasons. The record occupies
 /// space in the blob and the codecs after it in the canonical order
-/// cannot be found without stepping over it. And a value that
-/// disagrees with the frame header would be worth knowing about; you
-/// cannot notice that in a field you threw away.
+/// cannot be found without stepping over it. And both fields are
+/// range-checked on the way in: a `format` other than zero, or a
+/// dictionary past
+/// [`Z_EROFS_ZSTD_MAX_DICT_SIZE`](crate::decompress::Z_EROFS_ZSTD_MAX_DICT_SIZE),
+/// means the record is not the record this reader knows — and every
+/// codec after it in the blob would then be read from the wrong
+/// offset.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ZstdCfg {
     /// Reserved by the format; zero in everything mkfs.erofs emits.
@@ -551,8 +555,9 @@ const Z_EROFS_COMPRESSION_ZSTD_BIT: u16 = 1 << 3;
 ///   `windowbits` is informational; the reader's DEFLATE codec
 ///   accepts any compliant stream.
 /// - ZSTD (`size = 6`): `u8 format; u8 windowlog; u8 reserved[4];`.
-///   `windowlog` is `ZSTD_windowLog - 10`; see [`ZstdCfg`] for why the
-///   codec does not consult it.
+///   `windowlog` is `ZSTD_windowLog - 10`. Both fields are range-checked
+///   here; see [`ZstdCfg`] for why the codec still does not consult
+///   them.
 ///
 /// Spec: blob layout described in the public EROFS on-disk-format
 /// documentation
@@ -629,10 +634,37 @@ pub fn read_compr_cfgs<R: BlockRead + ?Sized>(
         if payload.len() < 2 {
             return Err(Error::BadInode("ZSTD cfg payload < 2 bytes"));
         }
-        cfgs.zstd = Some(ZstdCfg {
+        let cfg = ZstdCfg {
             format: payload[0],
             windowlog: payload[1],
-        });
+        };
+        // Refused rather than ignored. Both fields are constrained by the
+        // format, and a value outside those constraints means the record
+        // is not the record this reader knows: either the layout moved,
+        // or the bytes are not a ZSTD config at all. Reading on would
+        // treat whatever follows as an ordinary frame and produce
+        // confident nonsense, which is the failure mode worth spending a
+        // refusal to avoid.
+        if cfg.format != 0 {
+            return Err(Error::BadSuperblock(
+                "ZSTD config declares a format other than 0, the only one defined",
+            ));
+        }
+        // `windowlog` is `ZSTD_windowLog - 10`, so the dictionary is
+        // `1 << (windowlog + 10)`, and the format caps that at
+        // `Z_EROFS_ZSTD_MAX_DICT_SIZE`. `mkfs.erofs` refuses to write a
+        // larger one; the kernel sizes its workspace from this field and
+        // would not be able to honour one.
+        //
+        // The shift is bounded by the check itself: anything above 10
+        // exceeds the limit, so `windowlog` never gets near the width of
+        // the type it is shifted into.
+        if u32::from(cfg.windowlog) + 10 > crate::decompress::Z_EROFS_ZSTD_MAX_DICT_LOG {
+            return Err(Error::BadSuperblock(
+                "ZSTD config declares a dictionary larger than the format allows",
+            ));
+        }
+        cfgs.zstd = Some(cfg);
     }
     Ok(Some(cfgs))
 }

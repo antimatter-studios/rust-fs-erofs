@@ -97,9 +97,13 @@ fn the_committed_zstd_image_reads_back_exactly() {
     let cfgs = *fs.compr_cfgs().expect("the image advertises COMPR_CFGS");
     let zstd = cfgs.zstd.expect("the blob carries a ZSTD record");
     assert_eq!(zstd.format, 0, "mkfs.erofs emits format 0");
+    // `windowlog` is `ZSTD_windowLog - 10`, and the format caps the
+    // dictionary at 1 MiB — so the field never exceeds 10. The parser
+    // enforces that; this says what a real writer actually emits, which
+    // is well under it.
     assert!(
-        (1..=22).contains(&(zstd.windowlog as u32 + 10)),
-        "windowlog {} is outside what zstd defines",
+        u32::from(zstd.windowlog) + 10 <= fs_erofs::decompress::Z_EROFS_ZSTD_MAX_DICT_LOG,
+        "windowlog {} is past what the format allows",
         zstd.windowlog
     );
 
