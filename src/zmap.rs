@@ -1292,7 +1292,26 @@ impl<'a> ZMap<'a> {
         // BIG_PCLUSTER compressed-block count.
         let mut next_head: Option<(u64, LClusterEntry)> = None;
         let mut cblkcnt_blocks: Option<u32> = None;
-        for i in (head_idx + 1)..n_lclusters {
+        // AS FAR AS A PCLUSTER CAN REACH, and no further.
+        //
+        // This walk runs once per block read, and `n_lclusters` is
+        // bounded only by `u32::MAX`, so reading a file linearly was
+        // quadratic in its lcluster count: an image whose lcluster 0 is
+        // a HEAD and whose remainder is all NONHEAD made every block
+        // read scan to the end of the file.
+        //
+        // A pcluster covers at most `MAX_PCLUSTER_SIZE` bytes of the
+        // source -- see `fs::pcluster_span`, and mkfs.erofs 1.7.1
+        // refuses `-C2097152` -- so the next HEAD is at most that many
+        // lclusters away. A walk that reaches further is looking for a
+        // HEAD that would bound a pcluster larger than one can be, and
+        // the span is refused a moment later anyway.
+        let reach = (crate::fs::MAX_PCLUSTER_SIZE / lcluster_size).max(1) + 1;
+        let scan_end = head_idx
+            .saturating_add(1)
+            .saturating_add(reach)
+            .min(n_lclusters);
+        for i in (head_idx + 1)..scan_end {
             let e = self.read_lcluster(dev, i)?;
             if is_head_or_plain(e.cluster_type) {
                 next_head = Some((i, e));
