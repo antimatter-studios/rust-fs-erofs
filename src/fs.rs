@@ -100,18 +100,33 @@ pub struct Filesystem {
 
 /// The largest span a physical cluster may decode to.
 ///
-/// EROFS's own limit, and measured rather than assumed: `mkfs.erofs`
-/// 1.7.1 accepts `-C1048576` and refuses `-C2097152` with "unsupported
-/// clusterblks 512 (too large)". So no image a maker will produce has a
-/// pcluster larger than this.
+/// This is `Z_EROFS_PCLUSTER_MAX_DSIZE`, the kernel's ceiling on a
+/// pcluster's DECODED length. It is not the same number as the ceiling
+/// on its length ON DISK, which is `Z_EROFS_PCLUSTER_MAX_SIZE` -- 1 MiB,
+/// the one `mkfs.erofs -C` sets and refuses to exceed.
 ///
-/// It matters because a pcluster's uncompressed span is the size of the
-/// buffer the decoder writes into, and for the last pcluster of a file
-/// that span's end is simply the inode's declared size -- an
+/// That distinction was got wrong once, and the 1 MiB number was applied
+/// here. It refused ordinary images. Measured with erofs-utils on a
+/// 64 MiB file of zeros at a 4 KiB block size, largest decoded span per
+/// pcluster:
+///
+/// ```text
+///   -zlz4hc                     1,041,954     (just under 1 MiB)
+///   -zlz4hc -C16384             4,175,394
+///   -zlz4hc -C65536             8,192,000     (mkfs's own default cap)
+///   -zlz4hc -C1048576           8,192,000
+/// ```
+///
+/// So the compressed cluster is bounded at 1 MiB and what it decodes to
+/// is not. 12 MiB is what the kernel will accept.
+///
+/// The bound matters because a pcluster's decoded span is the size of
+/// the buffer the decoder writes into, and for the last pcluster of a
+/// file that span's end is simply the inode's declared size -- an
 /// unvalidated `u64`. A 1.3 MB image asked a 64 KiB read for a 281 TB
 /// allocation, which `handle_alloc_error` answers by aborting: the FFI
 /// boundary's `catch_unwind` never sees it and the host process dies.
-pub const MAX_PCLUSTER_SIZE: u64 = 1024 * 1024;
+pub const MAX_PCLUSTER_SIZE: u64 = 12 * 1024 * 1024;
 
 /// What identifies a decompressed physical cluster.
 ///
