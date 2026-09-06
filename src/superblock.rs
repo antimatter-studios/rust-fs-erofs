@@ -86,7 +86,40 @@ pub const EROFS_FEATURE_COMPAT_SB_CHKSUM: u32 = 0x0000_0001;
 /// bytes for every file with a `Z_EROFS_ADVISE_FRAGMENT_PCLUSTER`
 /// header bit. Spec: `linux/fs/erofs/erofs_fs.h::
 /// EROFS_FEATURE_INCOMPAT_FRAGMENTS`.
-pub const EROFS_FEATURE_INCOMPAT_FRAGMENTS: u32 = 0x0000_0010;
+///
+/// **The value is 0x20, and was 0x10 here for a long time — which is
+/// [`EROFS_FEATURE_INCOMPAT_ZTAILPACKING`]'s bit.** Nothing gated on
+/// it, so no image was ever misread, and that is exactly why it went
+/// unnoticed: a constant that is wrong and unused reads as verified.
+/// Measured rather than re-copied — see the test below, which builds
+/// images with `mkfs.erofs -E<option>` and asserts the bit each one
+/// actually sets.
+pub const EROFS_FEATURE_INCOMPAT_FRAGMENTS: u32 = 0x0000_0020;
+
+/// `feature_incompat` bit advertising ztailpacking: the tail of a
+/// compressed file inlined into its inode rather than given a pcluster
+/// of its own.
+///
+/// Set only when the layout is actually used. `mkfs.erofs
+/// -Eztailpacking` on a tree with no inlinable tail produces an image
+/// that does not set it.
+///
+/// Spec: `linux/fs/erofs/erofs_fs.h::
+/// EROFS_FEATURE_INCOMPAT_ZTAILPACKING`.
+pub const EROFS_FEATURE_INCOMPAT_ZTAILPACKING: u32 = 0x0000_0010;
+
+/// `feature_incompat` bit for deduplication.
+///
+/// **The same bit as [`EROFS_FEATURE_INCOMPAT_FRAGMENTS`]**, which is
+/// how the kernel header defines it, so the two cannot be told apart
+/// from the superblock. Measured: `mkfs.erofs -Ededupe` alone produces
+/// an image whose `feature_incompat` is indistinguishable from a plain
+/// one, and the bit appears only once fragments are in play.
+///
+/// Deduplication needs nothing from a reader in any case — it means
+/// several inodes' extent maps point at the same pcluster, which is
+/// read by physical address like any other.
+pub const EROFS_FEATURE_INCOMPAT_DEDUPE: u32 = 0x0000_0020;
 
 /// `feature_incompat` bit advertising the per-algorithm "compression
 /// configurations" blob that lives immediately after the 128-byte
