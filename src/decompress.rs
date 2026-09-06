@@ -174,11 +174,50 @@ fn decompress_lzma(input: &[u8], output: &mut [u8], cfg: &LzmaCfg) -> Result<()>
     decompress_lzma_no_header(real_input, output, cfg)
 }
 
+/// A `Write` sink that refuses to grow past a ceiling.
+///
+/// `lzma_rs::lzma_decompress` decodes into whatever sink it is given
+/// and stops when the stream says to, so a `Vec` grows to whatever the
+/// stream's own 13-byte header declared. That header is attacker bytes.
+pub(crate) struct Capped {
+    pub(crate) buf: Vec<u8>,
+    pub(crate) limit: usize,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > self.limit {
+            return Err(std::io::Error::other(
+                "decoded output is longer than the extent it decodes",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn try_decompress_lzma_with_header(input: &[u8], output: &mut [u8]) -> Result<()> {
-    let mut decoded: Vec<u8> = Vec::with_capacity(output.len());
+    // BOUNDED, because this attempt is made FIRST, for every LZMA
+    // cluster, and its failure is swallowed -- so a stream whose header
+    // declares an enormous unpacked size costs the full decode before
+    // the fallback is even reached. Measured against an unbounded
+    // `Vec`: 303 KB of input against a 4096-byte extent reached 946 MB
+    // resident and took two minutes before erroring.
+    //
+    // The ceiling is the extent's own size. A stream that decodes to
+    // more than that would fail the length check below anyway; this
+    // only stops it doing so after the memory is spent.
+    let mut sink = Capped {
+        buf: Vec::with_capacity(output.len()),
+        limit: output.len(),
+    };
     let mut reader = Cursor::new(input);
-    lzma_rs::lzma_decompress(&mut reader, &mut decoded)
+    lzma_rs::lzma_decompress(&mut reader, &mut sink)
         .map_err(|_| Error::BadInode("LZMA decompression failed"))?;
+    let decoded = sink.buf;
     if decoded.len() != output.len() {
         return Err(Error::BadInode("LZMA decompressed size mismatch"));
     }
@@ -241,6 +280,34 @@ fn decompress_deflate(input: &[u8], output: &mut [u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The LZMA-with-header attempt is made first, for every LZMA
+    /// cluster, and its failure is swallowed -- so an unbounded sink
+    /// meant a stream whose own header declares an enormous unpacked
+    /// size paid the full decode before the fallback was even reached.
+    /// Measured: 303 KB of input against a 4096-byte extent reached
+    /// 946 MB resident and took two minutes.
+    #[test]
+    fn the_decode_sink_refuses_to_grow_past_the_extent_it_fills() {
+        use std::io::Write;
+        let mut sink = Capped {
+            buf: Vec::new(),
+            limit: 8,
+        };
+        assert!(sink.write(b"12345678").is_ok());
+        assert_eq!(sink.buf.len(), 8);
+        assert!(sink.write(b"9").is_err(), "the sink grew past its limit");
+        assert_eq!(sink.buf.len(), 8, "the refused write was kept anyway");
+
+        // A single write larger than the whole limit is refused
+        // outright rather than partly accepted.
+        let mut sink = Capped {
+            buf: Vec::new(),
+            limit: 4,
+        };
+        assert!(sink.write(b"far too much").is_err());
+        assert!(sink.buf.is_empty());
+    }
 
     #[test]
     fn algorithm_from_id() {

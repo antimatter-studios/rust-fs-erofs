@@ -41,7 +41,7 @@ struct PclusterCache {
     // this struct; introducing a top-level type alias would just push the
     // complexity around without aiding readability.
     #[allow(clippy::type_complexity)]
-    inner: Option<LruCache<(u64, u32), Arc<Vec<u8>>>>,
+    inner: Option<LruCache<PclusterKey, Arc<Vec<u8>>>>,
     /// Counts cache hits, for tests + diagnostics. Never wraps in
     /// realistic workloads (u64 is fine).
     hits: u64,
@@ -96,6 +96,49 @@ pub struct Filesystem {
     /// once per block; with the cache they pay once per pcluster.
     /// PLAIN clusters bypass the cache (already a single direct read).
     pcluster_cache: Mutex<PclusterCache>,
+}
+
+/// The largest span a physical cluster may decode to.
+///
+/// EROFS's own limit, and measured rather than assumed: `mkfs.erofs`
+/// 1.7.1 accepts `-C1048576` and refuses `-C2097152` with "unsupported
+/// clusterblks 512 (too large)". So no image a maker will produce has a
+/// pcluster larger than this.
+///
+/// It matters because a pcluster's uncompressed span is the size of the
+/// buffer the decoder writes into, and for the last pcluster of a file
+/// that span's end is simply the inode's declared size -- an
+/// unvalidated `u64`. A 1.3 MB image asked a 64 KiB read for a 281 TB
+/// allocation, which `handle_alloc_error` answers by aborting: the FFI
+/// boundary's `catch_unwind` never sees it and the host process dies.
+pub const MAX_PCLUSTER_SIZE: u64 = 1024 * 1024;
+
+/// What identifies a decompressed physical cluster.
+///
+/// The inode it belongs to, where it starts on the device, and which
+/// span of the file it covers. The span is part of it because two HEAD
+/// lclusters of one inode may name the same block address and cover
+/// different spans -- see `read_compressed_block`.
+type PclusterKey = (u64, u32, u64, u64);
+
+/// The longest a symbolic link's target can be.
+///
+/// `PATH_MAX`, because a symlink target is a path and the operating
+/// system will not accept a longer one. The inode's declared size is an
+/// unvalidated `u64`.
+pub const MAX_SYMLINK_TARGET: u64 = 4096;
+
+/// How many bytes a physical cluster covers of the file, or a refusal.
+fn pcluster_span(start_byte: u64, end_byte: u64) -> Result<usize> {
+    let span = end_byte
+        .checked_sub(start_byte)
+        .ok_or(Error::BadInode("pcluster ends before it starts"))?;
+    if span > MAX_PCLUSTER_SIZE {
+        return Err(Error::BadInode(
+            "pcluster covers more of the file than a pcluster can",
+        ));
+    }
+    Ok(span as usize)
 }
 
 impl Filesystem {
@@ -365,6 +408,17 @@ impl Filesystem {
     pub fn read_symlink_target(&self, inode: &Inode) -> Result<Vec<u8>> {
         if !inode.is_symlink() {
             return Err(Error::BadInode("read_symlink_target on non-symlink"));
+        }
+        // A symlink target is a path, and no path is longer than
+        // PATH_MAX. `Inode::size` is an unvalidated u64 off the disk,
+        // and this allocated it before reading a byte: an extended
+        // inode declaring 2^56 aborted the process out of
+        // `fs_erofs_readlink`, through `handle_alloc_error`, which
+        // `ffi_guard`'s `catch_unwind` cannot intercept.
+        if inode.size > MAX_SYMLINK_TARGET {
+            return Err(Error::BadInode(
+                "symlink target is longer than any path can be",
+            ));
         }
         let mut buf = vec![0u8; inode.size as usize];
         if !buf.is_empty() {
@@ -692,7 +746,7 @@ impl Filesystem {
                 // documentation
                 // (<https://erofs.docs.kernel.org/en/latest/design.html>).
                 let blocks = extent.pcluster_block_count;
-                let on_disk_len = ((extent.source_end_byte - extent.source_start_byte) as usize)
+                let on_disk_len = pcluster_span(extent.source_start_byte, extent.source_end_byte)?
                     .max(blocks as usize * bs as usize);
                 // Source byte length matches the on-disk block range;
                 // `pcluster_block_count` is the on-disk block count
@@ -741,11 +795,29 @@ impl Filesystem {
         // This is the whole point of the cache — sequential block
         // reads of a multi-block pcluster otherwise re-decompress the
         // same payload on every call.
-        let cache_key = (inode_nid, extent.pcluster_blkaddr);
+        //
+        // THE SPAN IS PART OF THE KEY. Two HEAD lclusters of one inode
+        // may name the same `blkaddr` and cover different spans of the
+        // file, and the key used to be the address alone -- so the
+        // second one was served the first one's bytes, silently, and
+        // then indexed past the end of them. The comment here used to
+        // assert that the cached buffer was "sized to the pcluster's
+        // full source span", which is true only of the pcluster that
+        // put it there.
+        let cache_key = (
+            inode_nid,
+            extent.pcluster_blkaddr,
+            extent.source_start_byte,
+            extent.source_end_byte,
+        );
         if let Some(cached) = self.cache_lookup(&cache_key) {
-            // The cached buffer is sized to the pcluster's full source
-            // span, so `off_in_pcluster + take <= cached.len()`.
-            out[..take].copy_from_slice(&cached[off_in_pcluster..off_in_pcluster + take]);
+            let slice =
+                cached
+                    .get(off_in_pcluster..off_in_pcluster + take)
+                    .ok_or(Error::BadInode(
+                        "cached pcluster is shorter than its extent",
+                    ))?;
+            out[..take].copy_from_slice(slice);
             return Ok(take);
         }
 
@@ -773,7 +845,7 @@ impl Filesystem {
             self.read_block(extent.device_id, src_off, &mut compressed)?;
         }
 
-        let uncompressed_len = (extent.source_end_byte - extent.source_start_byte) as usize;
+        let uncompressed_len = pcluster_span(extent.source_start_byte, extent.source_end_byte)?;
         let mut decompressed = vec![0u8; uncompressed_len];
         // For LZMA we plumb the COMPR_CFGS-derived dict_size / lc /
         // lp / pb through; for the other codecs the second arg is
@@ -795,7 +867,7 @@ impl Filesystem {
     /// (capacity 0) or on a miss; the miss counter is only bumped
     /// when caching is actually live, so disabled-mode reads don't
     /// inflate the miss count and confuse the hit-rate stat.
-    fn cache_lookup(&self, key: &(u64, u32)) -> Option<Arc<Vec<u8>>> {
+    fn cache_lookup(&self, key: &PclusterKey) -> Option<Arc<Vec<u8>>> {
         let mut g = self.pcluster_cache.lock().expect("cache lock");
         let lru = g.inner.as_mut()?;
         if let Some(buf) = lru.get(key) {
@@ -809,7 +881,7 @@ impl Filesystem {
     }
 
     /// Cache insert. No-op when caching is disabled (capacity 0).
-    fn cache_insert(&self, key: (u64, u32), value: Arc<Vec<u8>>) {
+    fn cache_insert(&self, key: PclusterKey, value: Arc<Vec<u8>>) {
         let mut g = self.pcluster_cache.lock().expect("cache lock");
         if let Some(lru) = g.inner.as_mut() {
             lru.put(key, value);
@@ -863,6 +935,45 @@ mod tests {
         img[3 * BS..4 * BS].copy_from_slice(&dir);
 
         img
+    }
+
+    /// A symlink's target is a path, and the inode's declared size is
+    /// an unvalidated `u64`. `read_symlink_target` allocated it before
+    /// reading a byte, so an extended inode declaring 2^56 asked for
+    /// 72 petabytes -- and `handle_alloc_error` answers that by
+    /// aborting, which `ffi_guard`'s `catch_unwind` cannot intercept.
+    #[test]
+    fn a_symlink_longer_than_any_path_is_refused_before_the_buffer_exists() {
+        let img = build_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+
+        let mut link = fs.lookup_path("/hello.txt").unwrap();
+        link.mode = 0xA1FF; // S_IFLNK | 0777
+        link.size = 1 << 56;
+        assert!(link.is_symlink());
+
+        let outcome = fs.read_symlink_target(&link);
+        assert!(
+            outcome.is_err(),
+            "a symlink declaring 2^56 bytes of target was accepted"
+        );
+    }
+
+    #[test]
+    fn a_pcluster_may_not_cover_more_of_the_file_than_a_pcluster_can() {
+        // mkfs.erofs 1.7.1 accepts -C1048576 and refuses -C2097152.
+        assert_eq!(
+            pcluster_span(0, MAX_PCLUSTER_SIZE).unwrap() as u64,
+            MAX_PCLUSTER_SIZE
+        );
+        assert!(pcluster_span(0, MAX_PCLUSTER_SIZE + 1).is_err());
+        // The shape the last pcluster of a file produces: its end is
+        // the inode's declared size.
+        assert!(pcluster_span(0, 1 << 48).is_err());
+        // An end before the start is not a span at all.
+        assert!(pcluster_span(4096, 0).is_err());
+        assert_eq!(pcluster_span(4096, 8192).unwrap(), 4096);
     }
 
     #[test]
