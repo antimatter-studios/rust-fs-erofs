@@ -59,12 +59,7 @@ impl Algorithm {
 /// (callers know this from the cluster geometry: cluster_size for
 /// non-tail, residual for tail).
 pub fn decompress(algo: Algorithm, input: &[u8], output: &mut [u8]) -> Result<()> {
-    match algo {
-        Algorithm::Lz4 => decompress_lz4(input, output),
-        Algorithm::Lzma => decompress_lzma(input, output, &LzmaCfg::default()),
-        Algorithm::Deflate => decompress_deflate(input, output),
-        Algorithm::Zstd => decompress_zstd(input, output),
-    }
+    decompress_with_config_and_padding(algo, None, true, input, output)
 }
 
 /// Like [`decompress`] but threads a per-codec config through (e.g.
@@ -82,26 +77,48 @@ pub fn decompress_with_config(
     input: &[u8],
     output: &mut [u8],
 ) -> Result<()> {
+    decompress_with_config_and_padding(algo, config, true, input, output)
+}
+
+/// Like [`decompress_with_config`], but takes the superblock's
+/// `EROFS_FEATURE_INCOMPAT_ZERO_PADDING` state explicitly.
+///
+/// When `zero_padding` is set, the compressed frame may be right-aligned
+/// within its on-disk block and leading zero bytes are removed before the
+/// codec sees it. When it is clear, the input is passed to the codec
+/// unchanged. Keeping this decision at the filesystem boundary matters:
+/// an unadvertised leading zero is part of the compressed input, not padding.
+pub fn decompress_with_config_and_padding(
+    algo: Algorithm,
+    config: Option<&LzmaCfg>,
+    zero_padding: bool,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
     match algo {
-        Algorithm::Lz4 => decompress_lz4(input, output),
+        Algorithm::Lz4 => decompress_lz4(input, output, zero_padding),
         Algorithm::Lzma => {
             let default = LzmaCfg::default();
             let cfg = config.unwrap_or(&default);
-            decompress_lzma(input, output, cfg)
+            decompress_lzma(input, output, cfg, zero_padding)
         }
-        Algorithm::Deflate => decompress_deflate(input, output),
-        Algorithm::Zstd => decompress_zstd(input, output),
+        Algorithm::Deflate => decompress_deflate(input, output, zero_padding),
+        Algorithm::Zstd => decompress_zstd(input, output, zero_padding),
     }
 }
 
-fn decompress_lz4(input: &[u8], output: &mut [u8]) -> Result<()> {
+fn decompress_lz4(input: &[u8], output: &mut [u8], zero_padding: bool) -> Result<()> {
     // Empty cluster: nothing to decode. EROFS never emits a zero-byte
     // compressed cluster against a non-empty output, so treat input
     // and output both being empty as a no-op.
     if input.is_empty() && output.is_empty() {
         return Ok(());
     }
-    let real_input = strip_leading_pad(input, "LZ4")?;
+    let real_input = if zero_padding {
+        strip_leading_pad(input, "LZ4")?
+    } else {
+        input
+    };
     let written = lz4_flex::block::decompress_into(real_input, output)
         .map_err(|_| Error::BadInode("LZ4 decompression failed"))?;
     // Caller sized `output` to the exact decompressed length; a short
@@ -119,11 +136,13 @@ fn decompress_lz4(input: &[u8], output: &mut [u8]) -> Result<()> {
 ///
 /// `EROFS_FEATURE_INCOMPAT_ZERO_PADDING` right-aligns a codec frame
 /// inside its on-disk block, so the *leading* bytes are the zeros. The
-/// feature bit is not plumbed down here; the pad is skipped
-/// unconditionally instead, which is lossless against un-padded input
-/// as long as a genuine frame never starts with a zero byte. That holds
-/// for all three codecs this crate reads, for a different reason each
-/// time:
+/// filesystem layer must check that feature bit before calling this helper.
+/// The pad is not valid input when the bit is clear.
+///
+/// When the feature is set, the leading-zero rule is lossless against
+/// un-padded input as long as a genuine frame never starts with a zero byte.
+/// That holds for all three codecs this crate reads, for a different reason
+/// each time:
 ///
 /// * **LZ4** — the first byte is a token whose nibbles are the literal
 ///   and match lengths. `0x00` means "no literals, no match", which
@@ -282,11 +301,15 @@ fn zstd_window_size(frame: &[u8]) -> Result<u64> {
 /// different length than the extent map says it should is a
 /// disagreement between two parts of the image, and the honest thing to
 /// do with a disagreement is refuse it.
-fn decompress_zstd(input: &[u8], output: &mut [u8]) -> Result<()> {
+fn decompress_zstd(input: &[u8], output: &mut [u8], zero_padding: bool) -> Result<()> {
     if input.is_empty() && output.is_empty() {
         return Ok(());
     }
-    let real_input = strip_leading_pad(input, "ZSTD")?;
+    let real_input = if zero_padding {
+        strip_leading_pad(input, "ZSTD")?
+    } else {
+        input
+    };
 
     // BEFORE the decoder exists, because constructing it is what spends
     // the memory. The ceiling is the format's own dictionary limit, or
@@ -329,11 +352,20 @@ fn decompress_zstd(input: &[u8], output: &mut [u8]) -> Result<()> {
     }
 }
 
-fn decompress_lzma(input: &[u8], output: &mut [u8], cfg: &LzmaCfg) -> Result<()> {
+fn decompress_lzma(
+    input: &[u8],
+    output: &mut [u8],
+    cfg: &LzmaCfg,
+    zero_padding: bool,
+) -> Result<()> {
     if input.is_empty() && output.is_empty() {
         return Ok(());
     }
-    let real_input = strip_leading_pad(input, "LZMA")?;
+    let real_input = if zero_padding {
+        strip_leading_pad(input, "LZMA")?
+    } else {
+        input
+    };
 
     // Two on-disk dialects coexist:
     // (a) Our writer emits the standard 13-byte LZMA1 header (5-byte
@@ -447,11 +479,15 @@ fn decompress_lzma_no_header(input: &[u8], output: &mut [u8], cfg: &LzmaCfg) -> 
     Ok(())
 }
 
-fn decompress_deflate(input: &[u8], output: &mut [u8]) -> Result<()> {
+fn decompress_deflate(input: &[u8], output: &mut [u8], zero_padding: bool) -> Result<()> {
     if input.is_empty() && output.is_empty() {
         return Ok(());
     }
-    let real_input = strip_leading_pad(input, "DEFLATE")?;
+    let real_input = if zero_padding {
+        strip_leading_pad(input, "DEFLATE")?
+    } else {
+        input
+    };
     // `false` selects raw DEFLATE (no zlib header/checksum), which is
     // what EROFS stores.
     let mut decoder = Decompress::new(false);
@@ -675,6 +711,52 @@ mod tests {
         let mut output = vec![0u8; original.len()];
         decompress(Algorithm::Lz4, &compressed, &mut output).unwrap();
         assert_eq!(&output[..], &original[..]);
+    }
+
+    #[test]
+    fn zero_padding_feature_controls_leading_pad() {
+        let original = b"zero-padding is only valid when the superblock advertises it";
+        let compressed = lz4_flex::block::compress(original);
+        let mut padded = vec![0u8; 4];
+        padded.extend_from_slice(&compressed);
+
+        let mut output = vec![0u8; original.len()];
+        decompress_with_config_and_padding(Algorithm::Lz4, None, true, &padded, &mut output)
+            .unwrap();
+        assert_eq!(&output[..], &original[..]);
+
+        output.fill(0);
+        decompress_with_config_and_padding(Algorithm::Lz4, None, false, &compressed, &mut output)
+            .unwrap();
+        assert_eq!(&output[..], &original[..]);
+
+        let err =
+            decompress_with_config_and_padding(Algorithm::Lz4, None, false, &padded, &mut output)
+                .unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn zero_padding_feature_controls_zstd_leading_pad() {
+        let original = b"zero-padding is only valid when the superblock advertises it";
+        let compressed = zstd_frame(original);
+        let mut padded = vec![0u8; 4];
+        padded.extend_from_slice(&compressed);
+
+        let mut output = vec![0u8; original.len()];
+        decompress_with_config_and_padding(Algorithm::Zstd, None, true, &padded, &mut output)
+            .unwrap();
+        assert_eq!(&output[..], &original[..]);
+
+        output.fill(0);
+        decompress_with_config_and_padding(Algorithm::Zstd, None, false, &compressed, &mut output)
+            .unwrap();
+        assert_eq!(&output[..], &original[..]);
+
+        let err =
+            decompress_with_config_and_padding(Algorithm::Zstd, None, false, &padded, &mut output)
+                .unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
     }
 
     // Empty input + empty output is the documented contract: nothing
