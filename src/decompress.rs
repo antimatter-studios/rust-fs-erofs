@@ -1,8 +1,9 @@
 //! Codec wrappers for EROFS compressed clusters.
 //!
-//! Phase 3: LZ4, LZMA, and DEFLATE.
+//! LZ4, LZMA, DEFLATE and ZSTD.
 //!
-//! On-disk format: EROFS stores raw codec output (no frame header).
+//! On-disk format: EROFS stores raw codec output (no frame header),
+//! with ZSTD the exception that proves the rule.
 //! - LZ4: raw BLOCK output, decoded via `lz4_flex::block::decompress_into`.
 //! - LZMA: raw LZMA1 bitstream (NOT `.xz` framed). EROFS conveys the
 //!   LZMA properties (lc, lp, pb, dict_size) out-of-band via the
@@ -12,8 +13,17 @@
 //!   need the parent zmap layer to plumb config through later.
 //! - DEFLATE: raw DEFLATE blocks (no zlib/gzip wrapper), decoded with
 //!   `flate2::Decompress::new(false)`.
+//! - ZSTD: an ordinary zstd frame, magic number and all. This is the
+//!   odd one out and it is worth saying why, because "EROFS stores raw
+//!   codec output" would lead a reader to strip a header that is
+//!   really there: `mkfs.erofs` compresses a pcluster with a plain
+//!   `ZSTD_compress2` call, which produces a complete frame. The
+//!   `z_erofs_zstd_cfgs` record in the superblock's COMPR_CFGS blob
+//!   carries a window log, but only so a decoder that streams into a
+//!   fixed ring buffer can size it up front; decoding a whole pcluster
+//!   at a time, as this crate does, never needs it.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use flate2::{Decompress, FlushDecompress};
 
@@ -29,6 +39,7 @@ pub enum Algorithm {
     Lz4 = 0,
     Lzma = 1,
     Deflate = 2,
+    Zstd = 3,
 }
 
 impl Algorithm {
@@ -37,6 +48,7 @@ impl Algorithm {
             0 => Ok(Algorithm::Lz4),
             1 => Ok(Algorithm::Lzma),
             2 => Ok(Algorithm::Deflate),
+            3 => Ok(Algorithm::Zstd),
             n => Err(Error::UnsupportedLayout(n)),
         }
     }
@@ -51,6 +63,7 @@ pub fn decompress(algo: Algorithm, input: &[u8], output: &mut [u8]) -> Result<()
         Algorithm::Lz4 => decompress_lz4(input, output),
         Algorithm::Lzma => decompress_lzma(input, output, &LzmaCfg::default()),
         Algorithm::Deflate => decompress_deflate(input, output),
+        Algorithm::Zstd => decompress_zstd(input, output),
     }
 }
 
@@ -77,6 +90,7 @@ pub fn decompress_with_config(
             decompress_lzma(input, output, cfg)
         }
         Algorithm::Deflate => decompress_deflate(input, output),
+        Algorithm::Zstd => decompress_zstd(input, output),
     }
 }
 
@@ -121,9 +135,13 @@ fn decompress_lz4(input: &[u8], output: &mut [u8]) -> Result<()> {
 /// * **LZMA** — the first byte is the packed properties byte, which
 ///   encodes `(pb * 5 + lp) * 9 + lc`. Zero would mean lc=lp=pb=0,
 ///   which no EROFS encoder emits.
+/// * **ZSTD** — the frame begins with the magic number 0xFD2FB528,
+///   stored little-endian, so the first byte on disk is 0x28. This is
+///   the only one of the four where the codec's own format guarantees
+///   it outright rather than the encoder's habits doing so.
 ///
 /// So the assumption is per-codec, not universal, and each codec's
-/// reason is recorded here rather than restated in three places with
+/// reason is recorded here rather than restated in four places with
 /// different emphasis — which is how it was before, at 14, 4 and 8
 /// lines.
 ///
@@ -136,10 +154,179 @@ fn strip_leading_pad<'a>(input: &'a [u8], codec: &'static str) -> Result<&'a [u8
         return Err(Error::BadInode(match codec {
             "LZ4" => "LZ4 input is all zeros",
             "LZMA" => "LZMA input is all zeros",
+            "ZSTD" => "ZSTD input is all zeros",
             _ => "DEFLATE input is all zeros",
         }));
     }
     Ok(frame)
+}
+
+/// `Z_EROFS_ZSTD_MAX_DICT_SIZE` — the largest dictionary window an EROFS
+/// ZSTD stream is permitted, which the format defines as
+/// `Z_EROFS_PCLUSTER_MAX_SIZE`: one mebibyte.
+///
+/// It is enforced on both sides upstream. `mkfs.erofs` refuses a
+/// `-zzstd,dictsize=` above it, and the kernel sizes its decompression
+/// workspace from the superblock's declared window log, which is bounded
+/// by the same number. So no legitimate image asks for more.
+pub const Z_EROFS_ZSTD_MAX_DICT_SIZE: u64 = 1024 * 1024;
+
+/// The same limit as a base-two logarithm, which is the shape the
+/// superblock's `windowlog` field is compared against.
+pub const Z_EROFS_ZSTD_MAX_DICT_LOG: u32 = 20;
+
+/// The window size a ZSTD frame header asks a decoder to allocate.
+///
+/// # Why this is read here rather than left to the decoder
+///
+/// A decoder allocates its sliding window from the frame header before
+/// it has decoded a single byte, and the header is bytes off the disk.
+/// `ruzstd` will honour a request up to a hundred megabytes; the zstd
+/// format itself allows nearly four terabytes. Either is an eager
+/// allocation driven by an image, once per pcluster read, and a crafted
+/// image would need only a handful of them.
+///
+/// The bound is not invented: [`Z_EROFS_ZSTD_MAX_DICT_SIZE`] is the
+/// format's own ceiling, and it is checked before the decoder is
+/// constructed rather than after — after is too late, because the
+/// allocation is the cost.
+///
+/// # The header, per RFC 8878 §3.1.1
+///
+/// ```text
+///   0..4  magic 0xFD2FB528, little-endian
+///      4  frame header descriptor
+///           bits 7..6  frame content size flag
+///           bit  5     single segment flag
+///           bit  2     content checksum flag
+///           bits 1..0  dictionary id flag
+///      5  window descriptor        (only when single segment is CLEAR)
+///         dictionary id            (0, 1, 2 or 4 bytes)
+///         frame content size       (0, 1, 2, 4 or 8 bytes)
+/// ```
+///
+/// With the single-segment flag set there is no window descriptor and
+/// the window is the frame's content size — the whole frame is decoded
+/// in one piece — so both spellings have to be read to know how large
+/// the allocation would be.
+fn zstd_window_size(frame: &[u8]) -> Result<u64> {
+    const MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+    let bad = || Error::BadInode("ZSTD frame header is not readable");
+    if frame.len() < 5 || frame[..4] != MAGIC {
+        return Err(bad());
+    }
+    let descriptor = frame[4];
+    let content_size_flag = descriptor >> 6;
+    let single_segment = descriptor & 0x20 != 0;
+    let dict_id_flag = descriptor & 0x03;
+
+    let mut pos = 5usize;
+    let window_descriptor = if single_segment {
+        None
+    } else {
+        let b = *frame.get(pos).ok_or_else(bad)?;
+        pos += 1;
+        Some(b)
+    };
+    // The dictionary id is skipped, not read: this crate never decodes
+    // against a dictionary, and a frame that wanted one would fail in
+    // the decoder. Its width still has to be stepped over to reach the
+    // content size.
+    pos += [0usize, 1, 2, 4][dict_id_flag as usize];
+
+    // A content size of "0 bytes" means the field is absent — except
+    // under single segment, where the flag value 0 means one byte.
+    let content_size_width = match content_size_flag {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let content_size = match content_size_width {
+        0 => None,
+        n => {
+            let bytes = frame.get(pos..pos + n).ok_or_else(bad)?;
+            let mut v = 0u64;
+            for (i, b) in bytes.iter().enumerate() {
+                v |= u64::from(*b) << (8 * i);
+            }
+            // The two-byte spelling is stored with 256 subtracted, since
+            // a frame that small would have used the one-byte one.
+            Some(if n == 2 { v + 256 } else { v })
+        }
+    };
+
+    match window_descriptor {
+        // exponent and mantissa: base = 1 << (10 + exponent), and the
+        // mantissa adds eighths of the base.
+        Some(wd) => {
+            let exponent = u32::from(wd >> 3);
+            let mantissa = u64::from(wd & 7);
+            let base = 1u64
+                .checked_shl(10 + exponent)
+                .ok_or(Error::BadInode("ZSTD frame declares an impossible window"))?;
+            Ok(base + (base / 8) * mantissa)
+        }
+        None => content_size.ok_or_else(bad),
+    }
+}
+
+/// Decode one ZSTD-compressed pcluster.
+///
+/// `output` is sized to the pcluster's exact decoded span, and the frame
+/// must fill it exactly — no more and no less. That is stricter than
+/// erofs-utils' own userspace decoder, which reads the frame's declared
+/// content size and copies a sub-range out of it, but erofs-utils needs
+/// that because `dump.erofs` asks for arbitrary byte ranges. This crate
+/// only ever decodes whole pclusters, so a frame that decodes to a
+/// different length than the extent map says it should is a
+/// disagreement between two parts of the image, and the honest thing to
+/// do with a disagreement is refuse it.
+fn decompress_zstd(input: &[u8], output: &mut [u8]) -> Result<()> {
+    if input.is_empty() && output.is_empty() {
+        return Ok(());
+    }
+    let real_input = strip_leading_pad(input, "ZSTD")?;
+
+    // BEFORE the decoder exists, because constructing it is what spends
+    // the memory. The ceiling is the format's own dictionary limit, or
+    // the extent being filled when that is larger — a small frame may
+    // set the single-segment flag, in which case its "window" is just
+    // its content and is bounded by the extent anyway.
+    let ceiling = Z_EROFS_ZSTD_MAX_DICT_SIZE.max(output.len() as u64);
+    let window = zstd_window_size(real_input)?;
+    if window > ceiling {
+        return Err(Error::BadInode(
+            "ZSTD frame asks for a window larger than the format allows",
+        ));
+    }
+
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(real_input)
+        .map_err(|_| Error::BadInode("ZSTD frame header is not readable"))?;
+
+    // Read into the caller's buffer directly. BOUNDED BY CONSTRUCTION:
+    // the decoder is never given anywhere to put more than `output`
+    // holds, so a frame whose header claims a gigabyte costs nothing
+    // beyond the window the decoder allocates for itself.
+    let mut filled = 0usize;
+    while filled < output.len() {
+        let n = decoder
+            .read(&mut output[filled..])
+            .map_err(|_| Error::BadInode("ZSTD decompression failed"))?;
+        if n == 0 {
+            return Err(Error::BadInode("ZSTD decompressed size mismatch"));
+        }
+        filled += n;
+    }
+    // And the frame must be spent. One more byte read is enough to tell:
+    // a frame with anything left over decoded to more than the extent it
+    // is supposed to cover.
+    let mut overflow = [0u8; 1];
+    match decoder.read(&mut overflow) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(Error::BadInode("ZSTD decompressed size mismatch")),
+        Err(_) => Err(Error::BadInode("ZSTD decompression failed")),
+    }
 }
 
 fn decompress_lzma(input: &[u8], output: &mut [u8], cfg: &LzmaCfg) -> Result<()> {
@@ -314,14 +501,169 @@ mod tests {
         assert_eq!(Algorithm::from_id(0).unwrap(), Algorithm::Lz4);
         assert_eq!(Algorithm::from_id(1).unwrap(), Algorithm::Lzma);
         assert_eq!(Algorithm::from_id(2).unwrap(), Algorithm::Deflate);
+        assert_eq!(Algorithm::from_id(3).unwrap(), Algorithm::Zstd);
         assert!(matches!(
-            Algorithm::from_id(3),
-            Err(Error::UnsupportedLayout(3))
+            Algorithm::from_id(4),
+            Err(Error::UnsupportedLayout(4))
         ));
         assert!(matches!(
             Algorithm::from_id(99),
             Err(Error::UnsupportedLayout(99))
         ));
+    }
+
+    /// A frame this crate compressed and then decompressed proves the
+    /// wrapper's arithmetic, not interoperability. Interoperability is
+    /// what `tests/zstd_image.rs` is for: a real `mkfs.erofs -zzstd`
+    /// image, and a freshly built one wherever the installed writer can
+    /// make one. These tests cover what an image cannot easily produce
+    /// — a frame that decodes to the wrong length, in both directions.
+    fn zstd_frame(payload: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(payload, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    #[test]
+    fn round_trip_zstd() {
+        let original = b"the quick brown fox jumps over the lazy dog. ".repeat(40);
+        let compressed = zstd_frame(&original);
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Zstd, &compressed, &mut output).unwrap();
+        assert_eq!(output, original);
+    }
+
+    /// EROFS right-aligns a frame inside its on-disk block under
+    /// ZERO_PADDING, so the leading bytes are zeros. A zstd frame
+    /// begins with the little-endian magic 0xFD2FB528, i.e. 0x28, so
+    /// skipping leading zeros can never eat part of a real frame.
+    #[test]
+    fn zstd_tolerates_the_leading_zero_pad() {
+        let original = b"padded on the left, as the format requires".repeat(10);
+        let mut padded = vec![0u8; 37];
+        padded.extend_from_slice(&zstd_frame(&original));
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Zstd, &padded, &mut output).unwrap();
+        assert_eq!(output, original);
+    }
+
+    /// A frame that decodes to FEWER bytes than the extent it is
+    /// supposed to fill. The stream is well-formed and ends cleanly, so
+    /// no codec can catch this; only the caller, which knows how long
+    /// the pcluster is, can refuse it. Getting this wrong would leave
+    /// the tail of the buffer as zeros and report success.
+    #[test]
+    fn a_zstd_frame_shorter_than_its_extent_is_refused() {
+        let compressed = zstd_frame(b"only sixteen byt");
+        let mut output = vec![0u8; 4096];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &compressed, &mut output),
+            Err(Error::BadInode("ZSTD decompressed size mismatch"))
+        ));
+    }
+
+    /// And a frame that decodes to MORE. erofs-utils' own userspace
+    /// decoder accepts this and copies a sub-range out, because
+    /// `dump.erofs` asks for arbitrary byte ranges; this crate only
+    /// ever decodes whole pclusters, so a longer frame means the extent
+    /// map and the frame disagree about the image.
+    #[test]
+    fn a_zstd_frame_longer_than_its_extent_is_refused() {
+        let compressed = zstd_frame(&b"x".repeat(4096));
+        let mut output = vec![0u8; 100];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &compressed, &mut output),
+            Err(Error::BadInode("ZSTD decompressed size mismatch"))
+        ));
+    }
+
+    #[test]
+    fn an_all_zero_zstd_block_says_which_codec_rejected_it() {
+        let mut output = vec![0u8; 16];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &[0u8; 64], &mut output),
+            Err(Error::BadInode("ZSTD input is all zeros"))
+        ));
+    }
+
+    /// The window a real frame asks for is small, and the guard must not
+    /// stand in its way. Checked against the frames this crate's own
+    /// encoder produces AND, in `tests/zstd_image.rs`, against the ones
+    /// mkfs.erofs does.
+    #[test]
+    fn a_real_frame_asks_for_a_window_the_guard_allows() {
+        for len in [1usize, 100, 4096, 65536] {
+            let frame = zstd_frame(&b"a".repeat(len));
+            let window = zstd_window_size(&frame).expect("readable header");
+            assert!(
+                window <= Z_EROFS_ZSTD_MAX_DICT_SIZE.max(len as u64),
+                "a {len}-byte payload produced a frame wanting a {window}-byte window"
+            );
+        }
+    }
+
+    /// A hand-built header asking for the largest window the zstd format
+    /// can express: exponent 31, mantissa 7, which is nearly four
+    /// terabytes. A decoder handed this allocates before it decodes
+    /// anything, so the refusal has to come first — and `ruzstd` would
+    /// have accepted it up to a hundred megabytes and this up to the
+    /// whole of it.
+    #[test]
+    fn a_frame_demanding_an_enormous_window_is_refused_before_it_is_decoded() {
+        // magic, descriptor (no single segment, no dict id, no content
+        // size), then the window descriptor.
+        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, (31 << 3) | 7];
+        let window = zstd_window_size(&frame).expect("the header is well formed");
+        assert!(
+            window > 3 << 40,
+            "expected a multi-terabyte window, got {window}"
+        );
+
+        let mut output = vec![0u8; 4096];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &frame, &mut output),
+            Err(Error::BadInode(
+                "ZSTD frame asks for a window larger than the format allows"
+            ))
+        ));
+    }
+
+    /// With the single-segment flag set there is no window descriptor at
+    /// all and the window is the frame's declared content size, so that
+    /// spelling has to be read too or the guard reports zero and waves
+    /// everything through.
+    #[test]
+    fn the_single_segment_spelling_of_the_window_is_read_as_well() {
+        // Descriptor: single segment set, content size flag 3 (8 bytes).
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0xe0];
+        frame.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        assert_eq!(zstd_window_size(&frame).unwrap(), 1 << 40);
+
+        let mut output = vec![0u8; 4096];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &frame, &mut output),
+            Err(Error::BadInode(
+                "ZSTD frame asks for a window larger than the format allows"
+            ))
+        ));
+    }
+
+    /// A truncated header is refused rather than read past.
+    #[test]
+    fn a_header_that_stops_early_is_refused() {
+        assert!(zstd_window_size(&[0x28, 0xb5, 0x2f, 0xfd, 0x00]).is_err());
+        assert!(zstd_window_size(&[0x28, 0xb5, 0x2f]).is_err());
+        // Right length, wrong magic.
+        assert!(zstd_window_size(&[0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn garbage_is_not_mistaken_for_a_zstd_frame() {
+        let mut output = vec![0u8; 16];
+        assert!(decompress(
+            Algorithm::Zstd,
+            &[0x28, 0xb5, 0x2f, 0xfd, 1, 2, 3],
+            &mut output
+        )
+        .is_err());
     }
 
     #[test]

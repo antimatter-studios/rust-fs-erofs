@@ -52,7 +52,7 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 |---|---|
 | FLAT_PLAIN + FLAT_INLINE + ChunkBased emission | ✅ |
 | Compact + extended inode auto-promotion | ✅ |
-| LZ4 / LZMA / DEFLATE compression | ✅ |
+| LZ4 / LZMA / DEFLATE / ZSTD decompression | ✅ |
 | Legacy + compacted-2B index format | ✅ |
 | ztailpacking (single-pcluster inline tail) | ✅ |
 | Multi-lcluster pcluster collation (greedy) | ✅ (writer-default; better compression ratios) |
@@ -75,7 +75,7 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 | **Multi-device WRITER** | `mkfs.erofs --blobdev` is broken in upstream 1.9 | Wait for upstream fix or hand-build |
 | **Mutate an existing EROFS image in place** | EROFS is read-only by spec — no journal, no allocator, no rewrite path | See "Read-write semantics" below |
 | **Verified boot / dm-verity hash trees** | Layer above EROFS, out of scope | Use `verity` tools alongside |
-| **ZSTD codec** | Not yet implemented | Use `-z lz4` / `-z lzma` / `-z deflate` |
+| **ZSTD WRITER** | Reading `-zzstd` images works; our writer emits LZ4 / LZMA / DEFLATE only | Use `mkfs.erofs -zzstd` to produce one |
 
 ## Use cases
 
@@ -230,7 +230,7 @@ The GSI is large (~1 GB) and gitignored. The script verifies a pinned SHA256 and
 ## Performance notes
 
 - **LRU cache**: defaults to 256 decompressed pclusters (~64 MiB at typical sizes). Sequential reads of compressed multi-pcluster files see roughly 8× speedup from cache hits. Disable via `Filesystem::set_pcluster_cache_capacity(0)` for memory-constrained hosts.
-- **Codec choice**: LZ4 is fastest to decompress; LZMA gives best compression ratios; DEFLATE is mid. Default `mkfs_erofs` compression is uncompressed (ship a baseline image first, opt into compression via `mkfs::build_image_with`).
+- **Codec choice**: LZ4 is fastest to decompress; LZMA gives best compression ratios; DEFLATE and ZSTD are in between, and ZSTD is read-only here. Default `mkfs_erofs` compression is uncompressed (ship a baseline image first, opt into compression via `mkfs::build_image_with`).
 - **Inline tail-packing**: small files become FLAT_INLINE automatically when their tail fits in the metadata block — saves a full block of padding per file. Significant for many-small-files trees (Android `/etc`).
 
 ## Known limitations & gotchas

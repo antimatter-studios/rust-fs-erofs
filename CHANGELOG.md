@@ -6,6 +6,34 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **ZSTD-compressed images can be read.** `mkfs.erofs -zzstd` produces
+  images whose compression algorithm id is 3; before this, opening one
+  failed at the superblock's COMPR_CFGS blob with
+  `UnsupportedLayout(3)`. The on-disk payload turns out to be an
+  ordinary zstd frame, magic number and all, because `mkfs.erofs`
+  compresses a pcluster with a plain `ZSTD_compress2` call — unlike the
+  other three codecs, which are stored raw. Decoded with `ruzstd`, which
+  is pure Rust.
+- The `z_erofs_zstd_cfgs` record in the COMPR_CFGS blob is parsed and
+  exposed as `ComprCfgs::zstd`. Nothing consults its window log: it
+  exists for a decoder that must size a ring buffer before it sees the
+  stream, which this crate is not. Both its fields are range-checked
+  anyway — an out-of-range value means the blob is not laid out the way
+  this reader believes, and every codec after it would then be read
+  from the wrong offset.
+
+### Security
+
+- A ZSTD frame's declared window size is checked against the format's
+  own one-mebibyte dictionary limit **before** a decoder is built. A
+  decoder allocates its sliding window from the frame header, and the
+  header is bytes off the disk: `ruzstd` would honour a request up to a
+  hundred megabytes, and the zstd format can express nearly four
+  terabytes. Since the decompression cache misses outside its lock, a
+  crafted image could otherwise drive one such allocation per read.
+
 ## [0.1.5] — 2026-09-06
 
 ### Fixed

@@ -2,7 +2,7 @@
 //!
 //! Reads everything `mkfs.erofs` 1.9 emits: compact and extended
 //! inodes, FLAT_PLAIN and FLAT_INLINE, chunk-based inodes, and
-//! compressed clusters in LZ4, LZMA and DEFLATE — including
+//! compressed clusters in LZ4, LZMA, DEFLATE and ZSTD — including
 //! compacted-2B cluster maps, ztailpacking, fragments and
 //! big_pcluster. It also builds images; see [`mkfs`].
 //!

@@ -2,6 +2,13 @@
 # Cargo.lock is committed: reproducible, locked dependency resolution for
 # the build/test/clippy gates (cargo … --locked). Do not re-ignore.
 *.img
+# ...except this one fixture, which IS committed. A mkfs.erofs built
+# without libzstd cannot produce a zstd image, and most packaged builds
+# are not built with it, so `tests/zstd_image.rs` carries the image
+# rather than depending on what happens to be installed. Named
+# individually rather than un-ignoring the whole directory, so a stray
+# local image dropped in test-disks/ still stays out.
+!test-disks/erofs-zstd-4k.img
 *audit*
 .history
 

@@ -2639,6 +2639,65 @@ mod tests {
         assert_eq!(lzma.lp, 0);
         assert_eq!(lzma.pb, 2);
         assert!(cfgs.deflate.is_none());
+        assert!(cfgs.zstd.is_none());
+    }
+
+    /// The ZSTD record, and the two values in it that are constrained.
+    ///
+    /// Neither is consulted while decoding — the frame header carries
+    /// the window size a decoder actually needs — so the only thing an
+    /// out-of-range value can do is go unnoticed. That is why they are
+    /// range-checked at all: a record that does not look like a ZSTD
+    /// config means the blob is not laid out the way this reader
+    /// believes, and everything read after it is then read from the
+    /// wrong offset.
+    #[test]
+    fn zstd_cfgs_record_is_parsed_and_range_checked() {
+        use crate::superblock::{
+            read_compr_cfgs, EROFS_FEATURE_INCOMPAT_COMPR_CFGS, EROFS_SUPER_BLOCK_SIZE,
+            EROFS_SUPER_OFFSET,
+        };
+        const BS: usize = 4096;
+        // `format` and `windowlog`, and whether the blob must parse.
+        // windowlog is `ZSTD_windowLog - 10`, so 10 is a 1 MiB
+        // dictionary — the largest the format allows — and 11 is 2 MiB,
+        // which mkfs.erofs will not write and the kernel could not
+        // honour.
+        for (format, windowlog, ok) in [
+            (0u8, 5u8, true), // what mkfs.erofs writes at a 4 KiB pcluster
+            (0, 0, true),     // the smallest window the field can express
+            (0, 10, true),    // exactly the limit
+            (0, 11, false),   // one past it
+            (0, 255, false),  // and a value that would overflow a naive shift
+            (1, 5, false),    // an undefined format
+        ] {
+            let mut img = vec![0u8; BS * 4];
+            let mut sb = synth_sb(12, 0, 1, 4);
+            sb[0x50..0x54].copy_from_slice(&EROFS_FEATURE_INCOMPAT_COMPR_CFGS.to_le_bytes());
+            let algos: u16 = 1 << 3; // ZSTD only
+            sb[0x54..0x56].copy_from_slice(&algos.to_le_bytes());
+            img[EROFS_SUPER_OFFSET as usize..EROFS_SUPER_OFFSET as usize + sb.len()]
+                .copy_from_slice(&sb);
+
+            let off = EROFS_SUPER_OFFSET as usize + EROFS_SUPER_BLOCK_SIZE;
+            img[off..off + 2].copy_from_slice(&6u16.to_le_bytes());
+            img[off + 2] = format;
+            img[off + 3] = windowlog;
+
+            let dev = MemDev::new(img);
+            let sb_parsed = crate::superblock::read(&dev).unwrap();
+            match (read_compr_cfgs(&dev, &sb_parsed), ok) {
+                (Ok(Some(cfgs)), true) => {
+                    let z = cfgs.zstd.expect("the ZSTD record must parse");
+                    assert_eq!((z.format, z.windowlog), (format, windowlog));
+                    assert!(cfgs.lz4.is_none() && cfgs.lzma.is_none());
+                }
+                (Err(Error::BadSuperblock(_)), false) => {}
+                (other, _) => panic!(
+                    "format {format}, windowlog {windowlog}: expected ok={ok}, got {other:?}"
+                ),
+            }
+        }
     }
 
     /// Multi-lcluster pcluster with a SENTINEL-style PLAIN last entry
