@@ -1965,3 +1965,53 @@ fn oracle_multidevice_round_trip() {
     assert_eq!(slots.len(), 1);
     assert_eq!(slots[0].tag_str(), "blob1");
 }
+
+/// A pcluster's DECODED span is not bounded by the same number as its
+/// length on disk.
+///
+/// `Z_EROFS_PCLUSTER_MAX_SIZE` is 1 MiB and bounds the compressed
+/// cluster -- it is what `mkfs.erofs -C` sets and refuses to exceed.
+/// What that cluster decodes to is bounded by
+/// `Z_EROFS_PCLUSTER_MAX_DSIZE` instead, and mkfs's own default cap is
+/// 8,192,000 bytes. Applying the 1 MiB number to the decoded span made
+/// ordinary images unreadable; measured on a 64 MiB file of zeros at a
+/// 4 KiB block size:
+///
+/// ```text
+///   -zlz4hc                     1,041,954
+///   -zlz4hc -C16384             4,175,394
+///   -zlz4hc -C65536             8,192,000
+/// ```
+///
+/// So this test uses `-C65536`, whose spans are eight times the wrong
+/// ceiling, and demands the bytes back rather than tolerating an error
+/// the way the surveys above do.
+#[test]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
+fn a_pcluster_decoding_to_more_than_a_megabyte_still_reads() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not on PATH");
+        return;
+    }
+    // Compressible enough that one pcluster covers megabytes.
+    let payload = vec![0u8; 24 * 1024 * 1024];
+    let tree = dir(vec![("zeros.bin", file(&payload))]);
+    let img = build_with_mkfs_erofs(&["-b4096", "-zlz4hc", "-C65536"], &tree);
+
+    let fs = open_image(img.bytes);
+    let inode = fs.lookup_path("/zeros.bin").expect("lookup");
+    assert_eq!(inode.size, payload.len() as u64);
+
+    // One read spanning the first pcluster, and one deep inside a later
+    // one, so the forward lcluster walk has to reach across a span
+    // larger than a megabyte to find the next HEAD.
+    for at in [0u64, 9 * 1024 * 1024] {
+        let mut buf = vec![0xAAu8; 64 * 1024];
+        fs.read_file(&inode, at, &mut buf)
+            .unwrap_or_else(|e| panic!("read at {at}: {e:?}"));
+        assert!(
+            buf.iter().all(|b| *b == 0),
+            "read at {at} came back with something other than the zeros written"
+        );
+    }
+}
