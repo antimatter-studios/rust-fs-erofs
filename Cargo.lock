@@ -16,7 +16,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "am-fs-core"
-version = "0.2.9"
+version = "0.2.10"
 
 [[package]]
 name = "am-fs-erofs"
@@ -29,6 +29,7 @@ dependencies = [
  "lru",
  "lz4_flex",
  "lzma-rs",
+ "ruzstd",
  "tempfile",
 ]
 
@@ -320,6 +321,15 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys",
+]
+
+[[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]

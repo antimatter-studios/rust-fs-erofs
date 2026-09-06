@@ -145,8 +145,8 @@ pub const EROFS_FEATURE_INCOMPAT_COMPR_CFGS: u32 = 0x0000_0002;
 
 /// Per-algorithm configuration parsed from the COMPR_CFGS blob. One
 /// entry per codec type id observed in the blob. Only LZMA carries
-/// reader-relevant parameters today (LZ4 / DEFLATE blobs exist but
-/// are empty / informational).
+/// reader-relevant parameters today (LZ4 / DEFLATE / ZSTD blobs exist
+/// but are empty / informational).
 ///
 /// Spec: `Z_EROFS_COMPRESSION_*` type ids in the public format header
 /// `erofs_fs.h` and the on-disk-format chapter of the public EROFS
@@ -161,6 +161,37 @@ pub struct ComprCfgs {
     /// `Z_EROFS_COMPRESSION_DEFLATE = 2`. Empty today (window-bits is
     /// fixed at the EROFS / kernel default).
     pub deflate: Option<()>,
+    /// `Z_EROFS_COMPRESSION_ZSTD = 3`. Parsed, and deliberately not
+    /// used: see [`ZstdCfg`].
+    pub zstd: Option<ZstdCfg>,
+}
+
+/// Decoded ZSTD configuration record from the COMPR_CFGS blob.
+///
+/// Layout of `z_erofs_zstd_cfgs` (per the public format header
+/// `erofs_fs.h`): `u8 format; u8 windowlog; u8 reserved[4];`.
+///
+/// # Why nothing reads these
+///
+/// `windowlog` is stored as `ZSTD_windowLog - 10`, and it exists for a
+/// decoder that has to allocate its sliding window before it sees the
+/// stream — the kernel's, which decodes into a preallocated ring
+/// buffer. A decoder handed the whole compressed pcluster reads the
+/// window size out of the frame header itself, so the field is
+/// redundant here.
+///
+/// It is parsed and kept anyway, for two reasons. The record occupies
+/// space in the blob and the codecs after it in the canonical order
+/// cannot be found without stepping over it. And a value that
+/// disagrees with the frame header would be worth knowing about; you
+/// cannot notice that in a field you threw away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZstdCfg {
+    /// Reserved by the format; zero in everything mkfs.erofs emits.
+    pub format: u8,
+    /// `ZSTD_windowLog - 10`, i.e. the dictionary size is
+    /// `1 << (windowlog + 10)`.
+    pub windowlog: u8,
 }
 
 /// Decoded LZMA configuration record from the COMPR_CFGS blob.
@@ -519,7 +550,9 @@ const Z_EROFS_COMPRESSION_ZSTD_BIT: u16 = 1 << 3;
 /// - DEFLATE (`size = 6`): `u8 windowbits; u8 reserved[5];`.
 ///   `windowbits` is informational; the reader's DEFLATE codec
 ///   accepts any compliant stream.
-/// - ZSTD: not implemented. Returns `Error::UnsupportedLayout(3)`.
+/// - ZSTD (`size = 6`): `u8 format; u8 windowlog; u8 reserved[4];`.
+///   `windowlog` is `ZSTD_windowLog - 10`; see [`ZstdCfg`] for why the
+///   codec does not consult it.
 ///
 /// Spec: blob layout described in the public EROFS on-disk-format
 /// documentation
@@ -588,7 +621,18 @@ pub fn read_compr_cfgs<R: BlockRead + ?Sized>(
         cfgs.deflate = Some(());
     }
     if (algos & Z_EROFS_COMPRESSION_ZSTD_BIT) != 0 {
-        return Err(Error::UnsupportedLayout(3));
+        let payload = read_one(&mut cursor)?;
+        // Two bytes is all the record carries; the remaining four are
+        // reserved. A shorter one is a malformed blob rather than an
+        // older layout — the record has been six bytes since the codec
+        // was introduced.
+        if payload.len() < 2 {
+            return Err(Error::BadInode("ZSTD cfg payload < 2 bytes"));
+        }
+        cfgs.zstd = Some(ZstdCfg {
+            format: payload[0],
+            windowlog: payload[1],
+        });
     }
     Ok(Some(cfgs))
 }
