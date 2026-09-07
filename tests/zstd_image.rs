@@ -173,7 +173,7 @@ fn mkfs_erofs_speaks_zstd() -> bool {
     if !mkfs_erofs_available() {
         return false;
     }
-    Command::new("mkfs.erofs")
+    let speaks = Command::new("mkfs.erofs")
         .arg("-V")
         .output()
         .map(|o| {
@@ -181,7 +181,24 @@ fn mkfs_erofs_speaks_zstd() -> bool {
                 + &String::from_utf8_lossy(&o.stderr).to_lowercase();
             text.contains("zstd")
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // A CAPABILITY, BUT NOT AN OPTIONAL ONE IN CI. The workflow installs
+    // `libzstd-dev` before building erofs-utils from source precisely so
+    // this returns true, so a build here that cannot speak ZSTD means
+    // the install step changed -- the same class of breakage as the tool
+    // being absent, and worth the same loud failure rather than a line
+    // on stderr nobody reads.
+    //
+    // The distribution's packaged erofs-utils frequently lacks it, which
+    // is why the skip exists at all and why it stays for a developer.
+    assert!(
+        speaks || std::env::var_os("CI").is_none(),
+        "the mkfs.erofs on PATH was built without libzstd, and CI is set. The workflow \
+         installs libzstd-dev and builds erofs-utils from source so this comparison can \
+         run; without it the ZSTD oracle would skip and the suite would pass having \
+         checked the codec against nothing it did not write itself."
+    );
+    speaks
 }
 
 /// The same content, compressed by whatever `mkfs.erofs` is installed

@@ -94,31 +94,56 @@ pub fn file(data: &[u8]) -> mkfs::Node {
 
 // ---- erofs-utils oracle plumbing --------------------------------------
 
-/// Returns true if the `mkfs.erofs` binary is on `PATH` and runnable.
-/// Tests that need it should branch on this and skip (or mark `#[ignore]`)
-/// so CI without erofs-utils still passes.
-pub fn mkfs_erofs_available() -> bool {
-    Command::new("mkfs.erofs")
+/// True if `tool` is on `PATH` and runnable.
+///
+/// A MISSING TOOL IS A SKIP ON A LAPTOP AND A FAILURE IN CI.
+///
+/// Skipping is right on a machine with no erofs-utils: the driver's own
+/// tests still run, and a contributor without the reference tools is
+/// not blocked. It is exactly wrong in CI, where the workflow builds
+/// erofs-utils 1.9.1 from source for the sole purpose of running these
+/// comparisons, and verifies all three binaries with `--version` before
+/// the suite starts.
+///
+/// There, an absent tool means the install step changed or broke -- and
+/// the oracles would report success having compared this driver against
+/// nothing at all. That is the expensive failure to hide, because the
+/// oracles are the only check here that is not this repository marking
+/// its own homework.
+///
+/// `CI` is set on every GitHub Actions runner, unconditionally, which
+/// is what makes the distinction reliable. Measuring whether CI would
+/// catch a broken install means reproducing CI's ENVIRONMENT and not
+/// merely its command: a local run without `CI` set answers the
+/// developer question instead, and answers it more permissively.
+fn tool_available(tool: &str) -> bool {
+    let found = Command::new(tool)
         .arg("-V")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        found || std::env::var_os("CI").is_none(),
+        "{tool} is not on PATH, and CI is set. The workflow builds erofs-utils from \
+         source so the oracles can run; without it they would skip and the suite would \
+         pass having compared this driver against nothing."
+    );
+    found
+}
+
+/// Returns true if the `mkfs.erofs` binary is on `PATH` and runnable.
+/// Tests that need it should branch on this and skip, so a checkout
+/// without erofs-utils still runs everything that does not need it.
+pub fn mkfs_erofs_available() -> bool {
+    tool_available("mkfs.erofs")
 }
 
 pub fn fsck_erofs_available() -> bool {
-    Command::new("fsck.erofs")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    tool_available("fsck.erofs")
 }
 
 pub fn dump_erofs_available() -> bool {
-    Command::new("dump.erofs")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    tool_available("dump.erofs")
 }
 
 /// Materialize a `mkfs::Node` tree onto disk under `root`. Used to
