@@ -10,7 +10,7 @@ use crate::dir::{iter_block, DirEntry};
 use crate::error::{Error, Result};
 use crate::inode::Inode;
 use crate::layout::DataLayout;
-use crate::superblock::{self, ComprCfgs, Superblock};
+use crate::superblock::{self, ComprCfgs, Superblock, EROFS_FEATURE_INCOMPAT_ZERO_PADDING};
 use crate::xattr::{self, XattrLongPrefix};
 use crate::zmap::{self, Z_EROFS_LCLUSTER_TYPE_PLAIN};
 use fs_core::BlockRead;
@@ -907,11 +907,18 @@ impl Filesystem {
         let mut decompressed = vec![0u8; uncompressed_len];
         // For LZMA we plumb the COMPR_CFGS-derived dict_size / lc /
         // lp / pb through; for the other codecs the second arg is
-        // ignored. `decompress_with_config` falls back to LZMA1
+        // ignored. `decompress_with_config_and_padding` falls back to LZMA1
         // defaults when no config is present (ergonomic for older
         // images that strip the LZMA1 header but pre-date COMPR_CFGS).
         let lzma_cfg = self.compr_cfgs.as_ref().and_then(|c| c.lzma.as_ref());
-        decompress::decompress_with_config(algo, lzma_cfg, &compressed, &mut decompressed)?;
+        let zero_padding = self.sb.feature_incompat & EROFS_FEATURE_INCOMPAT_ZERO_PADDING != 0;
+        decompress::decompress_with_config_and_padding(
+            algo,
+            lzma_cfg,
+            zero_padding,
+            &compressed,
+            &mut decompressed,
+        )?;
         out[..take].copy_from_slice(&decompressed[off_in_pcluster..off_in_pcluster + take]);
         // Insert into cache AFTER the copy: the buffer is shared via
         // `Arc` so concurrent readers don't pay extra allocation, and
