@@ -1816,6 +1816,92 @@ fn oracle_lzma_compr_cfgs_round_trip() {
     );
 }
 
+/// A tree whose files are large enough that their fragment extents
+/// span several logical clusters.
+///
+/// The tails in `fragments_sample_tree` are all well under one
+/// lcluster, so their fragment extents are one lcluster wide and the
+/// last entry in the index is a real head. That is the shape every
+/// fragment test here used, and it is the shape that cannot see the
+/// sentinel rule at all.
+///
+/// The content is a deterministic linear congruential stream: it does
+/// not compress to nothing, so the extents stay real, and it is the
+/// same bytes on every run, so a mismatch is reproducible.
+fn wide_fragment_sample_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node) {
+    fn stream(len: usize, seed: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 4);
+        let mut x = seed;
+        while out.len() < len {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    // Sizes chosen to leave a tail that is not a whole number of
+    // lclusters, which is what makes the last index entry a sentinel.
+    let specs: &[(&str, usize, u32)] = &[
+        ("wide200k.bin", 200_000, 0x1234_5678),
+        ("wide300k.bin", 300_003, 0x0BAD_C0DE),
+        ("small.txt", 700, 0x5EED_5EED),
+    ];
+    let mut expected = Vec::new();
+    let mut entries = Vec::new();
+    for (name, len, seed) in specs {
+        let data = stream(*len, *seed);
+        expected.push((format!("/{name}"), data.clone()));
+        entries.push((*name, file(&data)));
+    }
+    (expected, dir(entries))
+}
+
+/// `mkfs.erofs -zlz4 -Efragments -C65536`: a fragment extent that
+/// spans several logical clusters still reads.
+///
+/// With `-Efragments` alone every extent is one lcluster wide, the
+/// last index entry's `clusterofs` is 0, and the walk back from it
+/// lands on a real head — which is why every fragment test here passed
+/// while the rule was missing. Adding `-C65536` lets mkfs.erofs merge
+/// the tail into a wider extent, and the last entry becomes a sentinel
+/// marking where the preceding extent ends.
+///
+/// Before the fix these files did not merely read wrong, they refused:
+///
+/// ```text
+/// /wide200k.bin  READ_ERR  BadInode("CBLKCNT marker with zero block count")
+/// ```
+///
+/// because the fragment was missed and the read fell through to a
+/// compressed extent with no blocks behind it. `fsck.erofs` calls the
+/// same image clean.
+#[test]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
+fn oracle_fragments_wider_than_one_lcluster_round_trip() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not on PATH");
+        return;
+    }
+    let (expected, tree) = wide_fragment_sample_tree();
+    let img = build_with_mkfs_erofs(&["-z", "lz4", "-Efragments", "-C65536"], &tree);
+    let fs = open_image(img.bytes);
+    for (path, want) in &expected {
+        let inode = fs
+            .lookup_path(path)
+            .unwrap_or_else(|e| panic!("lookup {path}: {e:?}"));
+        assert_eq!(inode.size as usize, want.len(), "{path}: size");
+        let mut buf = vec![0u8; want.len()];
+        fs.read_file(&inode, 0, &mut buf)
+            .unwrap_or_else(|e| panic!("read {path}: {e:?}"));
+        assert_eq!(
+            sha256(want),
+            sha256(&buf),
+            "{path}: SHA256 mismatch (fragments, -C65536)"
+        );
+    }
+}
+
 /// Same flow but with both ztailpacking AND fragments explicitly
 /// enabled: mkfs.erofs picks per-file which mode saves more space, so
 /// the resulting image will mix ztailpacked and fragment-packed

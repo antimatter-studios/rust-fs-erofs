@@ -894,8 +894,56 @@ impl<'a> ZMap<'a> {
         // `inode.size % lcluster_size` if the entire last lcluster is
         // a fragment, or some smaller number when an earlier pcluster
         // spills into it).
+        let lcluster_size = self.lcluster_size();
         let mut cursor = last_idx;
         let mut entry = self.read_lcluster(dev, cursor)?;
+
+        // The last lcluster's HEAD/PLAIN may be a SENTINEL rather than
+        // the head of an extent.
+        //
+        // mkfs.erofs emits one whose `clusterofs` marks where the
+        // PRECEDING extent ends -- `file_size % lcluster_size` -- and
+        // it starts nothing. `pcluster_extent` already knows this and
+        // applies the same rule to the offset it is asked about; this
+        // walk applied neither, broke on the sentinel, and computed a
+        // fragment starting at `inode.size`. It then read that as a
+        // degenerate range and answered "no fragment at all".
+        //
+        // What that costs: a fragment extent spanning more than one
+        // lcluster is missed entirely, and the read falls through to
+        // the ordinary compressed path over an extent that has no
+        // on-disk blocks. Its first NONHEAD carries CBLKCNT = 0 --
+        // correctly, a fragment extent occupies no blocks -- which
+        // `pcluster_block_count` rejects as bad metadata. Measured on
+        // an image `fsck.erofs` calls clean:
+        //
+        //     mkfs.erofs -Efragments -zlz4 -C65536
+        //     /random200k.bin  READ_ERR  BadInode("CBLKCNT marker with zero block count")
+        //
+        // The failure is loud only by luck. Relax that CBLKCNT check
+        // without this and the same images return wrong bytes instead.
+        //
+        // The rule: an entry whose `clusterofs` is past the file's last
+        // byte within its own lcluster cannot be the head of anything,
+        // because there are no bytes left for it to head. Step back one
+        // lcluster and let the ordinary walk-back continue.
+        //
+        // `interlaced` gates it for the same reason it gates the
+        // sibling in `pcluster_extent`: there `clusterofs` is a
+        // rotation amount rather than a spillover marker. The gate is
+        // copied deliberately rather than reasoned about afresh, so the
+        // two move together -- see #49, which is about that flag's
+        // value being wrong, and which changes both or neither.
+        let last_byte_in_lcluster = (self.inode.size - 1) % lcluster_size;
+        if is_head_or_plain(entry.cluster_type)
+            && !self.has_interlaced_pcluster()
+            && (entry.clusterofs as u64) > last_byte_in_lcluster
+            && cursor > 0
+        {
+            cursor -= 1;
+            entry = self.read_lcluster(dev, cursor)?;
+        }
+
         loop {
             match entry.cluster_type {
                 Z_EROFS_LCLUSTER_TYPE_PLAIN
@@ -916,7 +964,6 @@ impl<'a> ZMap<'a> {
                 _ => return Err(Error::BadInode("fragment lcluster: invalid cluster type")),
             }
         }
-        let lcluster_size = self.lcluster_size();
         let source_start_byte = cursor * lcluster_size + entry.clusterofs as u64;
         let source_end_byte = self.inode.size;
         if source_start_byte >= source_end_byte {
@@ -2731,6 +2778,129 @@ mod tests {
             assert_eq!(e.source_end_byte, 52544, "query={query}");
             assert_eq!(e.head_lcluster_idx, 0);
         }
+    }
+
+    /// A fragment extent spanning several lclusters is found, not
+    /// mistaken for no fragment at all.
+    ///
+    /// The index is the shape `mkfs.erofs -Efragments -zlz4 -C65536`
+    /// writes for a 200,000-byte file at 16 KiB lclusters, scaled here
+    /// to the 4 KiB lclusters this harness builds:
+    ///
+    /// ```text
+    /// lc9  HEAD1   clusterofs=0          <- the fragment extent's head
+    /// lc10 NONHEAD cblkcnt=Some(0)
+    /// lc11 NONHEAD delta[0]=1
+    /// lc12 PLAIN   clusterofs=3392       <- sentinel, not a head
+    /// ```
+    ///
+    /// Breaking on the sentinel gives `12 * 4096 + 3392`, which is the
+    /// file size exactly, and the range then looks degenerate — so the
+    /// old code answered `None` and the read fell through to a
+    /// compressed extent with no blocks behind it.
+    ///
+    /// The assertion is on the *start*: `None` and a start of EOF are
+    /// the two wrong answers this can give, and asserting `is_some()`
+    /// alone would accept the second.
+    #[test]
+    fn a_fragment_extent_spanning_several_lclusters_starts_at_its_head() {
+        const SIZE: u32 = 12 * 4096 + 3392;
+        let mut entries: Vec<[u8; 8]> = Vec::new();
+        // lc0..lc8: an ordinary HEAD each, so the walk-back has
+        // somewhere wrong it could stop if it stepped too far.
+        for i in 0..9u32 {
+            entries.push(encode_lcluster(1, 0, i + 1));
+        }
+        // lc9 HEAD1: the fragment extent's head.
+        entries.push(encode_lcluster(1, 0, 10));
+        // lc10 and lc11 NONHEAD, delta[0] = 1 each.
+        //
+        // On a real image lc10 carries a CBLKCNT marker of zero blocks,
+        // which is how a fragment extent's lack of on-disk blocks is
+        // spelled — and rejecting that marker is what turns this defect
+        // into a loud failure rather than wrong bytes. It cannot be
+        // written here: `cblkcnt` is only decoded on a BIG_PCLUSTER
+        // image and this harness builds images without that feature, so
+        // the same entry would decode as `delta[0] = 0` and be refused
+        // for an unrelated reason. The oracle test covers the marker;
+        // this one covers the walk.
+        entries.push(encode_lcluster(2, 0, 1));
+        entries.push(encode_lcluster(2, 0, 1));
+        // lc12 PLAIN sentinel: clusterofs == SIZE % 4096.
+        entries.push(encode_lcluster(0, 3392, 0));
+
+        let img = build_zmap_image(SIZE, Z_EROFS_ADVISE_FRAGMENT_PCLUSTER, 0, &entries);
+        let dev = MemDev::new(img);
+        let sb = crate::superblock::read(&dev).unwrap();
+        let inode = Inode::read(&dev, &sb, 0).unwrap();
+        let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
+
+        let (_, start, end) = zmap
+            .fragment_range(&dev)
+            .unwrap()
+            .expect("a fragment extent wider than one lcluster is still a fragment");
+        assert_eq!(start, 9 * 4096, "the fragment starts at its head");
+        assert_eq!(end, u64::from(SIZE));
+    }
+
+    /// The one-lcluster case still answers the same, which is what says
+    /// the sentinel rule did not simply move the answer by a cluster.
+    ///
+    /// This is the shape `-Efragments` alone produces, and the shape
+    /// every fragment test here used before: the last lcluster's
+    /// `clusterofs` is 0, so it is a head rather than a sentinel and no
+    /// step back is due.
+    #[test]
+    fn a_fragment_occupying_one_lcluster_still_starts_there() {
+        const SIZE: u32 = 3 * 4096 + 1000;
+        let mut entries: Vec<[u8; 8]> = Vec::new();
+        for i in 0..3u32 {
+            entries.push(encode_lcluster(1, 0, i + 1));
+        }
+        // lc3 HEAD1 clusterofs=0: the fragment is the whole of it.
+        entries.push(encode_lcluster(1, 0, 4));
+
+        let img = build_zmap_image(SIZE, Z_EROFS_ADVISE_FRAGMENT_PCLUSTER, 0, &entries);
+        let dev = MemDev::new(img);
+        let sb = crate::superblock::read(&dev).unwrap();
+        let inode = Inode::read(&dev, &sb, 0).unwrap();
+        let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
+
+        let (_, start, end) = zmap.fragment_range(&dev).unwrap().expect("a fragment");
+        assert_eq!(start, 3 * 4096);
+        assert_eq!(end, u64::from(SIZE));
+    }
+
+    /// A head whose `clusterofs` is exactly the file's last byte within
+    /// its lcluster is a head, not a sentinel.
+    ///
+    /// The rule is `>` and not `>=`, and the two differ at exactly one
+    /// value: a fragment of a single byte, whose head sits at that
+    /// byte. Reading the rule as `>=` steps back over a real head and
+    /// starts the fragment an lcluster early.
+    #[test]
+    fn a_head_at_the_files_last_byte_is_not_a_sentinel() {
+        const SIZE: u32 = 2 * 4096 + 1001;
+        let mut entries: Vec<[u8; 8]> = Vec::new();
+        for i in 0..2u32 {
+            entries.push(encode_lcluster(1, 0, i + 1));
+        }
+        // lc2 HEAD1 clusterofs = 1000 = (SIZE - 1) % 4096: the last
+        // byte of the file is the first byte of this head.
+        entries.push(encode_lcluster(1, 1000, 3));
+
+        let img = build_zmap_image(SIZE, Z_EROFS_ADVISE_FRAGMENT_PCLUSTER, 0, &entries);
+        let dev = MemDev::new(img);
+        let sb = crate::superblock::read(&dev).unwrap();
+        let inode = Inode::read(&dev, &sb, 0).unwrap();
+        let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
+
+        let (_, start, _) = zmap.fragment_range(&dev).unwrap().expect("a fragment");
+        assert_eq!(
+            start,
+            2 * 4096 + 1000,
+            "a head at the last byte was treated as a sentinel"
+        );
     }
 
     /// Compile-time pin of [`IndexFormat`]'s variant set. The public
