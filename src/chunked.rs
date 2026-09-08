@@ -55,16 +55,39 @@ pub struct ChunkInfo {
 /// Derive chunk geometry from the inode's `i_u` chunk-format word + size.
 ///
 /// Spec: `linux/fs/erofs/erofs_fs.h::erofs_inode_chunk_info`. The
-/// chunk-format word is the low 16 bits of i_u (offset 0x10). Older
-/// reader iterations of this crate read the same bits from `i_format`'s
-/// per-layout flags by accident -- they happened to match for
-/// chunk_bits=0 + INDEXES-clear images. This implementation reads from
-/// the spec-correct i_u location and tolerates either as a fallback so
-/// older fixtures still parse.
+/// chunk-format word is the low 16 bits of `i_u`, at offset 0x10, and
+/// that is the only place it is read from.
+///
+/// It used to fall back to `i_format`'s per-layout flags when `i_u`'s
+/// low word was zero — a shim for fixtures an older iteration of this
+/// crate wrote, which had put the same bits there by accident. The
+/// discriminator does not work, because **zero is a legal value of the
+/// chunk-format word**: `chunk_bits == 0` means one chunk is one block
+/// and a clear `EROFS_CHUNK_FORMAT_INDEXES` means four-byte compact
+/// entries, which is an ordinary combination — the crate's own
+/// `chunk_info_compact_form` test constructs it. For such an inode the
+/// geometry came from a different field entirely.
+///
+/// The two are not interchangeable. `EROFS_CHUNK_FORMAT_INDEXES` is
+/// 0x20, which as an `i_format` flag is bit 9 of the inode's format
+/// word, and those bits are per-layout and undefined for a chunked
+/// inode. A producer setting anything up there made this reader
+/// conclude the chunkmap holds 8-byte indexed entries where it holds
+/// 4-byte compact ones: every chunk address is then read from the wrong
+/// offset and `lookup_chunk_blkaddr` returns a plausible `u32` from the
+/// middle of the neighbouring entry. There is no checksum on a chunkmap
+/// and no sentinel, so the read succeeds and returns the wrong blocks.
+/// The `chunk_bits` half is quieter and no better: a wrong shift moves
+/// `n_chunks` and `chunk_idx` together, so offsets map to entirely
+/// different chunks.
+///
+/// Measured against erofs-utils 1.9.4, which never produces the
+/// ambiguous case because it clamps `--chunksize` up to four blocks:
+/// `i_format.flags` is zero on every image it writes and `i_u` never
+/// is. So the fallback was unreachable through the reference tool —
+/// a branch that is wrong and unreachable, which reads as verified.
 pub fn chunk_info(sb: &Superblock, inode: &Inode) -> Result<ChunkInfo> {
-    let cf = (inode.raw_u & 0xFFFF) as u16;
-    let from_iu = cf != 0;
-    let flags = if from_iu { cf } else { inode.format.flags };
+    let flags = (inode.raw_u & 0xFFFF) as u16;
     let chunk_bits = (flags & EROFS_CHUNK_FORMAT_BLKBITS_MASK) as u8;
     let uses_indexes = (flags & EROFS_CHUNK_FORMAT_INDEXES) != 0;
     // chunk_size = block_size << chunk_bits. Guard against absurd shifts
@@ -135,15 +158,28 @@ pub(crate) mod tests {
     use crate::superblock::tests::synth_sb;
     use crate::test_device::MemDev;
 
-    /// Build a synthetic compact ChunkBased inode buffer with a given
-    /// per-layout `flags` value. Layout occupies bits 1..=3, flags occupy
-    /// bits 4..=15 of `i_format`.
-    fn synth_chunked_compact(mode: u16, size: u32, flags: u16) -> [u8; 32] {
+    /// Build a synthetic compact ChunkBased inode carrying `chunk_format`
+    /// where the spec puts it: the low 16 bits of `i_u`, at 0x10.
+    ///
+    /// These fixtures used to write it into `i_format`'s per-layout
+    /// flags instead, which is where an older iteration of this crate
+    /// read it from — so the tests agreed with the reader and both
+    /// disagreed with the format. `format_flags` exists so a test can
+    /// put something in that field and assert it is ignored.
+    fn synth_chunked_compact(mode: u16, size: u32, chunk_format: u16) -> [u8; 32] {
+        synth_chunked_compact_with_format_flags(mode, size, chunk_format, 0)
+    }
+
+    fn synth_chunked_compact_with_format_flags(
+        mode: u16,
+        size: u32,
+        chunk_format: u16,
+        format_flags: u16,
+    ) -> [u8; 32] {
         let mut b = synth_compact(DataLayout::ChunkBased, mode, size, 0);
-        // Re-pack i_format with flags. synth_compact wrote
-        // raw_format = (DataLayout::ChunkBased as u16) << 1; we OR in flags << 4.
-        let raw_format: u16 = ((DataLayout::ChunkBased as u16) << 1) | (flags << 4);
+        let raw_format: u16 = ((DataLayout::ChunkBased as u16) << 1) | (format_flags << 4);
         b[0x00..0x02].copy_from_slice(&raw_format.to_le_bytes());
+        b[0x10..0x14].copy_from_slice(&u32::from(chunk_format).to_le_bytes());
         b
     }
 
@@ -160,6 +196,52 @@ pub(crate) mod tests {
         assert!(!info.uses_indexes);
         assert_eq!(info.chunk_size, 8192);
         assert_eq!(info.n_chunks, 2); // 16384 / 8192
+    }
+
+    /// The geometry comes from `i_u` even when `i_format`'s per-layout
+    /// flags say something else.
+    ///
+    /// This is the case the old fallback got wrong: a chunk-format word
+    /// of zero is legal — one block per chunk, compact entries — and it
+    /// made the reader take the geometry from a field that means
+    /// nothing here. The `i_format` flags below spell `INDEXES` set and
+    /// `chunk_bits = 3`; both must be ignored.
+    #[test]
+    fn chunk_geometry_ignores_the_per_layout_format_flags() {
+        let misleading = EROFS_CHUNK_FORMAT_INDEXES | 3;
+        let inode_buf = synth_chunked_compact_with_format_flags(0x81A4, 8192, 0, misleading);
+        let inode = Inode::parse(0, &inode_buf).unwrap();
+        assert_eq!(
+            inode.format.flags, misleading,
+            "the fixture did not put the misleading value where it meant to"
+        );
+        let sb_buf = synth_sb(12, 0, 1, 16);
+        let sb = Superblock::parse(&sb_buf).unwrap();
+
+        let info = chunk_info(&sb, &inode).unwrap();
+        assert_eq!(info.chunk_bits, 0, "chunk_bits came from i_format");
+        assert!(!info.uses_indexes, "the INDEXES bit came from i_format");
+        // One block per chunk, and the harness's block size is 4 KiB.
+        assert_eq!(info.chunk_size, 4096);
+        assert_eq!(info.n_chunks, 2);
+    }
+
+    /// A chunk-format word of zero is a geometry, not an absence.
+    ///
+    /// One block per chunk with compact entries — what
+    /// `mkfs.erofs --chunksize=<one block>` would write, and what the
+    /// old discriminator read as "nothing here, look elsewhere".
+    #[test]
+    fn a_chunk_format_word_of_zero_is_one_block_per_chunk() {
+        let inode_buf = synth_chunked_compact(0x81A4, 3 * 4096, 0);
+        let inode = Inode::parse(0, &inode_buf).unwrap();
+        let sb_buf = synth_sb(12, 0, 1, 16);
+        let sb = Superblock::parse(&sb_buf).unwrap();
+        let info = chunk_info(&sb, &inode).unwrap();
+        assert_eq!(info.chunk_bits, 0);
+        assert!(!info.uses_indexes);
+        assert_eq!(info.chunk_size, 4096);
+        assert_eq!(info.n_chunks, 3);
     }
 
     #[test]
