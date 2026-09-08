@@ -64,6 +64,38 @@ jobs:
       # above, so we opt them in here.
       - run: cargo test --locked --release -- --ignored
 
+      # AND ONCE WITHOUT `--release` -- THE PR GATE COULD NOT SEE AN
+      # OVERFLOW OTHERWISE.
+      #
+      # overflow-checks defaults on in [profile.dev] and off in
+      # [profile.release]. Cargo.toml's [profile.release] carries lto,
+      # codegen-units, opt-level and panic only, and its [profile.dev]
+      # carries opt-level and panic only -- neither overrides the
+      # default, so the two runs above wrap a bad addition silently and
+      # report success. This repository already has a debug run --
+      # release.yml:71, `cargo test --locked --all-targets` -- but that
+      # workflow triggers on a version TAG, not a pull request, so a
+      # wrapping defect merges green here and only surfaces days later,
+      # detached from the change and from the reviewer who could have
+      # caught it, when someone else cuts the next release. See #68.
+      #
+      # `--lib` only: a second compile of the same sources, no oracle
+      # binaries needed, and the arithmetic lives in the unit tests.
+      # `EXPECT_OVERFLOW_CHECKS=1` tells
+      # `overflow_checks::the_build_the_gate_asked_to_check_does_check`
+      # in src/lib.rs that this is the run that must trap an overflow --
+      # asking the build directly rather than inferring it from which
+      # spellings of "disabled" happen to be absent from Cargo.toml. The
+      # release steps must NOT set it: the checks are off there
+      # deliberately, because that is what ships.
+      #
+      # Do not remove this as a duplicate of the runs above it, and do
+      # not drop the variable from it: tests/ci_profile.rs asserts that
+      # ci.yml -- this workflow specifically, not release.yml -- still
+      # runs a `cargo test` without `--release` that sets it, and says
+      # why release.yml having one is not enough.
+      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+
   # Validate the mkfs_erofs CLI binary's output by running upstream's
   # fsck.erofs (from erofs-utils) against an image we generated. This is
   # the canonical "does the kernel-shipped reader think this is a valid
