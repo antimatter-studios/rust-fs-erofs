@@ -223,6 +223,30 @@ fn key_of(line: &str) -> Option<String> {
     Some(unquoted.to_string())
 }
 
+/// Whether a `run:`'s value opens a block scalar rather than being the
+/// command itself.
+///
+/// `|` is not the only spelling. YAML's chomping and indentation
+/// indicators -- `|-`, `|+`, `>`, `>-`, `>+`, `|2`, `>2-` -- all open a
+/// block, and treating one as the command means the block's contents
+/// are never read.
+///
+/// THIS ONE BREAKS THE OTHER WAY from the rest of this guard's family.
+/// It does not let a broken workflow through; it FAILS A CORRECT ONE.
+/// Rewriting the gating step's `run:` from `|` to `|-` changes nothing
+/// about what executes, and made the guard report that nothing gates at
+/// all. Which is why the tests below assert that the spellings are
+/// ACCEPTED, and why "the suite goes red" is not evidence this is
+/// fixed -- it was already red, for the wrong reason.
+fn opens_a_block_scalar(value: &str) -> bool {
+    let v = value.trim();
+    let Some(rest) = v.strip_prefix('|').or_else(|| v.strip_prefix('>')) else {
+        return false;
+    };
+    rest.chars()
+        .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+}
+
 /// Structure a workflow far enough to answer the five questions above.
 ///
 /// Deliberately conservative: anything this cannot place confidently is
@@ -351,7 +375,10 @@ fn parse_workflow(text: &str) -> Workflow {
                                     in_run = true;
                                     let after =
                                         cur.split_once(':').map(|x| x.1).unwrap_or("").trim();
-                                    if after != "|" && !after.is_empty() {
+                                    // A block scalar in ANY of its
+                                    // spellings means the command is on
+                                    // the following lines.
+                                    if !opens_a_block_scalar(after) && !after.is_empty() {
                                         step.run.push_str(after);
                                         step.run.push('\n');
                                         in_run = false;
@@ -1334,6 +1361,75 @@ jobs:
                 gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
                 "`{spelling}` is the same key as its bare spelling, and the step carrying \
                  it may not run or may have its failure discarded"
+            );
+        }
+    }
+
+    /// EVERY BLOCK-SCALAR SPELLING, not just a bare `|`. The parser
+    /// treated `|-`, `>`, `|2` and the rest as the command itself, so
+    /// the block's contents were never read and a correct workflow was
+    /// reported as gating nothing.
+    ///
+    /// These assert ACCEPTANCE, deliberately. This half of the family
+    /// fails a correct workflow rather than passing a broken one, so a
+    /// red suite is not evidence the fix landed -- the suite was
+    /// already red, for the wrong reason.
+    #[test]
+    fn a_block_scalar_in_any_spelling_is_read() {
+        for opener in ["|", "|-", "|+", ">", ">-", ">+", "|2", ">2-"] {
+            let yaml = format!(
+                "\
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    steps:
+      - name: a block
+        run: {opener}
+          set -euo pipefail
+          EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+"
+            );
+            assert_eq!(
+                gating_runs_that_prove_the_build_traps(&yaml).len(),
+                1,
+                "`run: {opener}` opens a block, so the command is on the lines below it"
+            );
+        }
+    }
+
+    /// The control, and it has to be laid out as a block to be one. A
+    /// value that is NOT a block opener must still be the command
+    /// itself, so widening the check has not turned it into one that
+    /// accepts everything.
+    ///
+    /// The first draft of this test put the second line at the step's
+    /// own key indent, where the parser treats it as a sibling key
+    /// whether or not the value opened a block -- so it passed under
+    /// both the real check and a mutation returning `true` for
+    /// everything. Indented one level deeper it is block CONTENT, the
+    /// only position where the two answers differ.
+    #[test]
+    fn a_value_that_is_not_a_block_opener_is_still_the_command() {
+        for value in ["|x", ">>", "|-x", "cargo"] {
+            let yaml = format!(
+                "\
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    steps:
+      - name: not a block
+        run: {value}
+          EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+"
+            );
+            assert!(
+                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                "`{value}` is a command, not a block opener, so the line below it is not \
+                 the block's contents and the gating command is not there"
             );
         }
     }
