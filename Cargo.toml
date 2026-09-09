@@ -40,6 +40,18 @@ tempfile = "3"
 # the just-built binary. MIT/Apache-2.0; no proc-macro deps that would
 # pull GPL'd code into the test build.
 assert_cmd = "2"
+# YAML parser for tests/ci_profile.rs, which reads .github/workflows/ci.yml
+# and refuses if the debug run that lets the PR gate see an arithmetic
+# overflow has been removed or disabled. That guard hand-rolled its own
+# scanner and was defeated by ordinary YAML -- a quoted "if" key, a
+# commented-out trigger, and a `|-` block scalar. Quoted keys, block
+# styles and comments are the grammar, not edge cases, so the file is
+# parsed rather than scanned. Pure Rust, YAML 1.2 (so GitHub's `on:` key
+# stays the string `on` and is not folded into a boolean),
+# MIT/Apache-2.0, and no C to transpile -- unlike serde_yaml, which is
+# deprecated and wraps unsafe-libyaml. Dev-only: it never reaches a
+# consumer of this crate.
+saphyr = "0.0.12"
 
 [profile.release]
 lto = true
