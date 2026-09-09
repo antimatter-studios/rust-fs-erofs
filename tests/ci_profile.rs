@@ -168,12 +168,59 @@ struct Job {
 
 #[derive(Debug)]
 struct Workflow {
-    triggers: String,
+    /// The trigger NAMES, parsed. Not the `on:` block's text: a
+    /// substring search over that text answered `true` for a
+    /// `pull_request` sitting inside a comment, so commenting the real
+    /// key out -- the ordinary way to disable PR CI while chasing a
+    /// flaky runner -- left the guard reporting pull-request coverage
+    /// that was no longer there. It answered `true` for
+    /// `pull_request_review:` too, which fires on reviews rather than
+    /// on pull requests. Neither spelling needs an adversarial author.
+    triggers: Vec<String>,
     jobs: Vec<Job>,
 }
 
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
+}
+
+/// A line with any trailing comment removed.
+///
+/// Only a `#` that starts a token counts, so a `#` inside a value --
+/// `run: echo '#1'` -- is left alone. Crude next to real YAML, and in
+/// the safe direction: a comment mistaken for content can only make
+/// this parser see a key that is not there, which refuses a workflow
+/// rather than approving one.
+fn without_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'#' && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+            return &line[..i];
+        }
+    }
+    line
+}
+
+/// The key a mapping line declares, with any comment and quotes removed.
+///
+/// ONE PLACE DECIDES WHAT A KEY IS, because every defeat this guard has
+/// suffered lived in a spelling one comparison did not normalise while
+/// another did. `"if": false` and `'continue-on-error': true` are valid
+/// YAML and GitHub Actions honours them exactly as the bare spellings,
+/// but a raw compare against `if` matches neither. The manifest scan in
+/// this same file already strips quotes, for the same reason, after a
+/// quoted `"overflow-checks" = false` defeated it -- and the lesson had
+/// not travelled the few hundred lines from the TOML parser to the YAML
+/// one.
+fn key_of(line: &str) -> Option<String> {
+    let t = without_comment(line).trim();
+    let t = t.strip_prefix("- ").unwrap_or(t).trim_start();
+    let (raw, _) = t.split_once(':')?;
+    let unquoted = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if unquoted.is_empty() {
+        return None;
+    }
+    Some(unquoted.to_string())
 }
 
 /// Structure a workflow far enough to answer the five questions above.
@@ -183,7 +230,7 @@ fn indent_of(line: &str) -> usize {
 /// failure direction is a guard that refuses a workflow it did not
 /// understand, which is loud, rather than one that approves it.
 fn parse_workflow(text: &str) -> Workflow {
-    let mut triggers = String::new();
+    let mut triggers: Vec<String> = Vec::new();
     let mut jobs: Vec<Job> = Vec::new();
 
     let lines: Vec<&str> = text.lines().collect();
@@ -191,18 +238,44 @@ fn parse_workflow(text: &str) -> Workflow {
     // The `on:` block, taken verbatim up to the next top-level key.
     while i < lines.len() {
         let l = lines[i];
-        if l.starts_with("on:") {
-            triggers.push_str(l);
-            triggers.push('\n');
+        if indent_of(l) == 0 && key_of(l).as_deref() == Some("on") {
+            // `on: push` and `on: [push, pull_request]` both put the
+            // triggers on this line.
+            if let Some((_, after)) = without_comment(l).split_once(':') {
+                let after = after.trim();
+                let inner = after
+                    .strip_prefix('[')
+                    .and_then(|a| a.strip_suffix(']'))
+                    .unwrap_or(after);
+                for name in inner.split(',') {
+                    let name = name.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+                    if !name.is_empty() {
+                        triggers.push(name.to_string());
+                    }
+                }
+            }
             i += 1;
             while i < lines.len() && (lines[i].trim().is_empty() || indent_of(lines[i]) > 0) {
-                triggers.push_str(lines[i]);
-                triggers.push('\n');
+                let line = without_comment(lines[i]);
+                // A trigger is a key -- or a `- name` item -- at the
+                // block's own indent. Anything deeper belongs to a
+                // trigger's own options (`branches:`, `types:`) and is
+                // not itself a trigger.
+                if indent_of(line) == 2 {
+                    if let Some(k) = key_of(line) {
+                        triggers.push(k);
+                    } else if let Some(item) = line.trim().strip_prefix("- ") {
+                        let item = item.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+                        if !item.is_empty() {
+                            triggers.push(item.to_string());
+                        }
+                    }
+                }
                 i += 1;
             }
             continue;
         }
-        if l.starts_with("jobs:") {
+        if indent_of(l) == 0 && key_of(l).as_deref() == Some("jobs") {
             i += 1;
             break;
         }
@@ -220,7 +293,7 @@ fn parse_workflow(text: &str) -> Workflow {
         if ind == 0 {
             break; // another top-level key; jobs are done
         }
-        if ind != 2 || !line.trim_end().ends_with(':') {
+        if ind != 2 || !without_comment(line).trim_end().ends_with(':') {
             i += 1;
             continue;
         }
@@ -237,11 +310,11 @@ fn parse_workflow(text: &str) -> Workflow {
             }
             let t = l.trim_start();
             if indent_of(l) == 4 && !t.starts_with('#') && !t.starts_with('-') {
-                if let Some(key) = t.split(':').next() {
-                    job.keys.push(key.trim().to_string());
+                if let Some(key) = key_of(l) {
+                    job.keys.push(key);
                 }
             }
-            if indent_of(l) == 4 && t.starts_with("steps:") {
+            if indent_of(l) == 4 && key_of(l).as_deref() == Some("steps") {
                 i += 1;
                 // Steps: list items at some indent > 4.
                 let mut item_indent: Option<usize> = None;
@@ -270,8 +343,8 @@ fn parse_workflow(text: &str) -> Workflow {
                             let mut cur = st.trim_start_matches("- ").to_string();
                             let mut in_run = false;
                             loop {
-                                let key = cur.split(':').next().unwrap_or("").trim().to_string();
-                                if !key.is_empty() && !key.starts_with('#') {
+                                let key = key_of(&cur).unwrap_or_default();
+                                if !key.is_empty() {
                                     step.keys.push(key.clone());
                                 }
                                 if key == "run" {
@@ -331,8 +404,19 @@ fn parse_workflow(text: &str) -> Workflow {
 }
 
 /// Does this workflow still run on a pull request at all?
+///
+/// Matched against the parsed trigger NAMES, whole. A substring search
+/// over the `on:` block's raw text said yes to `pull_request_review:`
+/// -- which fires on reviews, not on pull requests -- and to a
+/// `pull_request` inside a comment, including the comment left behind
+/// when the real key is commented out.
+///
+/// `pull_request_target` counts, deliberately: it runs on pull
+/// requests, so a workflow using it does gate them.
 fn runs_on_pull_request(wf: &Workflow) -> bool {
-    wf.triggers.contains("pull_request")
+    wf.triggers
+        .iter()
+        .any(|t| t == "pull_request" || t == "pull_request_target")
 }
 
 /// Keys whose presence on a step or job means its result does not gate.
@@ -1127,5 +1211,142 @@ jobs:
             "a command inside a `run: |` block must be seen; the kernel-gate loops live in \
              blocks like this one"
         );
+    }
+
+    /// THE DEFEAT THIS TRIGGER CHECK WAS FILED FOR (#80). Commenting
+    /// the key out is how PR CI actually gets disabled -- while a
+    /// flaky runner is investigated, say -- and the comment left
+    /// behind still contains the word, so a substring search over the
+    /// block's raw text answered yes. Both shapes below left all 34
+    /// tests green while `ci.yml` no longer ran on pull requests.
+    #[test]
+    fn a_commented_out_pull_request_key_is_not_a_trigger() {
+        for on_block in [
+            "  # pull_request:\n  #   branches: [main]\n",
+            "  # pull_request disabled while we investigate flaky runners\n  \
+             push:\n    branches: [main]\n",
+        ] {
+            let yaml = GATING.replace("  pull_request:\n    branches: [main]\n", on_block);
+            assert!(
+                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                "this workflow no longer runs on a pull request, so its step gates \
+                 nothing; the word surviving in a comment is not the trigger"
+            );
+        }
+    }
+
+    /// A trigger whose name merely BEGINS with the one being looked
+    /// for. It fires on reviews, not on pull requests, so a workflow
+    /// carrying only this one gates no pull request.
+    #[test]
+    fn pull_request_review_is_not_pull_request() {
+        let yaml = GATING.replace(
+            "  pull_request:\n    branches: [main]\n",
+            "  pull_request_review:\n    types: [submitted]\n",
+        );
+        assert!(
+            gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+            "`pull_request_review` contains `pull_request` and is not it"
+        );
+    }
+
+    /// And the one that IS a pull-request trigger under another name,
+    /// so the whole-name match is not merely tighter than the
+    /// substring it replaced -- it is right in both directions.
+    #[test]
+    fn pull_request_target_is_a_pull_request_trigger() {
+        let yaml = GATING.replace("  pull_request:\n", "  pull_request_target:\n");
+        assert_eq!(
+            gating_runs_that_prove_the_build_traps(&yaml).len(),
+            1,
+            "`pull_request_target` runs on pull requests, so a workflow using it gates them"
+        );
+    }
+
+    /// The flow spelling puts the triggers on the `on:` line itself,
+    /// where a parser looking only at indented keys below it finds
+    /// none and reports a workflow that gates nothing.
+    #[test]
+    fn a_flow_sequence_of_triggers_is_read() {
+        let yaml = GATING.replace(
+            "on:\n  pull_request:\n    branches: [main]\n",
+            "on: [push, pull_request]\n",
+        );
+        assert_eq!(
+            gating_runs_that_prove_the_build_traps(&yaml).len(),
+            1,
+            "`on: [push, pull_request]` is the same trigger written another way"
+        );
+    }
+
+    /// A comment after the JOB's key must not hide the job. This is
+    /// the direction comment-stripping is actually load-bearing in:
+    /// a job is recognised by its line ending in `:`, and a trailing
+    /// comment ends it in something else, so the job -- and every step
+    /// in it -- disappears and the guard reports that nothing gates. A
+    /// commented-out key needs no stripping to be rejected, because the
+    /// `#` stays glued to the name and `# pull_request` is not
+    /// `pull_request`; this is the case that does.
+    #[test]
+    fn a_trailing_comment_on_the_job_line_does_not_hide_the_job() {
+        let yaml = GATING.replace("  test:\n", "  test: # the only job in this workflow\n");
+        assert_eq!(
+            gating_runs_that_prove_the_build_traps(&yaml).len(),
+            1,
+            "the job is still a job, and its gating step still gates"
+        );
+    }
+
+    /// A comment AFTER a live key does not remove the key.
+    #[test]
+    fn a_trailing_comment_does_not_disable_a_live_trigger() {
+        let yaml = GATING.replace(
+            "  pull_request:\n",
+            "  pull_request: # keep this until the runners settle\n",
+        );
+        assert_eq!(
+            gating_runs_that_prove_the_build_traps(&yaml).len(),
+            1,
+            "stripping comments must not also strip the key they trail"
+        );
+    }
+
+    /// THE SAME NORMALISATION FAILURE IN A DIFFERENT ALPHABET. GitHub
+    /// Actions honours `"if": false` exactly as `if: false`, and a raw
+    /// compare against `if` matches neither -- so the step that does
+    /// not gate was counted as one that does, which is precisely what
+    /// the unquoted spellings were fixed for.
+    #[test]
+    fn a_quoted_non_gating_key_on_the_step_still_does_not_gate() {
+        for spelling in [
+            "\"if\": false",
+            "'if': false",
+            "\"continue-on-error\": true",
+            "'continue-on-error': true",
+        ] {
+            let yaml = GATING.replace(
+                "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+                &format!(
+                    "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n        {spelling}\n"
+                ),
+            );
+            assert!(
+                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                "`{spelling}` is the same key as its bare spelling, and the step carrying \
+                 it may not run or may have its failure discarded"
+            );
+        }
+    }
+
+    /// And on the job, which is the other half the guard reads.
+    #[test]
+    fn a_quoted_non_gating_key_on_the_job_still_does_not_gate() {
+        for spelling in ["\"if\": false", "'continue-on-error': true"] {
+            let yaml = GATING.replace("  test:\n", &format!("  test:\n    {spelling}\n"));
+            assert!(
+                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                "`{spelling}` on the job decides whether every step in it runs"
+            );
+        }
     }
 }
