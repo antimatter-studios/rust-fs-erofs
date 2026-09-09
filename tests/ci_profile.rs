@@ -43,6 +43,7 @@
 //! library target the debug step builds, and inline there is no
 //! declaration to lose.
 
+use saphyr::{LoadableYamlNode, Yaml};
 use std::path::{Path, PathBuf};
 
 fn manifest_dir() -> PathBuf {
@@ -74,18 +75,23 @@ fn read_or_panic(path: &Path) -> String {
     })
 }
 
-/// Every `cargo test` invocation in a workflow that would be compiled
-/// with overflow checks on.
+/// Every `cargo test` invocation in a shell script that would be
+/// compiled with overflow checks on.
 ///
-/// Four things disqualify a line, and each one is a way the guard could
-/// otherwise be satisfied by something that does not actually build in
-/// debug:
+/// The argument is the SHELL text of one step's `run:`, not YAML.
+/// [`parse_workflow`] has already turned the workflow into a structure,
+/// so a YAML comment can no longer reach this function at all -- that
+/// half of the old scan is now the parser's job, by construction.
 ///
-/// - it is a YAML comment. This is not defensive here, it is load
-///   bearing: `ci.yml` quotes `cargo test --locked --lib` verbatim
-///   inside the comment block that explains the step, so a scan that
-///   ignored comments would still find it after the step itself had
-///   been deleted, and would pass;
+/// The `#` handling below is still load bearing, because what does
+/// reach here is shell, and shell has comments of its own inside a
+/// `run: |` block.
+///
+/// Four things disqualify a command, and each one is a way the guard
+/// could otherwise be satisfied by something that does not actually
+/// build in debug:
+///
+/// - it is a shell comment;
 /// - it is an inline trailing comment on an otherwise-`--release` line;
 /// - it passes `--release`, or names a profile explicitly;
 /// - it sets a `CARGO_PROFILE_*` variable, which can turn overflow
@@ -95,8 +101,8 @@ fn read_or_panic(path: &Path) -> String {
 /// repository's `validate-mkfs-bin` job, is not a `cargo test` and is
 /// not considered; the `fsck.erofs` steps beside it invoke no cargo at
 /// all.
-fn runs_with_overflow_checks(workflow: &str) -> Vec<String> {
-    workflow
+fn runs_with_overflow_checks(script: &str) -> Vec<String> {
+    script
         .lines()
         .filter_map(|raw| {
             let line = raw.trim_start();
@@ -152,8 +158,41 @@ fn runs_with_overflow_checks(workflow: &str) -> Vec<String> {
 /// can be split out; a guard that tries to interpret conditions is a
 /// guard with a new defeat every time GitHub adds syntax.
 ///
-/// A `run:` whose value is a `|` block is joined into one string, so a
-/// command inside a shell loop is seen whole rather than as fragments.
+/// # Why this is parsed and no longer scanned
+///
+/// The version this replaces hand-rolled the YAML: `.lines()`, an
+/// indent count, `split_once(':')` for the key, and `after != "|"` for
+/// a block scalar. It was defeated three more times after the five
+/// spellings above, and each defeat was the same shape -- ordinary
+/// YAML the scanner had not been taught:
+///
+/// ```text
+///   "if": false               quoted key -- matched no NON_GATING_KEYS
+///                             entry, so the step counted as gating
+///                             while Actions skipped it. SILENT.
+///   "continue-on-error": true same.
+///   # pull_request:           a substring match over the `on:` block's
+///                             raw text, comments included, so
+///                             commenting the trigger out left the
+///                             guard green. SILENT.
+///   run: |-  / run: >         only a bare `|` opened a block, so every
+///                             other legal style was read as the
+///                             command itself and the block's contents
+///                             never parsed. LOUD -- it failed a
+///                             correct workflow.
+/// ```
+///
+/// Quoted keys, block scalar styles, comments and nested mappings are
+/// not edge cases; they are the grammar. A parser handles all of them
+/// by construction, and does not need to be taught the next one. The
+/// sibling `rust-fs-xfs` copy patched each hole individually and its
+/// own comments record the cost: the identical quote-normalisation was
+/// added to its TOML key scan, and then had to be added again, a few
+/// dozen lines away, to its YAML key scan. The same lesson twice in one
+/// file is the argument against learning it a third time.
+///
+/// `saphyr` is a dev-dependency, so nothing here reaches a consumer of
+/// the crate.
 #[derive(Debug)]
 struct Step {
     keys: Vec<String>,
@@ -168,249 +207,196 @@ struct Job {
 
 #[derive(Debug)]
 struct Workflow {
-    triggers: String,
+    triggers: Vec<String>,
     jobs: Vec<Job>,
 }
 
-fn indent_of(line: &str) -> usize {
-    line.len() - line.trim_start().len()
+/// The value of `name` in a YAML mapping, or `None`.
+///
+/// By name rather than by constructing a key, because `saphyr`'s `Yaml`
+/// borrows the source text and building one to hand to `get` is more
+/// ceremony than the lookup is worth here.
+fn field<'a, 'b>(node: &'a Yaml<'b>, name: &str) -> Option<&'a Yaml<'b>> {
+    node.as_mapping()?
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(name))
+        .map(|(_, value)| value)
+}
+
+/// The keys of a YAML mapping, as plain strings.
+///
+/// The parser has already resolved the quoting, so `"if"`, `'if'` and
+/// `if` all arrive here as `if`. That is the whole of the quoted-key
+/// fix: there is no un-quoting step to forget.
+fn keys_of(node: &Yaml) -> Vec<String> {
+    node.as_mapping()
+        .map(|mapping| {
+            mapping
+                .iter()
+                .filter_map(|(key, _)| key.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Structure a workflow far enough to answer the five questions above.
 ///
-/// Deliberately conservative: anything this cannot place confidently is
-/// left out, so an unparsed step is a step that does not count. The
-/// failure direction is a guard that refuses a workflow it did not
-/// understand, which is loud, rather than one that approves it.
+/// Panics on a workflow it cannot parse, deliberately. A guard that
+/// returned an empty `Workflow` for a file it did not understand would
+/// report "no debug run gates this" -- which is a failure, so that
+/// direction is safe -- but a guard that returned early with a PASS
+/// would be the blindness this module exists to prevent. Failing on the
+/// parse error names the real problem instead of a consequence of it.
 fn parse_workflow(text: &str) -> Workflow {
-    let mut triggers = String::new();
-    let mut jobs: Vec<Job> = Vec::new();
-
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0usize;
-    // The `on:` block, taken verbatim up to the next top-level key.
-    while i < lines.len() {
-        let l = lines[i];
-        if l.starts_with("on:") {
-            triggers.push_str(l);
-            triggers.push('\n');
-            i += 1;
-            while i < lines.len() && (lines[i].trim().is_empty() || indent_of(lines[i]) > 0) {
-                triggers.push_str(lines[i]);
-                triggers.push('\n');
-                i += 1;
-            }
-            continue;
-        }
-        if l.starts_with("jobs:") {
-            i += 1;
-            break;
-        }
-        i += 1;
-    }
-
-    // Jobs: each is a key at indent 2 under `jobs:`.
-    while i < lines.len() {
-        let line = lines[i];
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            i += 1;
-            continue;
-        }
-        let ind = indent_of(line);
-        if ind == 0 {
-            break; // another top-level key; jobs are done
-        }
-        if ind != 2 || !line.trim_end().ends_with(':') {
-            i += 1;
-            continue;
-        }
-        // A job. Collect its keys and steps until the next indent-2 key.
-        let mut job = Job {
-            keys: Vec::new(),
-            steps: Vec::new(),
+    let documents = Yaml::load_from_str(text).unwrap_or_else(|e| {
+        panic!(
+            "workflow is not valid YAML: {e}. This guard reads the workflow \
+             rather than scanning its text, so a file it cannot parse is a \
+             failure and never a pass."
+        )
+    });
+    let Some(document) = documents.first() else {
+        return Workflow {
+            triggers: Vec::new(),
+            jobs: Vec::new(),
         };
-        i += 1;
-        while i < lines.len() {
-            let l = lines[i];
-            if !l.trim().is_empty() && indent_of(l) <= 2 && !l.trim_start().starts_with('#') {
-                break;
-            }
-            let t = l.trim_start();
-            if indent_of(l) == 4 && !t.starts_with('#') && !t.starts_with('-') {
-                if let Some(key) = t.split(':').next() {
-                    job.keys.push(key.trim().to_string());
-                }
-            }
-            if indent_of(l) == 4 && t.starts_with("steps:") {
-                i += 1;
-                // Steps: list items at some indent > 4.
-                let mut item_indent: Option<usize> = None;
-                while i < lines.len() {
-                    let sl = lines[i];
-                    if !sl.trim().is_empty()
-                        && indent_of(sl) <= 4
-                        && !sl.trim_start().starts_with('#')
-                    {
-                        break;
-                    }
-                    let st = sl.trim_start();
-                    if st.starts_with("- ") {
-                        let this_indent = indent_of(sl);
-                        if item_indent.is_none() {
-                            item_indent = Some(this_indent);
-                        }
-                        if Some(this_indent) == item_indent {
-                            // A new step. Its keys sit at this_indent + 2.
-                            let key_indent = this_indent + 2;
-                            let mut step = Step {
-                                keys: Vec::new(),
-                                run: String::new(),
-                            };
-                            // First key is on the `- ` line itself.
-                            let mut cur = st.trim_start_matches("- ").to_string();
-                            let mut in_run = false;
-                            loop {
-                                let key = cur.split(':').next().unwrap_or("").trim().to_string();
-                                if !key.is_empty() && !key.starts_with('#') {
-                                    step.keys.push(key.clone());
-                                }
-                                if key == "run" {
-                                    in_run = true;
-                                    let after =
-                                        cur.split_once(':').map(|x| x.1).unwrap_or("").trim();
-                                    if after != "|" && !after.is_empty() {
-                                        step.run.push_str(after);
-                                        step.run.push('\n');
-                                        in_run = false;
-                                    }
-                                } else if in_run {
-                                    in_run = false;
-                                }
-                                i += 1;
-                                if i >= lines.len() {
-                                    break;
-                                }
-                                let nl = lines[i];
-                                if nl.trim().is_empty() {
-                                    if in_run {
-                                        continue;
-                                    }
-                                    continue;
-                                }
-                                let ni = indent_of(nl);
-                                let nt = nl.trim_start();
-                                if ni <= this_indent && !nt.starts_with('#') {
-                                    break; // next step or end of steps
-                                }
-                                if in_run && ni > key_indent {
-                                    step.run.push_str(nt);
-                                    step.run.push('\n');
-                                    continue;
-                                }
-                                if ni == key_indent && !nt.starts_with('#') {
-                                    cur = nt.to_string();
-                                    continue;
-                                }
-                                // Anything else (comments, deeper mapping
-                                // under a non-run key) is skipped.
-                            }
-                            job.steps.push(step);
-                            continue;
-                        }
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            i += 1;
+    };
+
+    // `on:` takes three legal shapes: a mapping of trigger names, a
+    // sequence of them, or a single scalar. All three are names.
+    //
+    // Note that `on` survives as the string key `on` and is not folded
+    // into the boolean `true` -- saphyr implements the YAML 1.2 core
+    // schema, where only `true`/`false` are booleans. The YAML 1.1
+    // reading that would break every GitHub workflow ever written does
+    // not apply.
+    let triggers = match field(document, "on") {
+        Some(on) if on.as_mapping().is_some() => keys_of(on),
+        Some(on) if on.as_sequence().is_some() => on
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        Some(on) => on.as_str().map(str::to_string).into_iter().collect(),
+        None => Vec::new(),
+    };
+
+    let mut jobs = Vec::new();
+    if let Some(mapping) = field(document, "jobs").and_then(Yaml::as_mapping) {
+        for (_, body) in mapping.iter() {
+            let steps = field(body, "steps")
+                .and_then(Yaml::as_sequence)
+                .into_iter()
+                .flatten()
+                .map(|step| Step {
+                    keys: keys_of(step),
+                    // A `run:` block of any style -- `|`, `|-`, `|+`,
+                    // `>`, `>-`, `|2` -- arrives as one string with the
+                    // block folded per its own rules, so a command
+                    // inside a shell loop is seen whole rather than as
+                    // fragments, and no style is mistaken for the
+                    // command itself.
+                    run: field(step, "run")
+                        .and_then(Yaml::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .collect();
+            jobs.push(Job {
+                keys: keys_of(body),
+                steps,
+            });
         }
-        jobs.push(job);
     }
 
     Workflow { triggers, jobs }
 }
 
 /// Does this workflow still run on a pull request at all?
+///
+/// A whole-name comparison against the parsed trigger keys. The version
+/// this replaces asked `wf.triggers.contains("pull_request")` of the
+/// `on:` block's raw text -- comments and blank lines included -- so
+/// the word appearing anywhere in it satisfied the guard. Commenting
+/// the real key out, or deleting it and leaving a comment naming it,
+/// left `ci.yml` no longer running on pull requests at all with the
+/// guard still green.
+///
+/// `pull_request_target` DELIBERATELY DOES NOT COUNT, and the omission
+/// is the point rather than an oversight. It runs against the base
+/// repository with a write token and the repository's secrets, and it
+/// checks out the base ref by default -- so a workflow triggered only
+/// that way may never build the contributor's code at all, and
+/// accepting it as proof the merge is gated is permissive in the worst
+/// direction. `rust-fs-xfs#146` and `rust-fs-ext4#149` record it as a
+/// live gap in the hand-rolled guard this file replaces, where the
+/// clause was written by hand and then copied between repositories.
+///
+/// A parser has no opinion about `pull_request_target` unless someone
+/// writes one. So it is not written. If this repository ever needs it
+/// accepted, that is a decision with its own justification, and it
+/// comes with a check that the checkout selects the pull request head.
 fn runs_on_pull_request(wf: &Workflow) -> bool {
-    wf.triggers.contains("pull_request")
+    wf.triggers.iter().any(|t| t == "pull_request")
 }
 
 /// Keys whose presence on a step or job means its result does not gate.
 const NON_GATING_KEYS: [&str; 2] = ["if", "continue-on-error"];
 
-/// The run commands of steps that run in debug AND actually gate a
-/// pull request -- without requiring the handshake.
+/// Walk a workflow's steps and collect what `select` finds in each
+/// `run:`.
 ///
-/// The headline assertion used the line-based scan while only the
-/// handshake assertion was step-aware, so under `if: false` the
-/// headline PASSED and its failure message would have claimed the
-/// pull-request gate could see an overflow when the step it names does
-/// not run. Every defeat spelling still turned the suite red through
-/// the other assertion, so this was a precision defect rather than a
-/// hole -- but it left the "runs without --release" property verified
-/// line-based, and defeatable if the handshake assertion were ever
-/// weakened. Both halves are step-aware now. Found on the sibling
-/// `rust-fs-btrfs` copy of this guard; this repository's copy was
-/// merged before the correction existed, which is what
-/// rust-fs-erofs#76 tracks.
-fn gating_runs_with_overflow_checks(workflow: &str) -> Vec<String> {
+/// `gating` restricts the walk to steps whose result the pull-request
+/// gate actually reads: the workflow must still trigger on a pull
+/// request, and neither the job nor the step may carry a key from
+/// [`NON_GATING_KEYS`].
+///
+/// One walk rather than two. The headline assertion used the line-based
+/// scan while only the handshake assertion was step-aware, so under
+/// `if: false` the headline PASSED and its failure message would have
+/// claimed the pull-request gate could see an overflow when the step it
+/// names does not run. Every defeat spelling still turned the suite red
+/// through the other assertion, so this was a precision defect rather
+/// than a hole -- but it left the "runs without --release" property
+/// verified line-based, and defeatable if the handshake assertion were
+/// ever weakened. Both halves share this walk now and cannot drift
+/// apart again. Found on the sibling `rust-fs-btrfs` copy of this
+/// guard; this repository's copy was merged before the correction
+/// existed, which is what rust-fs-erofs#76 tracked.
+fn scan_steps(workflow: &str, gating: bool, select: fn(&str) -> Vec<String>) -> Vec<String> {
     let wf = parse_workflow(workflow);
-    if !runs_on_pull_request(&wf) {
+    if gating && !runs_on_pull_request(&wf) {
         return Vec::new();
     }
+    let carries_a_non_gating_key =
+        |keys: &[String]| keys.iter().any(|k| NON_GATING_KEYS.contains(&k.as_str()));
+
     let mut out = Vec::new();
     for job in &wf.jobs {
-        if job
-            .keys
-            .iter()
-            .any(|k| NON_GATING_KEYS.contains(&k.as_str()))
-        {
+        if gating && carries_a_non_gating_key(&job.keys) {
             continue;
         }
         for step in &job.steps {
-            if step
-                .keys
-                .iter()
-                .any(|k| NON_GATING_KEYS.contains(&k.as_str()))
-            {
+            if gating && carries_a_non_gating_key(&step.keys) {
                 continue;
             }
-            out.extend(runs_with_overflow_checks(&step.run));
+            out.extend(select(&step.run));
         }
     }
     out
 }
 
+/// The run commands of steps that run in debug AND actually gate a
+/// pull request -- without requiring the handshake.
+fn gating_runs_with_overflow_checks(workflow: &str) -> Vec<String> {
+    scan_steps(workflow, true, runs_with_overflow_checks)
+}
+
 /// The run commands of steps that both cover the library in debug with
 /// the handshake AND actually gate a pull request.
 fn gating_runs_that_prove_the_build_traps(workflow: &str) -> Vec<String> {
-    let wf = parse_workflow(workflow);
-    if !runs_on_pull_request(&wf) {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for job in &wf.jobs {
-        if job
-            .keys
-            .iter()
-            .any(|k| NON_GATING_KEYS.contains(&k.as_str()))
-        {
-            continue;
-        }
-        for step in &job.steps {
-            if step
-                .keys
-                .iter()
-                .any(|k| NON_GATING_KEYS.contains(&k.as_str()))
-            {
-                continue;
-            }
-            for command in debug_runs_that_prove_the_build_traps(&step.run) {
-                out.push(command);
-            }
-        }
-    }
-    out
+    scan_steps(workflow, true, debug_runs_that_prove_the_build_traps)
 }
 
 /// The debug runs that ask the build to prove it traps an overflow.
@@ -425,8 +411,8 @@ fn gating_runs_that_prove_the_build_traps(workflow: &str) -> Vec<String> {
 /// a step is a misconfiguration and it fails loudly rather than
 /// quietly: the checks are legitimately off in release, so the
 /// assertion the handshake arms would fire there every time.
-fn debug_runs_that_prove_the_build_traps(workflow: &str) -> Vec<String> {
-    runs_with_overflow_checks(workflow)
+fn debug_runs_that_prove_the_build_traps(script: &str) -> Vec<String> {
+    runs_with_overflow_checks(script)
         .into_iter()
         .filter(|command| command.contains("EXPECT_OVERFLOW_CHECKS=1"))
         .collect()
@@ -528,17 +514,22 @@ jobs:
       - run: cargo test --locked --all-targets -- --ignored
 ";
     assert_eq!(
-        runs_with_overflow_checks(release_yml_as_it_is),
+        scan_steps(release_yml_as_it_is, false, runs_with_overflow_checks),
         vec![
-            "- run: cargo test --locked --all-targets".to_string(),
-            "- run: cargo test --locked --all-targets -- --ignored".to_string(),
+            "cargo test --locked --all-targets".to_string(),
+            "cargo test --locked --all-targets -- --ignored".to_string(),
         ],
         "release.yml's real steps ARE debug runs -- the parser counts them, \
          and the only reason they do not satisfy the guard is that the guard \
          never opens that file"
     );
     assert!(
-        debug_runs_that_prove_the_build_traps(release_yml_as_it_is).is_empty(),
+        scan_steps(
+            release_yml_as_it_is,
+            false,
+            debug_runs_that_prove_the_build_traps
+        )
+        .is_empty(),
         "release.yml carries no handshake, and is not asked to"
     );
 
@@ -549,9 +540,13 @@ jobs:
       - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --all-targets
 ";
     assert_eq!(
-        debug_runs_that_prove_the_build_traps(release_yml_with_a_handshake),
-        vec!["- run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --all-targets".to_string()],
-        "the parser itself would count this line too -- so widening the scan \
+        scan_steps(
+            release_yml_with_a_handshake,
+            false,
+            debug_runs_that_prove_the_build_traps
+        ),
+        vec!["EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --all-targets".to_string()],
+        "the parser itself would count this step too -- so widening the scan \
          to every workflow would silently stop catching this repository's \
          actual defect"
     );
@@ -559,7 +554,7 @@ jobs:
     // And the real guards must be reading ci.yml, not one of these.
     let scanned = read_or_panic(&ci_yml());
     assert!(
-        !debug_runs_that_prove_the_build_traps(&scanned).is_empty(),
+        !gating_runs_that_prove_the_build_traps(&scanned).is_empty(),
         "the guards above must be satisfied by ci.yml's own content, not by \
          any of the strings in this test"
     );
@@ -682,27 +677,32 @@ fn the_profile_that_cargo_test_builds_still_checks_for_overflow() {
     );
 }
 
-/// The workflow parser is the part of this that can rot, so it is
-/// checked against each shape it has to tell apart.
-mod parser {
+/// The shell scanner is the part of this that can rot, so it is checked
+/// against each shape it has to tell apart.
+///
+/// Its argument is the shell text of one step's `run:`, not YAML. What
+/// used to be tested here as YAML -- a debug command quoted in a `#`
+/// line of the workflow -- moved to `gating`, because the parser now
+/// answers it by construction and this function never sees it.
+mod shell_scan {
     use super::runs_with_overflow_checks;
 
-    /// The trap this repository actually contains. `ci.yml` documents
-    /// the debug step by quoting the command, so the text survives the
-    /// step's deletion.
+    /// The trap this repository actually contains, in the form that
+    /// still reaches this function. `ci.yml` documents the debug step
+    /// by quoting the command, and a `run: |` block can carry the same
+    /// habit in shell comments, where the text survives the command's
+    /// deletion.
     #[test]
-    fn a_debug_run_quoted_in_a_comment_does_not_count() {
-        let quoted_in_a_comment = "\
-jobs:
-  test:
-    steps:
-      # Measured on this branch:
-      #     cargo test --locked --release --lib   ->  EXIT=0
-      #     EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib   ->  EXIT=101
-      - run: cargo test --locked --release
+    fn a_debug_run_quoted_in_a_shell_comment_does_not_count() {
+        let block = "\
+set -euo pipefail
+# Measured on this branch:
+#     cargo test --locked --release --lib   ->  EXIT=0
+#     EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib   ->  EXIT=101
+cargo test --locked --release
 ";
         assert_eq!(
-            runs_with_overflow_checks(quoted_in_a_comment),
+            runs_with_overflow_checks(block),
             Vec::<String>::new(),
             "a debug command quoted inside a comment is documentation, not a run"
         );
@@ -710,24 +710,21 @@ jobs:
 
     #[test]
     fn a_real_debug_run_counts() {
-        let with_the_step = "\
-jobs:
-  test:
-    steps:
-      - run: cargo test --locked --release
-      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+        let block = "\
+cargo test --locked --release
+EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
 ";
         assert_eq!(
-            runs_with_overflow_checks(with_the_step),
-            vec!["- run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib".to_string()],
+            runs_with_overflow_checks(block),
+            vec!["EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib".to_string()],
         );
     }
 
-    /// A step whose command is `--release` but which carries a trailing
+    /// A command that is `--release` but which carries a trailing
     /// comment mentioning the debug run.
     #[test]
     fn a_trailing_comment_does_not_promote_a_release_run() {
-        let inline = "      - run: cargo test --locked --release  # not cargo test --lib\n";
+        let inline = "cargo test --locked --release  # not cargo test --lib\n";
         assert_eq!(
             runs_with_overflow_checks(inline),
             Vec::<String>::new(),
@@ -742,10 +739,10 @@ jobs:
     /// debug run while one is sitting in front of it.
     #[test]
     fn a_trailing_comment_naming_release_does_not_disqualify_a_debug_run() {
-        let line = "      - run: cargo test --locked --lib  # deliberately not --release\n";
+        let line = "cargo test --locked --lib  # deliberately not --release\n";
         assert_eq!(
             runs_with_overflow_checks(line),
-            vec!["- run: cargo test --locked --lib".to_string()],
+            vec!["cargo test --locked --lib".to_string()],
             "the command is a debug run; --release appears only in its comment"
         );
     }
@@ -755,9 +752,9 @@ jobs:
     #[test]
     fn a_profile_named_another_way_does_not_count() {
         let lines = [
-            "      - run: cargo test --locked --profile release-with-debug --lib",
-            "      - run: CARGO_PROFILE_TEST_OVERFLOW_CHECKS=false cargo test --locked --lib",
-            "      - run: CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false cargo test --locked --lib",
+            "cargo test --locked --profile release-with-debug --lib",
+            "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=false cargo test --locked --lib",
+            "CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false cargo test --locked --lib",
         ];
         for line in lines {
             assert_eq!(
@@ -776,16 +773,13 @@ jobs:
     /// `cargo build` is not `cargo test`. This repository's
     /// `validate-mkfs-bin` job builds the mkfs binary and then runs
     /// `fsck.erofs` against its output; none of that is a test run, and
-    /// a parser that counted `cargo build --release` lines would be
-    /// looking at the wrong steps entirely.
+    /// a scanner that counted `cargo build --release` would be looking
+    /// at the wrong steps entirely.
     #[test]
     fn a_cargo_build_step_is_not_a_test_run() {
         let validate_job = "\
-jobs:
-  validate-mkfs-bin:
-    steps:
-      - run: cargo build --locked --release --bin mkfs_erofs
-      - run: fsck.erofs --extract=/tmp/extracted /tmp/out.erofs
+cargo build --locked --release --bin mkfs_erofs
+fsck.erofs --extract=/tmp/extracted /tmp/out.erofs
 ";
         assert_eq!(
             runs_with_overflow_checks(validate_job),
@@ -795,16 +789,16 @@ jobs:
     }
 }
 
-/// The handshake half of the workflow parser.
+/// The handshake half of the shell scanner.
 mod handshake {
     use super::debug_runs_that_prove_the_build_traps;
 
     #[test]
     fn a_debug_run_carrying_the_handshake_counts() {
-        let yaml = "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n";
+        let script = "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n";
         assert_eq!(
-            debug_runs_that_prove_the_build_traps(yaml),
-            vec!["- run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib".to_string()],
+            debug_runs_that_prove_the_build_traps(script),
+            vec!["EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib".to_string()],
         );
     }
 
@@ -812,9 +806,9 @@ mod handshake {
     /// compile and no information.
     #[test]
     fn a_debug_run_without_the_handshake_does_not_count() {
-        let yaml = "      - run: cargo test --locked --lib\n";
+        let script = "cargo test --locked --lib\n";
         assert_eq!(
-            debug_runs_that_prove_the_build_traps(yaml),
+            debug_runs_that_prove_the_build_traps(script),
             Vec::<String>::new(),
             "the step is there but nothing checks the build it produced"
         );
@@ -824,20 +818,20 @@ mod handshake {
     /// this: the checks are off in release on purpose.
     #[test]
     fn the_handshake_on_a_release_run_does_not_count() {
-        let yaml = "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --release\n";
+        let script = "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --release\n";
         assert_eq!(
-            debug_runs_that_prove_the_build_traps(yaml),
+            debug_runs_that_prove_the_build_traps(script),
             Vec::<String>::new(),
         );
     }
 
-    /// And quoted inside the comment block that explains it, which is
-    /// where `ci.yml` also mentions it.
+    /// And quoted inside a shell comment, which is where a `run: |`
+    /// block would explain it.
     #[test]
     fn the_handshake_quoted_in_a_comment_does_not_count() {
-        let yaml = "      #     EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n";
+        let script = "#     EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n";
         assert_eq!(
-            debug_runs_that_prove_the_build_traps(yaml),
+            debug_runs_that_prove_the_build_traps(script),
             Vec::<String>::new(),
         );
     }
@@ -1127,5 +1121,208 @@ jobs:
             "a command inside a `run: |` block must be seen; the kernel-gate loops live in \
              blocks like this one"
         );
+    }
+
+    /// THE QUOTED SPELLINGS, WHICH WERE SILENT DEFEATS. Measured on
+    /// `main` at `57cf1b6`: `if: false` correctly turned the suite red,
+    /// and `"if": false` -- the same key, quoted -- left all 34 tests
+    /// green while Actions skipped the step. The old parser took its
+    /// key as `cur.split(':').next()` with no un-quoting, so the key
+    /// read `"if"` and matched no entry in `NON_GATING_KEYS`.
+    ///
+    /// Nothing un-quotes anything now: the key arrives from the parser
+    /// already resolved, so every spelling of it is the same key by
+    /// construction.
+    #[test]
+    fn a_quoted_key_is_the_same_key() {
+        for spelling in [
+            "\"if\": false",
+            "'if': false",
+            "\"continue-on-error\": true",
+            "'continue-on-error': true",
+        ] {
+            let yaml = GATING.replace(
+                "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+                &format!(
+                    "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n        {spelling}\n"
+                ),
+            );
+            assert!(
+                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                "`{spelling}` is the same key as its bare spelling; quoting it must not \
+                 make a skipped step count as the thing gating the merge"
+            );
+        }
+    }
+
+    /// And one level up, on the job.
+    #[test]
+    fn a_quoted_key_on_the_job_is_the_same_key() {
+        for spelling in ["\"if\": false", "\"continue-on-error\": true"] {
+            let yaml = GATING.replace("  test:\n", &format!("  test:\n    {spelling}\n"));
+            assert!(
+                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                "`{spelling}` on the job is the same key as its bare spelling"
+            );
+        }
+    }
+
+    /// THE COMMENTED-OUT TRIGGER, ALSO A SILENT DEFEAT. The old check
+    /// asked whether the `on:` block's raw text -- comments included --
+    /// contained the characters `pull_request`, so commenting the
+    /// trigger out left the guard green on a workflow that no longer
+    /// ran on pull requests at all. Measured on `main`: 34 passed,
+    /// both arms.
+    #[test]
+    fn a_commented_out_pull_request_trigger_does_not_gate() {
+        let commented_with_another_trigger_left = GATING.replace(
+            "  pull_request:\n    branches: [main]\n",
+            "  # pull_request:\n  #   branches: [main]\n  push:\n    branches: [main]\n",
+        );
+        let only_a_comment_naming_it = GATING.replace(
+            "  pull_request:\n    branches: [main]\n",
+            "  # pull_request disabled while we investigate flaky runners\n  push:\n    branches: [main]\n",
+        );
+        for yaml in [
+            &commented_with_another_trigger_left,
+            &only_a_comment_naming_it,
+        ] {
+            assert!(
+                gating_runs_that_prove_the_build_traps(yaml).is_empty(),
+                "a trigger named only in a comment is not a trigger; the parser drops \
+                 comments before anything compares a name, so there is no `#` to strip \
+                 and none to forget:\n{yaml}"
+            );
+        }
+    }
+
+    /// A whole-name comparison, so a trigger that merely begins with
+    /// those characters is a different trigger. `pull_request_review`
+    /// fires on a review, not on the pull request, and cannot be what
+    /// gates the merge.
+    #[test]
+    fn a_trigger_that_merely_begins_with_pull_request_does_not_gate() {
+        let yaml = GATING.replace(
+            "  pull_request:\n    branches: [main]\n",
+            "  pull_request_review:\n    types: [submitted]\n",
+        );
+        assert!(
+            gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+            "pull_request_review is not pull_request; a substring match cannot tell \
+             them apart and this comparison must"
+        );
+    }
+
+    /// `pull_request_target` is not `pull_request`, and is refused on
+    /// purpose. It runs against the base repository with a write token
+    /// and the repository's secrets, and checks out the base ref by
+    /// default, so a workflow triggered only that way may never build
+    /// the contributor's code. `rust-fs-xfs#146` and
+    /// `rust-fs-ext4#149` record it as a live gap in the hand-rolled
+    /// guard this file replaces.
+    ///
+    /// Pinned as a test rather than left to the comparison, because the
+    /// clause is one line and was previously written by hand and copied
+    /// between repositories. This is what stops it coming back.
+    #[test]
+    fn pull_request_target_does_not_gate() {
+        let yaml = GATING.replace(
+            "  pull_request:\n    branches: [main]\n",
+            "  pull_request_target:\n    branches: [main]\n",
+        );
+        assert!(
+            gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+            "pull_request_target runs with the base repository's token and secrets \
+             and checks out the base ref; it is not proof that the merge is gated"
+        );
+    }
+
+    /// `on:` may be a sequence of names rather than a mapping, in
+    /// either the flow or the block spelling, and all three are
+    /// ordinary workflows.
+    #[test]
+    fn a_sequence_of_triggers_is_read() {
+        for spelling in [
+            "on: [push, pull_request]\n",
+            "on:\n  - push\n  - pull_request\n",
+        ] {
+            let yaml = GATING.replace("on:\n  pull_request:\n    branches: [main]\n", spelling);
+            assert_eq!(
+                gating_runs_that_prove_the_build_traps(&yaml).len(),
+                1,
+                "this workflow triggers on a pull request as surely as the mapping \
+                 spelling does:\n{yaml}"
+            );
+        }
+    }
+
+    /// THE ARM THAT WAS A FALSE ALARM RATHER THAN A DEFEAT, AND SO
+    /// CANNOT BE WITNESSED BY THE SUITE GOING RED -- it already did.
+    /// The witness is that legal YAML now passes.
+    ///
+    /// The old parser treated only a bare `|` as a block opener
+    /// (`after != "|"`), so `|-`, `|+`, `>`, `>-` and `|2` were read as
+    /// the command itself and the block's contents never parsed at all.
+    /// Measured on `main`: `run: |` 34 passed, `run: |-` and `run: >`
+    /// each EXIT=101 with 2 failed -- the guard refusing a completely
+    /// correct workflow, which is the fastest way to get a guard
+    /// deleted.
+    ///
+    /// A parser knows all five styles because they are the grammar.
+    #[test]
+    fn every_block_scalar_style_is_read_whole() {
+        for style in ["|", "|-", "|+", ">", ">-", "|2"] {
+            let yaml = GATING.replace(
+                "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+                &format!(
+                    "      - name: a block\n        run: {style}\n          EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n"
+                ),
+            );
+            assert_eq!(
+                gating_runs_that_prove_the_build_traps(&yaml).len(),
+                1,
+                "`run: {style}` is a legal block scalar carrying the gating command; \
+                 failing here is the guard refusing a correct workflow:\n{yaml}"
+            );
+        }
+    }
+
+    /// A command quoted in a YAML comment is not a run. This used to be
+    /// the shell scanner's job and is the parser's now: comments do not
+    /// survive parsing, so there is no `#` handling here to get wrong.
+    /// It is asserted at this level because that is where the property
+    /// now lives -- `ci.yml` really does quote the gating command
+    /// verbatim in the comment block above it, so a scan that missed
+    /// this would stay green after the step itself was deleted.
+    #[test]
+    fn a_debug_run_quoted_in_a_yaml_comment_does_not_gate() {
+        let yaml = "\
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    steps:
+      # Do not remove this as a duplicate of the runs above it:
+      #     - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+      - run: cargo test --locked --release
+";
+        assert!(
+            gating_runs_that_prove_the_build_traps(yaml).is_empty(),
+            "the gating command appears only inside a comment, and the step that \
+             remains is a release run"
+        );
+    }
+
+    /// A workflow the parser cannot read is a failure, never a pass.
+    /// The direction matters: a guard that swallowed the error and
+    /// returned an empty structure would report "no debug run gates
+    /// this", which is also a failure and therefore safe -- but one
+    /// that returned early with a pass would be the blindness this
+    /// whole module exists to refuse.
+    #[test]
+    #[should_panic(expected = "not valid YAML")]
+    fn a_workflow_that_does_not_parse_is_a_failure() {
+        super::parse_workflow("jobs:\n  test:\n   - broken: [unclosed\n");
     }
 }
