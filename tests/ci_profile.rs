@@ -1325,4 +1325,40 @@ jobs:
     fn a_workflow_that_does_not_parse_is_a_failure() {
         super::parse_workflow("jobs:\n  test:\n   - broken: [unclosed\n");
     }
+
+    /// THE CONTROL THAT STOPS THE REFUSAL OVER-CORRECTING.
+    ///
+    /// `pull_request_target` is refused as insufficient ON ITS OWN.
+    /// That is not the same as refusing any workflow that mentions it,
+    /// and until this test existed nothing in the file could tell the
+    /// two apart: every fixture carried at most one trigger, so this
+    /// mutation survived the whole suite --
+    ///
+    /// ```text
+    ///   any(t == "pull_request")
+    ///       && !any(t == "pull_request_target")
+    /// ```
+    ///
+    /// -- while refusing a perfectly gated workflow. Carrying both
+    /// triggers is the ordinary way to reach repository secrets from a
+    /// job without giving up the pull-request gate, and such a workflow
+    /// IS gated, by its `pull_request:` key.
+    ///
+    /// An assertion whose result does not depend on the thing it claims
+    /// to check is this project's own recurring defect; this one was in
+    /// the test pinning the refusal rather than in the refusal itself.
+    #[test]
+    fn a_workflow_carrying_both_triggers_still_gates() {
+        let yaml = GATING.replace(
+            "  pull_request:\n    branches: [main]\n",
+            "  pull_request:\n    branches: [main]\n  pull_request_target:\n    branches: [main]\n",
+        );
+        assert_ne!(yaml, GATING, "the mutation must actually apply");
+        assert_eq!(
+            gating_runs_that_prove_the_build_traps(&yaml).len(),
+            1,
+            "the workflow still triggers on pull_request, so it still gates; refusing it \
+             because pull_request_target is also present would be the over-correction"
+        );
+    }
 }
