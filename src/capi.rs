@@ -601,7 +601,10 @@ pub unsafe extern "C" fn fs_erofs_readlink(
                 set_err_msg("readlink buffer too small", ERANGE);
                 return -1;
             }
-            let dst = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, bufsize) };
+            // `.cast::<u8>()`, not `as *mut u8`: `c_char` is `i8` on x86_64
+            // and Apple targets but `u8` on aarch64-linux, where the `as`
+            // spelling is a same-type cast that clippy refuses (#89).
+            let dst = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), bufsize) };
             dst[..target.len()].copy_from_slice(&target);
             dst[target.len()] = 0;
             0

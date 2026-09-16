@@ -459,5 +459,7 @@ pub fn cchar_field_to_bytes(field: &[std::os::raw::c_char]) -> Vec<u8> {
         .iter()
         .position(|&c| c == 0)
         .expect("C string field is not NUL-terminated");
-    field[..end].iter().map(|&c| c as u8).collect()
+    // `to_ne_bytes`, not `c as u8`: `c_char` is `u8` on aarch64-linux,
+    // where the cast is a same-type cast clippy refuses (#89).
+    field[..end].iter().map(|&c| c.to_ne_bytes()[0]).collect()
 }

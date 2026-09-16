@@ -9,11 +9,24 @@ on:
 
 jobs:
   test:
+    # The job name stays keyed on `os`: branch protection requires the
+    # context `test-ubuntu-latest` by name, and renaming it would leave
+    # that required check permanently pending.
     name: test-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      # One architecture failing must not cancel the other's evidence.
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        # Natively on both, not a cross-target `cargo check`: `c_char` is
+        # signed on x86_64-linux and unsigned on aarch64-linux, so a cast
+        # through it can be real on one and a clippy error on the other
+        # (#89), and only a native run also lints and executes there.
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       # The crate has a path dep on am-fs-core (../rust-fs-core).
@@ -55,7 +68,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --release
