@@ -84,7 +84,7 @@ pub struct DirEntry {
 /// contains `/` -- none of which a directory can legitimately list, and
 /// each of which a consumer of the name would misread.
 pub fn iter_block(block: &[u8]) -> Result<Vec<DirEntry>> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(dirent_count(block)?);
     visit_block(block, |nid, file_type, name| {
         out.push(DirEntry {
             nid,
@@ -95,17 +95,12 @@ pub fn iter_block(block: &[u8]) -> Result<Vec<DirEntry>> {
     Ok(out)
 }
 
-/// The same walk and the same validation as [`iter_block`], handing each
-/// dirent's name to `f` as a borrowed slice instead of an owned copy.
-///
-/// Every entry in the block is validated before this returns `Ok`, so a
-/// caller looking for one name sees exactly the errors a full listing
-/// would, without allocating per entry (#61).
-pub fn visit_block(block: &[u8], mut f: impl FnMut(u64, u8, &[u8])) -> Result<()> {
+/// How many dirents a directory block declares, from the first entry's
+/// name offset, which the dirent array runs up to.
+fn dirent_count(block: &[u8]) -> Result<usize> {
     if block.len() < EROFS_DIRENT_SIZE {
         return Err(Error::BadDirent("block shorter than one dirent"));
     }
-
     let first_nameoff = u16::from_le_bytes(block[8..10].try_into().unwrap()) as usize;
     if first_nameoff < EROFS_DIRENT_SIZE
         || first_nameoff > block.len()
@@ -113,7 +108,26 @@ pub fn visit_block(block: &[u8], mut f: impl FnMut(u64, u8, &[u8])) -> Result<()
     {
         return Err(Error::BadDirent("first nameoff invalid"));
     }
-    let n_dirents = first_nameoff / EROFS_DIRENT_SIZE;
+    Ok(first_nameoff / EROFS_DIRENT_SIZE)
+}
+
+/// The same walk and the same validation as [`iter_block`], handing each
+/// dirent's name to `f` as a borrowed slice instead of an owned copy.
+///
+/// Every entry in the block is validated before this returns `Ok`, so a
+/// caller looking for one name sees exactly the errors a full listing
+/// would, without allocating per entry (#61).
+///
+/// # Partial calls on error
+///
+/// Each entry is handed to `f` as soon as it has been validated, so when
+/// a later entry is malformed `f` has ALREADY run for the valid ones
+/// before it and this returns `Err`. A caller whose callback has effects
+/// beyond its own local state must discard them on error -- which is what
+/// [`iter_block`] and `Filesystem::lookup` do.
+pub fn visit_block(block: &[u8], mut f: impl FnMut(u64, u8, &[u8])) -> Result<()> {
+    let n_dirents = dirent_count(block)?;
+    let first_nameoff = n_dirents * EROFS_DIRENT_SIZE;
 
     for i in 0..n_dirents {
         let off = i * EROFS_DIRENT_SIZE;
