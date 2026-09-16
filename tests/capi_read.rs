@@ -20,7 +20,9 @@ use common::{
     LINK_TARGET, LONG_LINK_TARGET_LEN,
 };
 use fs_erofs::capi::*;
-use std::ffi::{c_void, CString};
+// `c_char`, never `i8`: it is `i8` on x86_64 and Apple targets and `u8`
+// on aarch64-linux, so an `i8` buffer does not compile there (#89).
+use std::ffi::{c_char, c_void, CString};
 
 /// Mount the shared fixture, keeping the image alive for the caller.
 fn mounted() -> (common::TempImage, *mut fs_erofs_fs_t) {
@@ -229,7 +231,7 @@ fn read_file_rejects_null_arguments() {
 #[test]
 fn reads_a_short_symlink_target() {
     let (_img, fs) = mounted();
-    let mut buf = vec![0i8; 256];
+    let mut buf: Vec<c_char> = vec![0; 256];
     let n = unsafe { fs_erofs_readlink(fs, cpath("/link").as_ptr(), buf.as_mut_ptr(), buf.len()) };
     // This ABI returns 0 on success and writes a NUL-terminated target,
     // rather than returning the length.
@@ -244,7 +246,7 @@ fn reads_a_short_symlink_target() {
 #[test]
 fn reads_a_long_symlink_target() {
     let (_img, fs) = mounted();
-    let mut buf = vec![0i8; 512];
+    let mut buf: Vec<c_char> = vec![0; 512];
     let n =
         unsafe { fs_erofs_readlink(fs, cpath("/longlink").as_ptr(), buf.as_mut_ptr(), buf.len()) };
     assert_eq!(n, 0, "readlink failed: {}", capi_last_error());
@@ -264,7 +266,7 @@ fn reads_a_long_symlink_target() {
 #[test]
 fn readlink_refuses_a_buffer_too_small_for_the_target() {
     let (_img, fs) = mounted();
-    let mut buf = vec![0x7Fi8; 5];
+    let mut buf: Vec<c_char> = vec![0x7F; 5];
     let n = unsafe { fs_erofs_readlink(fs, cpath("/link").as_ptr(), buf.as_mut_ptr(), buf.len()) };
     assert_eq!(n, -1, "a target that does not fit must be refused");
     assert_eq!(
@@ -279,7 +281,7 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
 #[test]
 fn readlink_on_a_regular_file_is_refused() {
     let (_img, fs) = mounted();
-    let mut buf = vec![0i8; 64];
+    let mut buf: Vec<c_char> = vec![0; 64];
     let n = unsafe {
         fs_erofs_readlink(
             fs,
@@ -297,7 +299,7 @@ fn readlink_on_a_regular_file_is_refused() {
 fn readlink_rejects_null_and_empty_buffers() {
     let (_img, fs) = mounted();
     let p = cpath("/link");
-    let mut buf = vec![0i8; 8];
+    let mut buf: Vec<c_char> = vec![0; 8];
     unsafe {
         assert_eq!(
             fs_erofs_readlink(std::ptr::null_mut(), p.as_ptr(), buf.as_mut_ptr(), 8),

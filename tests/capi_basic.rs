@@ -233,7 +233,7 @@ fn volume_info_zero_fills_before_writing() {
     // name is NUL-terminated -- an unterminated name would run a C caller
     // off the end of the field.
     assert!(
-        !info.volume_name.iter().any(|&c| c as u8 == 0xAA),
+        !info.volume_name.iter().any(|&c| c.to_ne_bytes()[0] == 0xAA),
         "volume_name kept the caller's fill: {:?}",
         info.volume_name
     );
