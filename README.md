@@ -19,7 +19,7 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 
 | Capability | Status |
 |---|---|
-| Superblock parsing + CRC32C verification | ✅ |
+| Superblock parsing + CRC32C verification (a mismatch refuses the image at open) | ✅ |
 | Compact (32-byte) and extended (64-byte) inodes | ✅ |
 | Layout `FLAT_PLAIN` (contiguous) | ✅ |
 | Layout `FLAT_INLINE` (tail-packed in metadata block) | ✅ |
