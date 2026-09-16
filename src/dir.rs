@@ -80,7 +80,9 @@ pub struct DirEntry {
 ///
 /// Bounds-checked: a malformed `nameoff` (not a multiple of 12, beyond
 /// block end, or before the previous nameoff) returns `BadDirent` rather
-/// than panicking.
+/// than panicking. So does a name that is empty, contains a NUL byte, or
+/// contains `/` -- none of which a directory can legitimately list, and
+/// each of which a consumer of the name would misread.
 pub fn iter_block(block: &[u8]) -> Result<Vec<DirEntry>> {
     if block.len() < EROFS_DIRENT_SIZE {
         return Err(Error::BadDirent("block shorter than one dirent"));
@@ -123,10 +125,28 @@ pub fn iter_block(block: &[u8]) -> Result<Vec<DirEntry>> {
             e
         };
 
+        let name = &block[nameoff..name_end];
+        // The same three names `mkfs::build_image` refuses to write. `.`
+        // and `..` are real on-disk dirents in EROFS and are NOT refused;
+        // the C ABI filters them at its own boundary.
+        if name.is_empty() {
+            return Err(Error::BadDirent("dirent name is empty"));
+        }
+        if name.contains(&0) {
+            // Only reachable for a non-last entry, whose name runs to the
+            // next nameoff; it would reach the C ABI with `name_len`
+            // disagreeing with `strlen(name)`.
+            return Err(Error::BadDirent("dirent name contains a NUL byte"));
+        }
+        if name.contains(&b'/') {
+            // A listed name that composes into a different path.
+            return Err(Error::BadDirent("dirent name contains '/'"));
+        }
+
         out.push(DirEntry {
             nid,
             file_type,
-            name: block[nameoff..name_end].to_vec(),
+            name: name.to_vec(),
         });
     }
     Ok(out)
@@ -182,6 +202,72 @@ pub(crate) mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[2].name, b"hello.txt");
         assert_eq!(entries[2].nid, 42);
+    }
+
+    /// `iter_block` must refuse the name, with the reason naming the rule.
+    fn refused_because(entries: &[(u64, u8, &[u8])], rule: &str) {
+        let buf = synth_dir_block(entries, 4096);
+        match iter_block(&buf) {
+            Err(Error::BadDirent(why)) => assert!(
+                why.contains(rule),
+                "refused, but for {why:?} rather than the {rule:?} rule"
+            ),
+            other => panic!("a dirent name breaking the {rule:?} rule was accepted: {other:?}"),
+        }
+    }
+
+    // #92: an embedded NUL reaches the C ABI with `name_len` disagreeing
+    // with `strlen(name)`. Only a non-last entry can carry one, because
+    // the last entry's name stops at its first NUL.
+    #[test]
+    fn refuses_a_name_containing_a_nul() {
+        refused_because(
+            &[(1, ftype::REG_FILE, b"a\0b"), (2, ftype::REG_FILE, b"z")],
+            "NUL",
+        );
+    }
+
+    // #92: a `/` makes a listed name compose into a different path.
+    #[test]
+    fn refuses_a_name_containing_a_slash() {
+        refused_because(
+            &[(1, ftype::REG_FILE, b"a/b"), (2, ftype::REG_FILE, b"z")],
+            "'/'",
+        );
+        refused_because(
+            &[(1, ftype::REG_FILE, b"z"), (2, ftype::REG_FILE, b"../x")],
+            "'/'",
+        );
+    }
+
+    // #92: `nameoff == next_nameoff` passes the offset checks and yields a
+    // zero-byte name.
+    #[test]
+    fn refuses_an_empty_name() {
+        refused_because(
+            &[(1, ftype::REG_FILE, b""), (2, ftype::REG_FILE, b"z")],
+            "empty",
+        );
+    }
+
+    // The negative control: `.` and `..` are real on-disk dirents in EROFS
+    // (unlike SquashFS), so the content checks must not refuse them.
+    #[test]
+    fn dot_and_dotdot_still_list() {
+        let buf = synth_dir_block(
+            &[
+                (36, ftype::DIR, b"."),
+                (36, ftype::DIR, b".."),
+                (40, ftype::REG_FILE, b"name with spaces.txt"),
+            ],
+            4096,
+        );
+        let names: Vec<Vec<u8>> = iter_block(&buf)
+            .expect("a well-formed directory must list")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, [&b"."[..], b"..", b"name with spaces.txt"]);
     }
 
     #[test]
