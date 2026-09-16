@@ -286,37 +286,102 @@ fn oracle_superblock_basic() {
     assert!(sb.blocks > 0);
 }
 
-/// Run `xattr -w name value path` (macOS) or `setfattr -n name -v value
-/// path` (Linux). Returns true if setting succeeded; false if neither
-/// tool is available or the command failed (the caller should treat
-/// false as "skip, environment unable to set xattrs").
+/// Set an xattr for an oracle test, or report that it cannot be set.
+///
+/// A CANNOT-SET IS A SKIP ON A LAPTOP AND A FAILURE IN CI -- the same
+/// rule `tool_available` in `tests/common/mod.rs` applies to the
+/// erofs-utils binaries (#91). The two xattr oracles are the only
+/// coverage of the shared-xattr area and the custom-prefix dictionary,
+/// and before this they returned early and reported `ok` whenever the
+/// probe failed, CI included: an `attr` package change or a `TMPDIR` on
+/// a mount without user xattrs would have silently switched them off.
 fn set_xattr(path: &std::path::Path, name: &str, value: &str) -> bool {
-    // Try macOS xattr first.
-    if let Ok(out) = std::process::Command::new("xattr")
-        .arg("-w")
-        .arg(name)
-        .arg(value)
-        .arg(path)
-        .output()
-    {
-        if out.status.success() {
-            return true;
+    xattr_outcome(
+        try_set_xattr(path, name, value),
+        std::env::var_os("CI").is_some(),
+    )
+}
+
+/// The decision, separated from the environment so it can be tested.
+fn xattr_outcome(result: Result<(), String>, in_ci: bool) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(why) => {
+            assert!(
+                !in_ci,
+                "cannot set an xattr, and CI is set: {why}. The workflow installs `attr` so \
+                 the xattr oracles run; skipping here would report them as passing having \
+                 checked nothing."
+            );
+            eprintln!("skipping: cannot set xattrs in this environment: {why}");
+            false
         }
     }
-    // Fall back to Linux setfattr.
-    if let Ok(out) = std::process::Command::new("setfattr")
-        .arg("-n")
-        .arg(name)
-        .arg("-v")
-        .arg(value)
-        .arg(path)
-        .output()
-    {
-        if out.status.success() {
-            return true;
+}
+
+/// `xattr -w name value path` (macOS), then `setfattr -n name -v value
+/// path` (Linux). On failure, says what each attempt reported, so a CI
+/// failure carries its cause.
+fn try_set_xattr(path: &std::path::Path, name: &str, value: &str) -> Result<(), String> {
+    let attempts: [(&str, Vec<&std::ffi::OsStr>); 2] = [
+        (
+            "xattr",
+            vec![
+                "-w".as_ref(),
+                name.as_ref(),
+                value.as_ref(),
+                path.as_os_str(),
+            ],
+        ),
+        (
+            "setfattr",
+            vec![
+                "-n".as_ref(),
+                name.as_ref(),
+                "-v".as_ref(),
+                value.as_ref(),
+                path.as_os_str(),
+            ],
+        ),
+    ];
+    let mut reports = Vec::new();
+    for (tool, args) in attempts {
+        match std::process::Command::new(tool).args(&args).output() {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => reports.push(format!(
+                "`{tool}` exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => reports.push(format!("`{tool}` could not run: {e}")),
         }
     }
-    false
+    Err(reports.join("; "))
+}
+
+#[test]
+fn an_xattr_that_cannot_be_set_in_ci_fails_rather_than_skips() {
+    let outcome = std::panic::catch_unwind(|| xattr_outcome(Err("probe failed".into()), true));
+    assert!(
+        outcome.is_err(),
+        "with CI set, an xattr that cannot be set was treated as a skip (#91)"
+    );
+}
+
+#[test]
+fn an_xattr_that_cannot_be_set_on_a_laptop_is_a_skip() {
+    assert!(!xattr_outcome(Err("probe failed".into()), false));
+    assert!(xattr_outcome(Ok(()), true));
+}
+
+#[test]
+fn a_failed_xattr_set_reports_what_each_tool_said() {
+    let missing = std::env::temp_dir().join("erofs-no-such-file-for-xattr-probe");
+    let why = try_set_xattr(&missing, "user.probe", "v").expect_err("the file does not exist");
+    assert!(
+        why.contains("`xattr`") && why.contains("`setfattr`"),
+        "the failure should name both attempts: {why}"
+    );
 }
 
 /// End-to-end: build an image with mkfs.erofs whose files all carry the
@@ -341,12 +406,10 @@ fn oracle_shared_xattrs_round_trip() {
         let p = src.join(name);
         std::fs::write(&p, b"hello\n").expect("write file");
         if !set_xattr(&p, "user.team", "datastore") {
-            eprintln!("skipping: cannot set xattrs in this environment");
             return;
         }
     }
     if !set_xattr(&src.join("f1.txt"), "user.unique", "f1only") {
-        eprintln!("skipping: cannot set xattrs in this environment");
         return;
     }
 
@@ -402,11 +465,9 @@ fn oracle_custom_xattr_prefix_round_trip() {
     let p = src.join("file.txt");
     std::fs::write(&p, b"x").expect("write file");
     if !set_xattr(&p, "user.dataitem.thing", "v1") {
-        eprintln!("skipping: cannot set xattrs in this environment");
         return;
     }
     if !set_xattr(&p, "user.dataitem.other", "v2") {
-        eprintln!("skipping: cannot set xattrs in this environment");
         return;
     }
 

@@ -61,6 +61,11 @@ jobs:
           mkfs.erofs --version | head -1
           fsck.erofs --version | head -1
           dump.erofs --version | head -1
+          # The xattr oracles need setfattr. Verified here as well as in the
+          # tests, which also fail in CI when a set fails for any other
+          # reason (#91). Not piped through `head`: without pipefail the
+          # pipeline's status would be head's, and a missing tool would pass.
+          setfattr --version
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
