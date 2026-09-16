@@ -1,9 +1,10 @@
 //! EROFS directory iteration.
 //!
 //! A directory's data is one or more dir-blocks, each the size of a
-//! filesystem block. `sb.dirblkbits` may be zero (what erofs-utils
-//! writes) or equal to `blkszbits`; `Superblock::parse` refuses any other
-//! value rather than walk directories at the wrong granularity.
+//! filesystem block. `sb.dirblkbits` must be zero (what erofs-utils
+//! writes); `Superblock::parse` refuses any other value, including one
+//! equal to `blkszbits`, rather than walk directories at a granularity
+//! the kernel does not use.
 //! Each block packs:
 //!
 //! ```text
