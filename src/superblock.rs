@@ -479,11 +479,22 @@ pub fn read<R: BlockRead + ?Sized>(dev: &R) -> Result<Superblock> {
     dev.read_at(EROFS_SUPER_OFFSET, &mut buf)?;
     let sb = Superblock::parse(&buf)?;
     if sb.feature_compat & EROFS_FEATURE_COMPAT_SB_CHKSUM != 0 {
-        let mut span = vec![0u8; sb.checksum_span_len()];
+        let mut span = vec![0u8; sb.checksum_span_len().max(EROFS_SUPER_BLOCK_SIZE)];
         dev.read_at(EROFS_SUPER_OFFSET, &mut span)?;
-        if !sb.verify_checksum(&span) {
+        // THE SUPERBLOCK RETURNED IS THE ONE THAT WAS VERIFIED. The span
+        // is a second read, and a device -- a callback, a file changing
+        // underneath -- need not return the same bytes twice: parsing the
+        // first read and checksumming the second accepted altered fields
+        // under an unaltered checksum. So the second read is parsed again
+        // and that parse is what the checksum is checked against.
+        let verified = Superblock::parse(&span[..EROFS_SUPER_BLOCK_SIZE])?;
+        if verified.feature_compat & EROFS_FEATURE_COMPAT_SB_CHKSUM == 0
+            || span.len() != verified.checksum_span_len().max(EROFS_SUPER_BLOCK_SIZE)
+            || !verified.verify_checksum(&span)
+        {
             return Err(Error::BadSuperblock("superblock checksum mismatch"));
         }
+        return Ok(verified);
     }
     Ok(sb)
 }

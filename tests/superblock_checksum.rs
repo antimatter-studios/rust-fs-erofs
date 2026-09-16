@@ -15,7 +15,7 @@
 //! implementation, rather than with this crate's own writer.
 
 mod common;
-use common::{build_with_mkfs_erofs, dir, file, mkfs_erofs_available, MemDev};
+use common::{build_with_mkfs_erofs, dir, file, mkfs_erofs_available, run_mkfs_erofs, MemDev};
 
 use fs_core::BlockRead;
 use fs_erofs::{mkfs, Error, Filesystem};
@@ -128,8 +128,29 @@ fn oracle_every_block_size_verifies_and_damage_is_refused() {
         ("a.txt", file(b"alpha\n")),
         ("sub", dir(vec![("b.txt", file(&[7u8; 9000]))])),
     ]);
+    let mut verified = Vec::new();
     for bs in ["512", "1024", "4096", "16384"] {
         let flag = format!("-b{bs}");
+        // mkfs.erofs refuses a block size above the host's page size --
+        // 16 KiB on a 4 KiB Linux runner, the Apple silicon page size it
+        // is here for. That refusal is the tool's, not a verdict on the
+        // reader, so that size is skipped and said so; the smaller three
+        // must still run.
+        let probe = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(probe.path().join("src")).unwrap();
+        let tried = run_mkfs_erofs(
+            &[&flag],
+            &probe.path().join("probe.img"),
+            &probe.path().join("src"),
+        );
+        if tried.status_code != Some(0) && tried.stderr.contains("invalid block size") {
+            eprintln!(
+                "skipping {flag}: this host's mkfs.erofs refuses it ({})",
+                tried.stderr.trim()
+            );
+            continue;
+        }
+        verified.push(bs);
         let img = build_with_mkfs_erofs(&[&flag], &tree).bytes;
         assert!(has_checksum(&img), "mkfs.erofs {flag} wrote no checksum");
         let fs = open_bytes(img.clone())
@@ -140,4 +161,54 @@ fn oracle_every_block_size_verifies_and_damage_is_refused() {
         damaged[UUID_AT] ^= 0x01;
         assert_refused_for_checksum(damaged, &format!("mkfs.erofs {flag}, uuid bit flipped"));
     }
+    for required in ["512", "1024", "4096"] {
+        assert!(
+            verified.contains(&required),
+            "block size {required} was skipped, so the oracle checked less than it claims: {verified:?}"
+        );
+    }
+}
+
+/// The superblock `open` returns is the one whose checksum it verified.
+///
+/// The checksum span is a second read. A device that answers the first
+/// read with altered fields and the second with the original bytes had
+/// the altered superblock parsed and the original one checksummed, so the
+/// altered fields were accepted. Found by Greptile on #103.
+#[test]
+fn the_superblock_returned_is_the_one_that_was_verified() {
+    struct Shifty {
+        image: Vec<u8>,
+        first: std::sync::atomic::AtomicBool,
+    }
+    impl BlockRead for Shifty {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+            let o = offset as usize;
+            buf.copy_from_slice(&self.image[o..o + buf.len()]);
+            if offset == 1024 && self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // The same bytes the checksum covers, one field altered.
+                buf[UUID_AT - 1024] ^= 0x01;
+            }
+            Ok(())
+        }
+        fn size_bytes(&self) -> u64 {
+            self.image.len() as u64
+        }
+    }
+    let tree = dir(vec![("a.txt", file(b"alpha\n"))]);
+    let image = mkfs::build_image(tree, 12).expect("build");
+    assert!(
+        has_checksum(&image),
+        "fixture: the writer stamps a checksum"
+    );
+    let original = image[UUID_AT];
+    let dev = Shifty {
+        image,
+        first: std::sync::atomic::AtomicBool::new(true),
+    };
+    let sb = fs_erofs::superblock::read(&dev).expect("the second read is the valid image");
+    assert_eq!(
+        sb.uuid[0], original,
+        "the superblock returned carries the altered first read, not the verified bytes"
+    );
 }
