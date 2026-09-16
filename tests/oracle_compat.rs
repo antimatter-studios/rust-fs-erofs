@@ -376,7 +376,11 @@ fn an_xattr_that_cannot_be_set_on_a_laptop_is_a_skip() {
 
 #[test]
 fn a_failed_xattr_set_reports_what_each_tool_said() {
-    let missing = std::env::temp_dir().join("erofs-no-such-file-for-xattr-probe");
+    // Inside a fresh private directory, so nothing -- a leftover, a
+    // symlink, another process -- can exist at the path and turn this
+    // into an xattr write on somebody else's file.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("no-such-file");
     let why = try_set_xattr(&missing, "user.probe", "v").expect_err("the file does not exist");
     assert!(
         why.contains("`xattr`") && why.contains("`setfattr`"),
