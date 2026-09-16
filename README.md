@@ -229,7 +229,7 @@ The GSI is large (~1 GB) and gitignored. The script verifies a pinned SHA256 and
 
 ## Performance notes
 
-- **LRU cache**: defaults to 256 decompressed pclusters (~64 MiB at typical sizes). Sequential reads of compressed multi-pcluster files see roughly 8× speedup from cache hits. Disable via `Filesystem::set_pcluster_cache_capacity(0)` for memory-constrained hosts.
+- **LRU cache**: defaults to at most 256 decompressed pclusters and at most 64 MiB of decoded bytes, whichever bound is reached first. Sequential reads of compressed multi-pcluster files see roughly 8× speedup from cache hits. Disable via `Filesystem::set_pcluster_cache_capacity(0)` for memory-constrained hosts.
 - **Codec choice**: LZ4 is fastest to decompress; LZMA gives best compression ratios; DEFLATE and ZSTD are in between, and ZSTD is read-only here. Default `mkfs_erofs` compression is uncompressed (ship a baseline image first, opt into compression via `mkfs::build_image_with`).
 - **Inline tail-packing**: small files become FLAT_INLINE automatically when their tail fits in the metadata block — saves a full block of padding per file. Significant for many-small-files trees (Android `/etc`).
 

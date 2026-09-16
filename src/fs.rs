@@ -19,14 +19,19 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Default capacity (in pcluster entries) for the decompression cache.
-/// At a typical pcluster size of ≤ 256 KiB this caps cache memory at
-/// roughly 64 MiB — generous for sequential-read workloads but bounded
-/// enough that memory-constrained callers can opt down (or out via
-/// `set_pcluster_cache_capacity(0)`). Picked empirically: every test
-/// image's compressed inode fits in well under this; real-world
-/// images with hundreds of multi-pcluster files still benefit from
-/// the cache without unbounded growth.
+///
+/// This bounds the NUMBER of entries only. It is not a memory ceiling on
+/// its own: a pcluster may legitimately decode to several megabytes
+/// (up to [`MAX_PCLUSTER_SIZE`], 12 MiB), so 256 of them could retain
+/// gigabytes. The memory ceiling is [`DEFAULT_PCLUSTER_CACHE_BYTES`],
+/// enforced alongside this count (#77). Callers can opt down, or out via
+/// `set_pcluster_cache_capacity(0)`.
 pub const DEFAULT_PCLUSTER_CACHE_CAPACITY: usize = 256;
+
+/// Most decoded bytes the decompression cache retains, whatever the entry
+/// count. Least-recently-used entries are evicted until the total fits; a
+/// single pcluster larger than this is decoded and served but not cached.
+pub const DEFAULT_PCLUSTER_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default capacity, in device blocks, of the metadata cache.
 ///
@@ -52,6 +57,10 @@ struct PclusterCache {
     // complexity around without aiding readability.
     #[allow(clippy::type_complexity)]
     inner: Option<LruCache<PclusterKey, Arc<Vec<u8>>>>,
+    /// Decoded bytes currently retained by `inner`.
+    bytes: usize,
+    /// Ceiling on `bytes`.
+    byte_limit: usize,
     /// Counts cache hits, for tests + diagnostics. Never wraps in
     /// realistic workloads (u64 is fine).
     hits: u64,
@@ -65,8 +74,37 @@ impl PclusterCache {
         let inner = NonZeroUsize::new(capacity).map(LruCache::new);
         PclusterCache {
             inner,
+            bytes: 0,
+            byte_limit: DEFAULT_PCLUSTER_CACHE_BYTES,
             hits: 0,
             misses: 0,
+        }
+    }
+
+    /// Insert, then evict least-recently-used entries until the retained
+    /// bytes fit the byte limit as well as the entry count. No-op when
+    /// caching is disabled.
+    fn insert(&mut self, key: PclusterKey, value: Arc<Vec<u8>>) {
+        let Some(lru) = self.inner.as_mut() else {
+            return;
+        };
+        let len = value.len();
+        if len > self.byte_limit {
+            // Retaining it would evict everything else and still exceed
+            // the ceiling.
+            return;
+        }
+        self.bytes += len;
+        // `push` hands back whatever it displaced: the previous value for
+        // this key, or the LRU entry evicted by the entry-count bound.
+        if let Some((_, displaced)) = lru.push(key, value) {
+            self.bytes -= displaced.len();
+        }
+        while self.bytes > self.byte_limit {
+            match lru.pop_lru() {
+                Some((_, evicted)) => self.bytes -= evicted.len(),
+                None => break,
+            }
         }
     }
 }
@@ -947,10 +985,10 @@ impl Filesystem {
 
     /// Cache insert. No-op when caching is disabled (capacity 0).
     fn cache_insert(&self, key: PclusterKey, value: Arc<Vec<u8>>) {
-        let mut g = self.pcluster_cache.lock().expect("cache lock");
-        if let Some(lru) = g.inner.as_mut() {
-            lru.put(key, value);
-        }
+        self.pcluster_cache
+            .lock()
+            .expect("cache lock")
+            .insert(key, value);
     }
 }
 
@@ -1763,6 +1801,55 @@ mod tests {
             misses_after_second, misses_after_first,
             "second read must NOT decompress again ({misses_after_first} -> {misses_after_second})"
         );
+    }
+
+    /// #77: the default cache was bounded by entry count alone, so 256
+    /// multi-megabyte decoded pclusters -- legal since the decoded-span
+    /// limit follows `Z_EROFS_PCLUSTER_MAX_DSIZE` -- were all retained.
+    /// The ceiling the documentation promises is 64 MiB of decoded
+    /// bytes, whatever size each pcluster decodes to.
+    #[test]
+    fn default_pcluster_cache_retains_at_most_64_mib_of_decoded_bytes() {
+        const MIB: usize = 1024 * 1024;
+        let bs = 4096usize;
+        let img = build_compressed_image_for_cache("a.bin", &vec![b'A'; 2 * bs]);
+        let fs = Filesystem::open(Arc::new(MemDev::new(img)) as Arc<dyn BlockRead>).unwrap();
+
+        // 40 pclusters of 4 MiB each: 160 MiB offered, well within the
+        // default entry count of 256. Zeroed allocations are not touched,
+        // so this does not commit 160 MiB of memory to the test.
+        let each = 4 * MIB;
+        for i in 0..40u64 {
+            fs.cache_insert((1, 0, i, i), Arc::new(vec![0u8; each]));
+        }
+        let (entries, _, _, _) = fs.pcluster_cache_stats();
+        assert!(
+            entries * each <= 64 * MIB,
+            "the default cache retained {entries} pclusters of {each} bytes = {} MiB, \
+             above the 64 MiB ceiling",
+            entries * each / MIB
+        );
+        assert!(entries > 0, "the cache retained nothing at all");
+    }
+
+    /// The byte accounting: re-inserting a key replaces rather than adds,
+    /// and one pcluster above the ceiling is served but never retained.
+    #[test]
+    fn pcluster_cache_byte_accounting_replaces_and_skips_oversize() {
+        const MIB: usize = 1024 * 1024;
+        let mut cache = PclusterCache::new(DEFAULT_PCLUSTER_CACHE_CAPACITY);
+        cache.insert((1, 0, 0, 0), Arc::new(vec![0u8; 40 * MIB]));
+        cache.insert((1, 0, 0, 0), Arc::new(vec![0u8; 40 * MIB]));
+        assert_eq!(cache.bytes, 40 * MIB, "a replaced value was counted twice");
+        assert_eq!(cache.inner.as_ref().unwrap().len(), 1);
+
+        cache.insert((1, 0, 1, 1), Arc::new(vec![0u8; 30 * MIB]));
+        assert_eq!(cache.bytes, 30 * MIB, "the LRU entry must go to fit");
+        assert_eq!(cache.inner.as_ref().unwrap().len(), 1);
+
+        cache.insert((1, 0, 2, 2), Arc::new(vec![0u8; 64 * MIB + 1]));
+        assert_eq!(cache.bytes, 30 * MIB, "an oversize pcluster was retained");
+        assert!(cache.inner.as_ref().unwrap().contains(&(1, 0, 1, 1)));
     }
 
     #[test]
