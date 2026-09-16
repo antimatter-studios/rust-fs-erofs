@@ -114,6 +114,17 @@ pub struct Filesystem {
     /// blob, inodes, xattrs, the device table itself) go through this
     /// device. Data reads with `device_id == 0` also go here.
     primary: Arc<dyn BlockRead>,
+    /// The primary device underneath the metadata cache, for file data
+    /// (#69). The same handle as `primary` unless
+    /// [`Filesystem::open_with_cache`] put a cache in between.
+    ///
+    /// File data used to go through the cache one block at a time. A
+    /// one-block read never trips the cache's large-read bypass, so each
+    /// data block was cached on its merits, and reading one 2 MiB file
+    /// evicted every metadata block the default cache holds. Directory and
+    /// symlink blocks are still read through `primary`: path resolution
+    /// re-reads them, and they are what the cache is for.
+    data: Arc<dyn BlockRead>,
     /// Extra backing devices for multi-device images. Indexed by
     /// `(device_id - 1)`; a `device_id == k > 0` in a chunkmap or zmap
     /// entry routes to `extras[k - 1]`. Stays empty for
@@ -248,8 +259,9 @@ impl Filesystem {
         // read goes to the device directly.
         let sb = superblock::read(&*dev)?;
         let block_size = 1u64 << sb.blkszbits;
-        let dev: Arc<dyn BlockRead> = fs_core::CachingDevice::read_only(dev, block_size, blocks);
-        Self::open_with_devices(dev, Vec::new())
+        let cached: Arc<dyn BlockRead> =
+            fs_core::CachingDevice::read_only(dev.clone(), block_size, blocks);
+        Self::open_split(cached, dev, Vec::new())
     }
 
     /// Multi-device open. The caller supplies the primary device plus
@@ -264,6 +276,17 @@ impl Filesystem {
     /// pick the right backings.
     pub fn open_with_devices(
         primary: Arc<dyn BlockRead>,
+        extras: Vec<Arc<dyn BlockRead>>,
+    ) -> Result<Self> {
+        let data = primary.clone();
+        Self::open_split(primary, data, extras)
+    }
+
+    /// `primary` serves metadata, `data` serves file contents; they are
+    /// the same image, so a read-only split has nothing to keep coherent.
+    fn open_split(
+        primary: Arc<dyn BlockRead>,
+        data: Arc<dyn BlockRead>,
         extras: Vec<Arc<dyn BlockRead>>,
     ) -> Result<Self> {
         let sb = superblock::read(&*primary)?;
@@ -283,6 +306,7 @@ impl Filesystem {
         let compr_cfgs = superblock::read_compr_cfgs(&*primary, &sb)?;
         Ok(Filesystem {
             primary,
+            data,
             extras,
             sb,
             packed_inode: OnceLock::new(),
@@ -313,6 +337,23 @@ impl Filesystem {
                 .get(idx)
                 .map(|a| a.as_ref())
                 .ok_or(Error::BadSuperblock("device_id out of range"))
+        }
+    }
+
+    /// [`Self::read_block`] for file contents: `device_id == 0` reads the
+    /// primary device below the metadata cache rather than through it
+    /// (#69).
+    fn read_data(&self, device_id: u16, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let dev = self.data_device_for(device_id)?;
+        dev.read_at(offset, buf)?;
+        Ok(())
+    }
+
+    fn data_device_for(&self, device_id: u16) -> Result<&dyn BlockRead> {
+        if device_id == 0 {
+            Ok(&*self.data)
+        } else {
+            self.device_for(device_id)
         }
     }
 
@@ -680,21 +721,31 @@ impl Filesystem {
         out: &mut [u8],
     ) -> Result<()> {
         let bs = self.sb.block_size();
+        // Directory and symlink blocks are re-read by every path resolved
+        // through them, so they go through the metadata cache; file
+        // contents go around it (#69).
+        let read = |device_id: u16, off: u64, out: &mut [u8]| {
+            if inode.is_dir() || inode.is_symlink() {
+                self.read_block(device_id, off, out)
+            } else {
+                self.read_data(device_id, off, out)
+            }
+        };
         match inode.format.layout {
             DataLayout::FlatPlain => {
                 let off = inode.raw_u as u64 * bs + block_idx * bs;
                 // FLAT_PLAIN data lives on the primary device — there
                 // is no per-inode device_id slot for non-chunked layouts.
-                self.read_block(0, off, out)
+                read(0, off, out)
             }
             DataLayout::FlatInline => {
                 if total_blocks > 0 && block_idx == total_blocks - 1 {
                     // Tail block: inline, sits at body_end on the primary.
                     let off = inode.body_end(&self.sb);
-                    self.read_block(0, off, out)
+                    read(0, off, out)
                 } else {
                     let off = inode.raw_u as u64 * bs + block_idx * bs;
-                    self.read_block(0, off, out)
+                    read(0, off, out)
                 }
             }
             DataLayout::ChunkBased => {
@@ -714,7 +765,7 @@ impl Filesystem {
                     return Ok(());
                 }
                 let off = (blkaddr as u64 + block_in_chunk) * bs;
-                self.read_block(device_id, off, out)
+                read(device_id, off, out)
             }
             DataLayout::Compression | DataLayout::CompressionLegacy => {
                 self.read_compressed_block(inode, block_idx, out)
@@ -750,7 +801,13 @@ impl Filesystem {
         let mut written: usize = 0;
         while written < out.len() {
             let cursor = block_start + written as u64;
-            let n = self.fill_from_one_pcluster(inode.nid, &zmap, cursor, &mut out[written..])?;
+            let n = self.fill_from_one_pcluster_as(
+                inode.nid,
+                inode.is_dir() || inode.is_symlink(),
+                &zmap,
+                cursor,
+                &mut out[written..],
+            )?;
             if n == 0 {
                 // No bytes came back for `cursor`, so the cursor cannot
                 // move and asking again would give the same answer for
@@ -777,9 +834,46 @@ impl Filesystem {
     /// `pcluster_blkaddr` so two inodes that happen to point at the
     /// same blkaddr (a possibility under BIG_PCLUSTER's shared-extent
     /// patterns) never serve each other's bytes.
+    #[cfg(test)]
     fn fill_from_one_pcluster(
         &self,
         inode_nid: u64,
+        zmap: &zmap::ZMap<'_>,
+        file_offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        self.fill_from_one_pcluster_as(inode_nid, false, zmap, file_offset, out)
+    }
+
+    /// Read one block's source bytes for [`Self::fill_from_one_pcluster_as`]:
+    /// through the metadata cache for a directory or symlink, around it
+    /// for file contents (#69).
+    ///
+    /// A compressed directory's decoded pcluster can be evicted, or the
+    /// pcluster cache switched off, and path resolution re-reads the
+    /// directory every time; its source belongs in the metadata cache as
+    /// much as a flat directory's blocks do.
+    fn read_source(
+        &self,
+        metadata: bool,
+        device_id: u16,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        if metadata {
+            self.read_block(device_id, offset, buf)
+        } else {
+            self.read_data(device_id, offset, buf)
+        }
+    }
+
+    /// [`Self::fill_from_one_pcluster`] for an inode whose source is
+    /// `metadata` (a directory or symlink) or file contents; see
+    /// [`Self::read_source`].
+    fn fill_from_one_pcluster_as(
+        &self,
+        inode_nid: u64,
+        metadata: bool,
         zmap: &zmap::ZMap<'_>,
         file_offset: u64,
         out: &mut [u8],
@@ -886,7 +980,7 @@ impl Filesystem {
                 // Compressed pclusters route through the resolved
                 // device_id (always 0 / primary under the public spec,
                 // but plumbed for symmetry with chunked).
-                self.read_block(extent.device_id, dev_off, &mut on_disk)?;
+                self.read_source(metadata, extent.device_id, dev_off, &mut on_disk)?;
                 let rot = extent.head_clusterofs as usize;
                 if rot > on_disk_len {
                     return Err(Error::BadInode(
@@ -905,7 +999,7 @@ impl Filesystem {
             // `pcluster_blkaddr * bs` and covers
             // `[source_start_byte, source_end_byte)` of the file.
             let off = extent.pcluster_blkaddr as u64 * bs + off_in_pcluster as u64;
-            self.read_block(extent.device_id, off, &mut out[..take])?;
+            self.read_source(metadata, extent.device_id, off, &mut out[..take])?;
             return Ok(take);
         }
 
@@ -958,7 +1052,11 @@ impl Filesystem {
             let blocks = extent.pcluster_block_count;
             // Cap reads at the end of the (routed) device so a generous
             // last-pcluster bound doesn't trip ShortRead.
-            let dev = self.device_for(extent.device_id)?;
+            let dev = if metadata {
+                self.device_for(extent.device_id)?
+            } else {
+                self.data_device_for(extent.device_id)?
+            };
             let dev_size = dev.size_bytes();
             let off = extent.pcluster_blkaddr as u64 * bs;
             let want = blocks * bs;
@@ -971,7 +1069,11 @@ impl Filesystem {
         };
         let mut compressed = vec![0u8; src_len];
         if src_len > 0 {
-            self.read_block(extent.device_id, src_off, &mut compressed)?;
+            // A file's compressed source goes around the metadata cache:
+            // its decoded result is what `pcluster_cache` keeps, so
+            // holding the source as well paid twice (#69). A directory's
+            // or symlink's goes through it, as its flat blocks do.
+            self.read_source(metadata, extent.device_id, src_off, &mut compressed)?;
         }
 
         let uncompressed_len = pcluster_span(extent.source_start_byte, extent.source_end_byte)?;
@@ -1984,6 +2086,46 @@ mod tests {
             misses_after > misses_before,
             "evicted A should re-MISS the cache after B displaced it ({misses_before} -> {misses_after})"
         );
+    }
+
+    /// A compressed DIRECTORY's source is read through the metadata cache
+    /// (#69, Greptile on #105): with the pcluster cache off, re-reading it
+    /// must not reach the device again, while a file's source still goes
+    /// around the cache. The crate's writer compresses files only, so the
+    /// routing is asked directly with each answer for the same pcluster.
+    #[test]
+    fn a_compressed_directorys_source_is_read_through_the_metadata_cache() {
+        let bs = 4096usize;
+        let payload = vec![b'D'; 3 * bs];
+        let img = build_compressed_image_for_cache("d.bin", &payload);
+        let counting = Arc::new(fs_core::CountingDevice::new(Arc::new(MemDev::new(img))));
+        let fs =
+            Filesystem::open_with_cache(counting.clone(), DEFAULT_METADATA_CACHE_BLOCKS).unwrap();
+        fs.set_pcluster_cache_capacity(0);
+        let inode = fs.lookup_path("/d.bin").unwrap();
+        let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).unwrap();
+
+        let mut buf = vec![0u8; bs];
+        for (metadata, second_reads) in [(true, 0u64), (false, 1)] {
+            fs.fill_from_one_pcluster_as(inode.nid, metadata, &zmap, 0, &mut buf)
+                .unwrap();
+            counting.reset();
+            fs.fill_from_one_pcluster_as(inode.nid, metadata, &zmap, 0, &mut buf)
+                .unwrap();
+            let reads = counting.reads();
+            if metadata {
+                assert_eq!(
+                    reads, second_reads,
+                    "a directory's source re-read reached the device"
+                );
+            } else {
+                assert!(
+                    reads >= second_reads,
+                    "control: a file's source bypasses the cache"
+                );
+            }
+            assert!(buf.iter().all(|&b| b == b'D'));
+        }
     }
 
     #[test]
