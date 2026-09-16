@@ -267,6 +267,10 @@ impl Filesystem {
         extras: Vec<Arc<dyn BlockRead>>,
     ) -> Result<Self> {
         let sb = superblock::read(&*primary)?;
+        // Before anything is read on the strength of this superblock: an
+        // incompatible feature this reader does not implement changes
+        // what the rest of the image means (#51, #45).
+        sb.check_incompat_features()?;
         if extras.len() != sb.extra_devices as usize {
             return Err(Error::BadSuperblock("extra device count mismatch"));
         }
