@@ -421,16 +421,25 @@ impl Superblock {
         std::str::from_utf8(&self.volume_name[..end]).unwrap_or("")
     }
 
+    /// Bytes covered by the superblock checksum: from the superblock's
+    /// offset to the end of the block containing it,
+    /// `block_size - EROFS_SUPER_OFFSET % block_size`.
+    pub fn checksum_span_len(&self) -> usize {
+        let block_size = 1usize << self.blkszbits;
+        block_size - EROFS_SUPER_OFFSET as usize % block_size
+    }
+
     /// Best-effort CRC32C verification of the on-disk superblock. Returns
     /// `true` if `EROFS_FEATURE_COMPAT_SB_CHKSUM` is clear (no checksum
     /// to verify) OR the recomputed CRC32C matches `self.checksum`.
     ///
     /// `raw_sb_to_block_end` must be the bytes from `EROFS_SUPER_OFFSET`
-    /// (i.e. SB start) up to the end of block 0 -- length
-    /// `block_size - EROFS_SUPER_OFFSET`, which is 3072 for the default
-    /// 4 KiB block. Shorter slices return `false`. We deliberately
-    /// don't gate `parse` on this (older mkfs.erofs images don't set
-    /// the bit) -- it's an opt-in integrity check.
+    /// (i.e. SB start) to the end of the block that contains it -- length
+    /// [`Superblock::checksum_span_len`]: 3072 for a 4 KiB block, and a
+    /// whole block for blocks of 1 KiB or less, where the superblock
+    /// starts a block of its own. Shorter slices return `false`.
+    /// [`read`] calls this whenever the bit is set; images without the bit
+    /// are not verified.
     ///
     /// Algorithm: CRC32C (Castagnoli, RFC 3720) over the SB-to-block-end
     /// range with the 4-byte checksum field at offset 0x04..0x08
@@ -446,9 +455,7 @@ impl Superblock {
         if self.feature_compat & EROFS_FEATURE_COMPAT_SB_CHKSUM == 0 {
             return true;
         }
-        let block_size = 1usize << self.blkszbits;
-        let off = EROFS_SUPER_OFFSET as usize;
-        let want_len = block_size - off % block_size;
+        let want_len = self.checksum_span_len();
         if raw_sb_to_block_end.len() < want_len {
             return false;
         }
@@ -459,11 +466,37 @@ impl Superblock {
     }
 }
 
-/// Read the superblock from a block device.
+/// Read the superblock from a block device and, when the image advertises
+/// `EROFS_FEATURE_COMPAT_SB_CHKSUM`, verify its CRC32C.
+///
+/// A mismatch refuses the image (#52): a superblock that fails its own
+/// checksum is not one the rest of the image can be interpreted by, and a
+/// queryable warning would hand that decision to a caller with less
+/// information. The checksum covers the superblock to the end of its
+/// block, so that span is read in addition to the 128 parsed bytes.
 pub fn read<R: BlockRead + ?Sized>(dev: &R) -> Result<Superblock> {
     let mut buf = [0u8; EROFS_SUPER_BLOCK_SIZE];
     dev.read_at(EROFS_SUPER_OFFSET, &mut buf)?;
-    Superblock::parse(&buf)
+    let sb = Superblock::parse(&buf)?;
+    if sb.feature_compat & EROFS_FEATURE_COMPAT_SB_CHKSUM != 0 {
+        let mut span = vec![0u8; sb.checksum_span_len().max(EROFS_SUPER_BLOCK_SIZE)];
+        dev.read_at(EROFS_SUPER_OFFSET, &mut span)?;
+        // THE SUPERBLOCK RETURNED IS THE ONE THAT WAS VERIFIED. The span
+        // is a second read, and a device -- a callback, a file changing
+        // underneath -- need not return the same bytes twice: parsing the
+        // first read and checksumming the second accepted altered fields
+        // under an unaltered checksum. So the second read is parsed again
+        // and that parse is what the checksum is checked against.
+        let verified = Superblock::parse(&span[..EROFS_SUPER_BLOCK_SIZE])?;
+        if verified.feature_compat & EROFS_FEATURE_COMPAT_SB_CHKSUM == 0
+            || span.len() != verified.checksum_span_len().max(EROFS_SUPER_BLOCK_SIZE)
+            || !verified.verify_checksum(&span)
+        {
+            return Err(Error::BadSuperblock("superblock checksum mismatch"));
+        }
+        return Ok(verified);
+    }
+    Ok(sb)
 }
 
 /// Size of one on-disk `erofs_deviceslot` entry. The table is an array
