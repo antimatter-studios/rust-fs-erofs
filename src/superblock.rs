@@ -371,13 +371,16 @@ impl Superblock {
         }
 
         // `Filesystem::read_dir` walks a directory in filesystem-block
-        // steps. Zero (what erofs-utils writes) and the block shift both
-        // mean exactly that; any other directory block size would have its
-        // dirent arrays taken from the wrong offsets (#58).
+        // steps, and zero -- what erofs-utils writes -- is the only value
+        // that means that (#58). The field is a shift RELATIVE to
+        // `blkszbits`, so a value equal to it names a directory block of
+        // `2^(2 * blkszbits)` bytes, not the filesystem block; accepting it
+        // read such an image at the wrong granularity. The kernel refuses
+        // every nonzero value too.
         let dirblkbits = bytes[offsets::DIRBLKBITS];
-        if dirblkbits != 0 && dirblkbits != blkszbits {
+        if dirblkbits != 0 {
             return Err(Error::BadSuperblock(
-                "dirblkbits differs from blkszbits; only a directory block equal to the filesystem block is supported",
+                "dirblkbits is nonzero; only a directory block equal to the filesystem block is supported",
             ));
         }
 

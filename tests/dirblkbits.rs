@@ -1,5 +1,4 @@
-//! `dirblkbits` other than zero or the filesystem block size refuses the
-//! image at open (#58).
+//! A nonzero `dirblkbits` refuses the image at open (#58).
 //!
 //! `read_dir` walks a directory in filesystem-block steps. `dirblkbits`
 //! was parsed and read by nothing, so an image declaring a different
@@ -7,8 +6,10 @@
 //! wrong offsets -- a `BadDirent` or a listing assembled from unrelated
 //! bytes, indistinguishable from corruption. erofs-utils writes zero on
 //! every option combination measured on #58, which means "the filesystem
-//! block size", which is what the reader does; the equal shift says the
-//! same thing explicitly. Anything else is refused by name.
+//! block size", which is what the reader does. The field is a shift
+//! relative to `blkszbits`, so a nonzero value -- including one equal to
+//! `blkszbits`, which names a 2^24-byte block on a 4 KiB image -- is a
+//! different directory block size, and is refused by name.
 //!
 //! The image is this crate's own, with the byte patched and the superblock
 //! checksum recomputed so the case stays valid once the checksum is
@@ -63,7 +64,7 @@ fn open_bytes(img: Vec<u8>) -> Result<Filesystem, Error> {
 
 #[test]
 fn a_directory_block_size_other_than_the_block_size_is_refused() {
-    for value in [9u8, 13, 16] {
+    for value in [1u8, 9, 12, 13, 16] {
         match open_bytes(image_with_dirblkbits(value)) {
             Err(Error::BadSuperblock(why)) => assert!(
                 why.contains("dirblkbits"),
@@ -78,23 +79,19 @@ fn a_directory_block_size_other_than_the_block_size_is_refused() {
     }
 }
 
-/// The negative control: zero (what erofs-utils writes) and the block
-/// size's own shift both mean the directory block is the filesystem
-/// block, and must still open and list.
+/// The negative control: zero, what erofs-utils writes, means the
+/// directory block is the filesystem block, and must still open and list.
 #[test]
-fn zero_and_the_block_shift_still_list() {
-    for value in [0u8, 12] {
-        let fs = open_bytes(image_with_dirblkbits(value))
-            .unwrap_or_else(|e| panic!("dirblkbits {value} must open: {e}"));
-        let root = fs.root_inode().expect("root");
-        let mut names: Vec<Vec<u8>> = fs
-            .read_dir(&root)
-            .expect("list root")
-            .into_iter()
-            .map(|e| e.name)
-            .filter(|n| n != b"." && n != b"..")
-            .collect();
-        names.sort();
-        assert_eq!(names, [&b"a.txt"[..], b"sub"], "dirblkbits {value}");
-    }
+fn zero_still_lists() {
+    let fs = open_bytes(image_with_dirblkbits(0)).expect("dirblkbits 0 must open");
+    let root = fs.root_inode().expect("root");
+    let mut names: Vec<Vec<u8>> = fs
+        .read_dir(&root)
+        .expect("list root")
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n != b"." && n != b"..")
+        .collect();
+    names.sort();
+    assert_eq!(names, [&b"a.txt"[..], b"sub"]);
 }
