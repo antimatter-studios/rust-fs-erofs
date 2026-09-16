@@ -6,7 +6,7 @@
 
 use crate::chunked::{self, EROFS_NULL_ADDR};
 use crate::decompress::{self};
-use crate::dir::{iter_block, DirEntry};
+use crate::dir::{iter_block, visit_block, DirEntry};
 use crate::error::{Error, Result};
 use crate::inode::Inode;
 use crate::layout::DataLayout;
@@ -477,13 +477,42 @@ impl Filesystem {
     /// Linear scan. EROFS sorts dirents by name hash on disk so a
     /// binary search is possible; this does not do it, which is a cost
     /// on very large directories and nothing else.
+    ///
+    /// NOT BY LISTING (#61). This called `read_dir`, which gives every
+    /// entry an owned copy of its name, and then compared one of them: one
+    /// allocation per entry per path component. It now walks the same
+    /// blocks with [`visit_block`], comparing borrowed names. Every block is
+    /// still read and validated, so a malformed directory is refused exactly
+    /// as a listing would refuse it, and the first match wins as before.
     pub fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Inode> {
-        for entry in self.read_dir(dir)? {
-            if entry.name == name {
-                return self.read_inode(entry.nid);
-            }
+        if !dir.is_dir() {
+            return Err(Error::NotADirectory);
         }
-        Err(Error::NotFound)
+        let bs = self.sb.block_size();
+        let total_blocks = dir.size.div_ceil(bs);
+        let mut remaining = dir.size;
+        let mut block_idx: u64 = 0;
+        let mut found: Option<u64> = None;
+        let mut buf = Vec::new();
+        while remaining > 0 {
+            let this_block = remaining.min(bs);
+            buf.clear();
+            buf.resize(this_block as usize, 0);
+            self.read_data_block(dir, block_idx, total_blocks, &mut buf)?;
+            // Padded back to bs for the NUL scan, as in `read_dir`.
+            buf.resize(bs as usize, 0);
+            visit_block(&buf, |nid, _, entry| {
+                if found.is_none() && entry == name {
+                    found = Some(nid);
+                }
+            })?;
+            remaining -= this_block;
+            block_idx += 1;
+        }
+        match found {
+            Some(nid) => self.read_inode(nid),
+            None => Err(Error::NotFound),
+        }
     }
 
     /// Resolve a `/`-separated path starting at the root. Symlinks are

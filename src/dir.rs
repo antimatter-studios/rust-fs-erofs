@@ -84,6 +84,24 @@ pub struct DirEntry {
 /// contains `/` -- none of which a directory can legitimately list, and
 /// each of which a consumer of the name would misread.
 pub fn iter_block(block: &[u8]) -> Result<Vec<DirEntry>> {
+    let mut out = Vec::new();
+    visit_block(block, |nid, file_type, name| {
+        out.push(DirEntry {
+            nid,
+            file_type,
+            name: name.to_vec(),
+        })
+    })?;
+    Ok(out)
+}
+
+/// The same walk and the same validation as [`iter_block`], handing each
+/// dirent's name to `f` as a borrowed slice instead of an owned copy.
+///
+/// Every entry in the block is validated before this returns `Ok`, so a
+/// caller looking for one name sees exactly the errors a full listing
+/// would, without allocating per entry (#61).
+pub fn visit_block(block: &[u8], mut f: impl FnMut(u64, u8, &[u8])) -> Result<()> {
     if block.len() < EROFS_DIRENT_SIZE {
         return Err(Error::BadDirent("block shorter than one dirent"));
     }
@@ -97,7 +115,6 @@ pub fn iter_block(block: &[u8]) -> Result<Vec<DirEntry>> {
     }
     let n_dirents = first_nameoff / EROFS_DIRENT_SIZE;
 
-    let mut out = Vec::with_capacity(n_dirents);
     for i in 0..n_dirents {
         let off = i * EROFS_DIRENT_SIZE;
         let nid = u64::from_le_bytes(block[off..off + 8].try_into().unwrap());
@@ -143,13 +160,9 @@ pub fn iter_block(block: &[u8]) -> Result<Vec<DirEntry>> {
             return Err(Error::BadDirent("dirent name contains '/'"));
         }
 
-        out.push(DirEntry {
-            nid,
-            file_type,
-            name: name.to_vec(),
-        });
+        f(nid, file_type, name);
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
