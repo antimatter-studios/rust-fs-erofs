@@ -463,3 +463,23 @@ pub fn cchar_field_to_bytes(field: &[std::os::raw::c_char]) -> Vec<u8> {
     // where the cast is a same-type cast clippy refuses (#89).
     field[..end].iter().map(|&c| c.to_ne_bytes()[0]).collect()
 }
+
+/// Recompute the superblock checksum after a test has edited superblock
+/// bytes, so the edit is what the test exercises rather than the checksum
+/// the reader verifies at open (#52). No-op when the image does not set
+/// `EROFS_FEATURE_COMPAT_SB_CHKSUM`. Span and algorithm as
+/// `Superblock::verify_checksum`: CRC32C from the superblock to the end of
+/// its block, checksum field zeroed, no final XOR.
+pub fn reseal_superblock(img: &mut [u8]) {
+    const SB: usize = 1024;
+    let compat = u32::from_le_bytes(img[SB + 0x08..SB + 0x0C].try_into().unwrap());
+    if compat & fs_erofs::EROFS_FEATURE_COMPAT_SB_CHKSUM == 0 {
+        return;
+    }
+    let block_size = 1usize << img[SB + 0x0C];
+    let want_len = block_size - SB % block_size;
+    let mut span = img[SB..SB + want_len].to_vec();
+    span[4..8].fill(0);
+    let crc = crc32c::crc32c(&span) ^ 0xFFFF_FFFF;
+    img[SB + 0x04..SB + 0x08].copy_from_slice(&crc.to_le_bytes());
+}

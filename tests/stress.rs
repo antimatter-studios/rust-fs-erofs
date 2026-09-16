@@ -253,6 +253,8 @@ fn corrupt_root_nid_is_handled_no_panic() {
     let mut img = build_simple_image();
     // Set root_nid to a wildly out-of-range value.
     img[1024 + 0x0E..1024 + 0x10].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    // Resealed, so the error comes from the root nid and not the checksum.
+    common::reseal_superblock(&mut img);
     let res: std::thread::Result<fs_erofs::Result<()>> = std::panic::catch_unwind(move || {
         let dev: Arc<dyn fs_core::BlockRead> = Arc::new(MemDev::new(img));
         let fs = Filesystem::open(dev)?;

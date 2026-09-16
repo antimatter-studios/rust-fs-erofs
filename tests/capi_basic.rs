@@ -253,6 +253,7 @@ fn volume_info_copies_a_label_and_nul_terminates_it() {
     let mut bytes = capi_fixture_image();
     let label = b"EROFSVOL";
     bytes[1088..1088 + label.len()].copy_from_slice(label);
+    common::reseal_superblock(&mut bytes);
     let img = temp_image(&bytes);
 
     let fs = unsafe { fs_erofs_mount(img.path.as_ptr()) };
@@ -272,6 +273,7 @@ fn volume_info_truncates_a_full_width_label_to_keep_the_terminator() {
     let mut bytes = capi_fixture_image();
     let label = b"ABCDEFGHIJKLMNOP"; // exactly 16 bytes, no NUL
     bytes[1088..1088 + 16].copy_from_slice(label);
+    common::reseal_superblock(&mut bytes);
     let img = temp_image(&bytes);
 
     let fs = unsafe { fs_erofs_mount(img.path.as_ptr()) };
