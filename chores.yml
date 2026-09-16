@@ -52,6 +52,11 @@ tasks:
       # THIS PATH AND THE cp MUST AGREE, and nothing checks that they do —
       # it is the same path Cargo.toml resolves am-fs-core from.
       - '../rust-fs-core/include/fs_core.h'
+      # The task's own definition. Without it an edit to cmds:, a cp path or
+      # vars.TRIPLE leaves the fingerprint unchanged, so chore reports
+      # `task: staticlib is up to date` and ships the previous artefacts.
+      # tests/chore_manifest.rs refuses its removal (#90).
+      - chores.yml
 
     # Templated, which is fine here where it is not fine above: the check
     # renders these correctly, and every entry is an exact path rather than a
