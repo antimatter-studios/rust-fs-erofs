@@ -370,6 +370,20 @@ impl Superblock {
             return Err(Error::BadSuperblock("blkszbits out of range"));
         }
 
+        // `Filesystem::read_dir` walks a directory in filesystem-block
+        // steps, and zero -- what erofs-utils writes -- is the only value
+        // that means that (#58). The field is a shift RELATIVE to
+        // `blkszbits`, so a value equal to it names a directory block of
+        // `2^(2 * blkszbits)` bytes, not the filesystem block; accepting it
+        // read such an image at the wrong granularity. The kernel refuses
+        // every nonzero value too.
+        let dirblkbits = bytes[offsets::DIRBLKBITS];
+        if dirblkbits != 0 {
+            return Err(Error::BadSuperblock(
+                "dirblkbits is nonzero; only a directory block equal to the filesystem block is supported",
+            ));
+        }
+
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&bytes[offsets::UUID]);
         let mut volume_name = [0u8; 16];
@@ -398,7 +412,7 @@ impl Superblock {
             u1: u16::from_le_bytes(bytes[offsets::U1].try_into().unwrap()),
             extra_devices: u16::from_le_bytes(bytes[offsets::EXTRA_DEVICES].try_into().unwrap()),
             devt_slotoff: u16::from_le_bytes(bytes[offsets::DEVT_SLOTOFF].try_into().unwrap()),
-            dirblkbits: bytes[offsets::DIRBLKBITS],
+            dirblkbits,
             xattr_prefix_count: bytes[offsets::XATTR_PREFIX_COUNT],
             xattr_prefix_start: u32::from_le_bytes(
                 bytes[offsets::XATTR_PREFIX_START].try_into().unwrap(),
