@@ -370,6 +370,17 @@ impl Superblock {
             return Err(Error::BadSuperblock("blkszbits out of range"));
         }
 
+        // `Filesystem::read_dir` walks a directory in filesystem-block
+        // steps. Zero (what erofs-utils writes) and the block shift both
+        // mean exactly that; any other directory block size would have its
+        // dirent arrays taken from the wrong offsets (#58).
+        let dirblkbits = bytes[offsets::DIRBLKBITS];
+        if dirblkbits != 0 && dirblkbits != blkszbits {
+            return Err(Error::BadSuperblock(
+                "dirblkbits differs from blkszbits; only a directory block equal to the filesystem block is supported",
+            ));
+        }
+
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&bytes[offsets::UUID]);
         let mut volume_name = [0u8; 16];
@@ -398,7 +409,7 @@ impl Superblock {
             u1: u16::from_le_bytes(bytes[offsets::U1].try_into().unwrap()),
             extra_devices: u16::from_le_bytes(bytes[offsets::EXTRA_DEVICES].try_into().unwrap()),
             devt_slotoff: u16::from_le_bytes(bytes[offsets::DEVT_SLOTOFF].try_into().unwrap()),
-            dirblkbits: bytes[offsets::DIRBLKBITS],
+            dirblkbits,
             xattr_prefix_count: bytes[offsets::XATTR_PREFIX_COUNT],
             xattr_prefix_start: u32::from_le_bytes(
                 bytes[offsets::XATTR_PREFIX_START].try_into().unwrap(),
