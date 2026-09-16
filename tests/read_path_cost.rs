@@ -63,6 +63,25 @@ struct Pass {
     read: Cost,
 }
 
+/// Directories per level and files per leaf directory. The expected
+/// counts below are derived from this rather than written down, so the
+/// fixture can change shape without the assertions going stale.
+const FANOUT: usize = 6;
+
+/// Every entry the walk must reach: `FANOUT` top directories, `FANOUT`
+/// directories under each, `FANOUT` files under each of those.
+const EXPECTED_ENTRIES: usize = FANOUT + FANOUT * FANOUT + FANOUT * FANOUT * FANOUT;
+
+/// The files among them.
+const EXPECTED_FILES: usize = FANOUT * FANOUT * FANOUT;
+
+/// A file's contents are its own name repeated, so a read can be checked
+/// without remembering anything.
+fn expected_body(path: &str) -> Vec<u8> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.repeat(64).into_bytes()
+}
+
 /// A tree wide and deep enough that resolving a path costs several
 /// directory reads, which is the shape a cache is for. Contents are
 /// derived from the name so nothing has to be remembered to check them.
@@ -70,20 +89,17 @@ fn fixture_bytes() -> Vec<u8> {
     // NAMES ARE HELD IN A VEC THAT OUTLIVES EACH `dir` CALL, because
     // `dir` takes `&str` and a `String` built in the loop would be gone
     // before the borrow was used.
-    let names: Vec<String> = (0..6).map(|a| format!("t{a}")).collect();
-    let mid_names: Vec<String> = (0..6).map(|b| format!("d{b}")).collect();
+    let names: Vec<String> = (0..FANOUT).map(|a| format!("t{a}")).collect();
+    let mid_names: Vec<String> = (0..FANOUT).map(|b| format!("d{b}")).collect();
 
     let mut top = Vec::new();
     for (a, top_name) in names.iter().enumerate() {
-        let leaf_names: Vec<Vec<String>> = (0..6)
-            .map(|b| (0..6).map(|c| format!("f{a}{b}{c}.txt")).collect())
+        let leaf_names: Vec<Vec<String>> = (0..FANOUT)
+            .map(|b| (0..FANOUT).map(|c| format!("f{a}{b}{c}.txt")).collect())
             .collect();
         let mut mid = Vec::new();
         for (b, mid_name) in mid_names.iter().enumerate() {
-            let bodies: Vec<Vec<u8>> = leaf_names[b]
-                .iter()
-                .map(|n| n.repeat(64).into_bytes())
-                .collect();
+            let bodies: Vec<Vec<u8>> = leaf_names[b].iter().map(|n| expected_body(n)).collect();
             let leaf: Vec<(&str, mkfs::Node)> = leaf_names[b]
                 .iter()
                 .zip(bodies.iter())
@@ -138,13 +154,18 @@ fn walk_paths(fs: &Filesystem, at: &str, depth: u32, out: &mut Vec<(String, bool
     }
 }
 
-fn measure<F>(counting: &CountingDevice, items: usize, body: F) -> Cost
+/// `body` returns how many items it completed SUCCESSFULLY. A result
+/// that is discarded cannot fail the measurement, and a driver that
+/// fails every read is cheaper than one that works — so the count of
+/// work is taken from what succeeded, never from how much was attempted
+/// (#70).
+fn measure<F>(counting: &CountingDevice, body: F) -> Cost
 where
-    F: FnOnce(),
+    F: FnOnce() -> usize,
 {
     counting.reset();
     let start = Instant::now();
-    body();
+    let items = body();
     Cost {
         reads: counting.reads(),
         bytes: counting.bytes(),
@@ -193,13 +214,36 @@ fn what_a_read_costs_in_calls_to_the_device() {
     // it is not wired to the mount and every figure above is fiction.
     // The cached pass is allowed to reach zero, so asserting the same
     // of it would be asserting that the cache failed.
+    //
+    // THE ITEM COUNTS ARE EXACT, not merely non-zero, and they are counts
+    // of SUCCESSES. A walk truncated to a smaller subtree, a lookup that
+    // fails, or a read that errors or returns the wrong bytes each costs
+    // less than the real work — so without these the figures would
+    // improve at the moment the driver broke (#70).
+    for (what, pass) in [("uncached", &uncached), ("cached", &cached)] {
+        assert_eq!(
+            pass.walk.items, EXPECTED_ENTRIES,
+            "{what} walk: reached {} of the fixture's {EXPECTED_ENTRIES} entries",
+            pass.walk.items
+        );
+        assert_eq!(
+            pass.stat.items, EXPECTED_FILES,
+            "{what} stat: {} of {EXPECTED_FILES} files resolved",
+            pass.stat.items
+        );
+        assert_eq!(
+            pass.read.items, EXPECTED_FILES,
+            "{what} read: {} of {EXPECTED_FILES} files read back with the right contents",
+            pass.read.items
+        );
+    }
     assert!(
-        uncached.walk.items > 0,
-        "the fixture had nothing to walk — the measurement is of nothing"
+        uncached.walk.reads > 0 && uncached.stat.reads > 0 && uncached.read.reads > 0,
+        "no calls reached the device, so the counter is not wired to the mount"
     );
     assert!(
-        uncached.walk.reads > 0 && uncached.stat.reads > 0,
-        "no calls reached the device, so the counter is not wired to the mount"
+        uncached.read.bytes > 0,
+        "the uncached read pass fetched no bytes from the device"
     );
     for (what, un, ca) in [
         ("walk", &uncached.walk, &cached.walk),
@@ -224,11 +268,10 @@ fn measure_one(img: &Path, blocks: usize) -> Pass {
     let (fs, counting) = open_counting(img, blocks);
 
     let mut paths = Vec::new();
-    let walk = measure(&counting, 0, || walk_paths(&fs, "/", 8, &mut paths));
-    let walk = Cost {
-        items: paths.len(),
-        ..walk
-    };
+    let walk = measure(&counting, || {
+        walk_paths(&fs, "/", 8, &mut paths);
+        paths.len()
+    });
     report("walk", &walk);
 
     let files: Vec<String> = paths
@@ -240,20 +283,22 @@ fn measure_one(img: &Path, blocks: usize) -> Pass {
     // RESOLVING THE SAME PREFIXES AGAIN AND AGAIN is the shape a cache
     // is for: every path here walks the root and each directory above
     // its target.
-    let stat = measure(&counting, files.len(), || {
-        for p in &files {
-            let _ = fs.lookup_path(p);
-        }
+    let stat = measure(&counting, || {
+        files.iter().filter(|p| fs.lookup_path(p).is_ok()).count()
     });
     report("stat", &stat);
 
-    let read = measure(&counting, files.len(), || {
-        for p in &files {
-            if let Ok(inode) = fs.lookup_path(p) {
+    let read = measure(&counting, || {
+        files
+            .iter()
+            .filter(|p| {
+                let Ok(inode) = fs.lookup_path(p) else {
+                    return false;
+                };
                 let mut buf = vec![0u8; inode.size as usize];
-                let _ = fs.read_file(&inode, 0, &mut buf);
-            }
-        }
+                fs.read_file(&inode, 0, &mut buf).is_ok() && buf == expected_body(p)
+            })
+            .count()
     });
     report("read", &read);
 
