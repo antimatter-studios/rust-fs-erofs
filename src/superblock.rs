@@ -143,6 +143,43 @@ pub const EROFS_FEATURE_INCOMPAT_DEDUPE: u32 = 0x0000_0020;
 /// Independent implementation; license clean.
 pub const EROFS_FEATURE_INCOMPAT_COMPR_CFGS: u32 = 0x0000_0002;
 
+/// `feature_incompat` bit: chunk-based file layout (`mkfs.erofs
+/// --chunksize`). Read by `src/chunked.rs`. Measured on erofs-utils
+/// 1.9.4: `--chunksize=65536` writes `feature_incompat = 0x04`.
+pub const EROFS_FEATURE_INCOMPAT_CHUNKED_FILE: u32 = 0x0000_0004;
+
+/// `feature_incompat` bit: the image carries a device table for extra
+/// blob devices. Read by `read_device_table` / `Filesystem::open_with_devices`.
+pub const EROFS_FEATURE_INCOMPAT_DEVICE_TABLE: u32 = 0x0000_0008;
+
+/// `feature_incompat` bit: long xattr name prefixes (`mkfs.erofs
+/// --xattr-prefix`). Read by `xattr::read_xattr_prefix_dictionary`.
+/// Measured: `--xattr-prefix=user.foo` writes `0x40`.
+pub const EROFS_FEATURE_INCOMPAT_XATTR_PREFIXES: u32 = 0x0000_0040;
+
+/// `feature_incompat` bit: 48-bit block addressing (`mkfs.erofs
+/// -E48bit`, measured `0x80`). NOT implemented: block addresses are read
+/// at 32 bits, so the image is refused rather than read at the wrong
+/// width wherever the high half is non-zero (#45).
+pub const EROFS_FEATURE_INCOMPAT_48BIT: u32 = 0x0000_0080;
+
+/// `feature_incompat` bit: inode metadata in a "metabox" (`mkfs.erofs
+/// -m`, measured `0x180` together with 48-bit). NOT implemented: the root
+/// nid carries a metabox flag in its top bit and does not fit the 16-bit
+/// slot this reader takes it from, which resolved the root to NID 0 (#51).
+pub const EROFS_FEATURE_INCOMPAT_METABOX: u32 = 0x0000_0100;
+
+/// Every `feature_incompat` bit this reader implements. Any other bit set
+/// on an image refuses it at open: an incompatible feature is by
+/// definition one a reader that does not understand it must not guess at.
+pub const EROFS_FEATURE_INCOMPAT_SUPPORTED: u32 = EROFS_FEATURE_INCOMPAT_ZERO_PADDING
+    | EROFS_FEATURE_INCOMPAT_COMPR_CFGS
+    | EROFS_FEATURE_INCOMPAT_CHUNKED_FILE
+    | EROFS_FEATURE_INCOMPAT_DEVICE_TABLE
+    | EROFS_FEATURE_INCOMPAT_ZTAILPACKING
+    | EROFS_FEATURE_INCOMPAT_FRAGMENTS
+    | EROFS_FEATURE_INCOMPAT_XATTR_PREFIXES;
+
 /// Per-algorithm configuration parsed from the COMPR_CFGS blob. One
 /// entry per codec type id observed in the blob. Only LZMA carries
 /// reader-relevant parameters today (LZ4 / DEFLATE / ZSTD blobs exist
@@ -290,6 +327,30 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// Refuse an image that sets a `feature_incompat` bit outside
+    /// [`EROFS_FEATURE_INCOMPAT_SUPPORTED`], naming the feature.
+    ///
+    /// Not part of [`Superblock::parse`], which the writer's own tests use
+    /// to inspect arbitrary words; [`crate::Filesystem`] calls it at open.
+    pub fn check_incompat_features(&self) -> Result<()> {
+        let unsupported = self.feature_incompat & !EROFS_FEATURE_INCOMPAT_SUPPORTED;
+        if unsupported == 0 {
+            Ok(())
+        } else if unsupported & EROFS_FEATURE_INCOMPAT_METABOX != 0 {
+            Err(Error::BadSuperblock(
+                "feature_incompat metabox (0x100) is not implemented by this reader",
+            ))
+        } else if unsupported & EROFS_FEATURE_INCOMPAT_48BIT != 0 {
+            Err(Error::BadSuperblock(
+                "feature_incompat 48bit (0x80) block addressing is not implemented by this reader",
+            ))
+        } else {
+            Err(Error::BadSuperblock(
+                "feature_incompat carries an unknown bit this reader does not implement",
+            ))
+        }
+    }
+
     /// Parse + validate a superblock from a 128-byte buffer. Caller is
     /// responsible for reading the buffer at `EROFS_SUPER_OFFSET`; this
     /// function is intentionally byte-slice-only so it's trivially

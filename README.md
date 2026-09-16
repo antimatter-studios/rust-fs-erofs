@@ -73,6 +73,9 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 | **Compacted-1B index** | Format reportedly never existed in published kernels; no producer found | n/a — unobservable in practice |
 | **HEAD2 separate-algorithm WRITER** | Our writer emits single-codec images only | Use `mkfs.erofs` with `-z lz4hc,lzma` if you need this |
 | **Multi-device WRITER** | `mkfs.erofs --blobdev` is broken in upstream 1.9 | Wait for upstream fix or hand-build |
+| **48-bit block addressing** (`-E48bit`, incompat `0x80`) | Block addresses are read at 32 bits; the image is **refused at open by name** rather than read at the wrong width | Build without `-E48bit` |
+| **Metabox** (`-m`, incompat `0x100`) | The metabox-flagged root nid does not fit the 16-bit slot; **refused at open by name** | Build without `-m` |
+| Any other unknown `feature_incompat` bit | Refused at open (`EROFS_FEATURE_INCOMPAT_SUPPORTED`) | n/a |
 | **Mutate an existing EROFS image in place** | EROFS is read-only by spec — no journal, no allocator, no rewrite path | See "Read-write semantics" below |
 | **Verified boot / dm-verity hash trees** | Layer above EROFS, out of scope | Use `verity` tools alongside |
 | **ZSTD WRITER** | Reading `-zzstd` images works; our writer emits LZ4 / LZMA / DEFLATE only | Use `mkfs.erofs -zzstd` to produce one |
