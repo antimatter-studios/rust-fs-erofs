@@ -615,6 +615,18 @@ pub struct ZMap<'a> {
     /// is 0 (LZ4); harmless even for a single-codec image because no
     /// HEAD2 cluster_type ever surfaces there.
     algo_head2_id: u8,
+    /// [`Self::fragment_range`]'s answer, once worked out. It is a pure
+    /// function of the header and the index, and the read path asks it
+    /// once per pcluster -- a backward walk over the last lclusters each
+    /// time (#60).
+    fragment: std::cell::OnceCell<Option<(u32, u64, u64)>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`ZMap::open`] ran on this thread, for the tests
+    /// that pin one open per read.
+    pub(crate) static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl<'a> ZMap<'a> {
@@ -625,6 +637,8 @@ impl<'a> ZMap<'a> {
         sb: &'a Superblock,
         inode: &'a Inode,
     ) -> Result<Self> {
+        #[cfg(test)]
+        OPENS.with(|n| n.set(n.get() + 1));
         let header_off = inode.body_end(sb);
         let mut h = [0u8; 8];
         dev.read_at(header_off, &mut h)?;
@@ -721,6 +735,7 @@ impl<'a> ZMap<'a> {
             big_pcluster,
             algo_head1_id,
             algo_head2_id,
+            fragment: std::cell::OnceCell::new(),
         })
     }
 
@@ -862,6 +877,19 @@ impl<'a> ZMap<'a> {
     ///
     /// Returns `None` when the inode has no fragment.
     pub fn fragment_range<R: BlockRead + ?Sized>(
+        &self,
+        dev: &R,
+    ) -> Result<Option<(u32, u64, u64)>> {
+        if let Some(known) = self.fragment.get() {
+            return Ok(*known);
+        }
+        let range = self.work_out_fragment_range(dev)?;
+        let _ = self.fragment.set(range);
+        Ok(range)
+    }
+
+    /// [`Self::fragment_range`], uncached.
+    fn work_out_fragment_range<R: BlockRead + ?Sized>(
         &self,
         dev: &R,
     ) -> Result<Option<(u32, u64, u64)>> {
@@ -2307,6 +2335,32 @@ mod tests {
         assert_eq!(foff, 0xCAFE);
         assert_eq!(src_start, 4096 + 512);
         assert_eq!(src_end, file_size as u64);
+
+        // Asked again, it reads nothing: the answer is kept on the
+        // ZMap, where the read path used to walk the index for it once
+        // per pcluster (#60).
+        struct Counting<'d>(&'d MemDev, std::sync::atomic::AtomicUsize);
+        impl BlockRead for Counting<'_> {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.0.read_at(offset, buf)
+            }
+            fn size_bytes(&self) -> u64 {
+                self.0.size_bytes()
+            }
+        }
+        let counting = Counting(&dev, std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..3 {
+            assert_eq!(
+                zmap.fragment_range(&counting).unwrap(),
+                Some((0xCAFE, 4096 + 512, file_size as u64))
+            );
+        }
+        assert_eq!(
+            counting.1.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a fragment range already worked out was worked out again"
+        );
     }
 
     /// A NONHEAD last lcluster walks back to its owning HEAD; the

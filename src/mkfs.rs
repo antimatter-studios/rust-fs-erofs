@@ -3245,6 +3245,35 @@ mod tests {
         })
     }
 
+    /// One `read_file` over a compressed file opens its index once, not
+    /// once per block: this file is 48 blocks, and each used to reopen
+    /// and re-parse the map header (#60). A directory listing and a
+    /// lookup walk blocks the same way and share the hoist.
+    #[test]
+    fn a_compressed_read_opens_its_index_once() {
+        let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(4460);
+        let img = build_image(
+            dir(vec![(
+                "big.txt",
+                compressed_with(CompressedAlgo::Lz4, &payload),
+            )]),
+            12,
+        )
+        .unwrap();
+        let fs = open(img);
+        let inode = fs.lookup_path("/big.txt").unwrap();
+        assert!(inode.size.div_ceil(4096) > 40, "fixture: many blocks");
+        let before = crate::zmap::OPENS.with(|n| n.get());
+        let mut buf = vec![0u8; payload.len()];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(buf, payload);
+        assert_eq!(
+            crate::zmap::OPENS.with(|n| n.get()) - before,
+            1,
+            "the compressed index was opened more than once for one read"
+        );
+    }
+
     #[test]
     fn compressed_lzma_small_file() {
         // Smaller-than-lcluster payload encoded with LZMA1. The
