@@ -508,11 +508,12 @@ impl Filesystem {
         let mut remaining = inode.size;
         let mut block_idx: u64 = 0;
         let total_blocks = inode.size.div_ceil(bs);
+        let zmap = self.zmap_for(inode)?;
 
         while remaining > 0 {
             let this_block = remaining.min(bs);
             let mut buf = vec![0u8; this_block as usize];
-            self.read_data_block(inode, block_idx, total_blocks, &mut buf)?;
+            self.read_data_block(inode, block_idx, total_blocks, zmap.as_ref(), &mut buf)?;
             // Pad short last blocks back up to bs for iter_block's NUL
             // scan -- iter_block expects to find the trailing zeros.
             if buf.len() < bs as usize {
@@ -544,6 +545,7 @@ impl Filesystem {
         }
         let bs = self.sb.block_size();
         let total_blocks = dir.size.div_ceil(bs);
+        let zmap = self.zmap_for(dir)?;
         let mut remaining = dir.size;
         let mut block_idx: u64 = 0;
         let mut found: Option<u64> = None;
@@ -552,7 +554,7 @@ impl Filesystem {
             let this_block = remaining.min(bs);
             buf.clear();
             buf.resize(this_block as usize, 0);
-            self.read_data_block(dir, block_idx, total_blocks, &mut buf)?;
+            self.read_data_block(dir, block_idx, total_blocks, zmap.as_ref(), &mut buf)?;
             // Padded back to bs for the NUL scan, as in `read_dir`.
             buf.resize(bs as usize, 0);
             visit_block(&buf, |nid, _, entry| {
@@ -699,6 +701,7 @@ impl Filesystem {
         }
         let bs = self.sb.block_size();
         let total_blocks = inode.size.div_ceil(bs);
+        let zmap = self.zmap_for(inode)?;
 
         let mut written = 0usize;
         let mut cursor = offset;
@@ -713,13 +716,29 @@ impl Filesystem {
             let take = (valid_in_block - in_block_off).min(buf.len() - written);
 
             let mut block = vec![0u8; valid_in_block];
-            self.read_data_block(inode, block_idx, total_blocks, &mut block)?;
+            self.read_data_block(inode, block_idx, total_blocks, zmap.as_ref(), &mut block)?;
             buf[written..written + take].copy_from_slice(&block[in_block_off..in_block_off + take]);
 
             written += take;
             cursor += take as u64;
         }
         Ok(())
+    }
+
+    /// The compressed index of `inode`, opened once for a whole read, or
+    /// `None` for a layout that has none.
+    ///
+    /// Every block of a compressed file used to reopen it -- reading and
+    /// parsing its header and recomputing the index geometry -- so a
+    /// 3 MiB file at 4 KiB blocks opened it 768 times in one `read_file`
+    /// (#60).
+    fn zmap_for<'s>(&'s self, inode: &'s Inode) -> Result<Option<zmap::ZMap<'s>>> {
+        match inode.format.layout {
+            DataLayout::Compression | DataLayout::CompressionLegacy => {
+                zmap::ZMap::open(&*self.primary, &self.sb, inode).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Read the `block_idx`-th data block of an inode into `out` (which
@@ -731,6 +750,7 @@ impl Filesystem {
         inode: &Inode,
         block_idx: u64,
         total_blocks: u64,
+        zmap: Option<&zmap::ZMap<'_>>,
         out: &mut [u8],
     ) -> Result<()> {
         let bs = self.sb.block_size();
@@ -780,9 +800,13 @@ impl Filesystem {
                 let off = (blkaddr as u64 + block_in_chunk) * bs;
                 read(device_id, off, out)
             }
-            DataLayout::Compression | DataLayout::CompressionLegacy => {
-                self.read_compressed_block(inode, block_idx, out)
-            }
+            DataLayout::Compression | DataLayout::CompressionLegacy => match zmap {
+                Some(zmap) => self.read_compressed_block(inode, block_idx, zmap, out),
+                None => {
+                    let zmap = zmap::ZMap::open(&*self.primary, &self.sb, inode)?;
+                    self.read_compressed_block(inode, block_idx, &zmap, out)
+                }
+            },
         }
     }
 
@@ -803,9 +827,14 @@ impl Filesystem {
     /// bytes (LZ4 decompress_into is happy to stop early). The fix is
     /// to walk forward through NONHEAD entries until the next HEAD,
     /// compute the exact source span, and decompress the whole pcluster.
-    fn read_compressed_block(&self, inode: &Inode, block_idx: u64, out: &mut [u8]) -> Result<()> {
+    fn read_compressed_block(
+        &self,
+        inode: &Inode,
+        block_idx: u64,
+        zmap: &zmap::ZMap<'_>,
+        out: &mut [u8],
+    ) -> Result<()> {
         let bs = self.sb.block_size();
-        let zmap = zmap::ZMap::open(&*self.primary, &self.sb, inode)?;
         let block_start = block_idx * bs;
         // A block can straddle a pcluster boundary (different mkfs
         // policies may not align pclusters to block boundaries). Loop
@@ -817,7 +846,7 @@ impl Filesystem {
             let n = self.fill_from_one_pcluster_as(
                 inode.nid,
                 inode.is_dir() || inode.is_symlink(),
-                &zmap,
+                zmap,
                 cursor,
                 &mut out[written..],
             )?;
