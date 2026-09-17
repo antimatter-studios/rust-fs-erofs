@@ -313,9 +313,10 @@ pub struct BuildOptions {
 /// Independent implementation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ComprCfgsConfig {
-    /// LZ4 record. Payload is `__le16 max_distance; __le16 max_pcluster_blks;`
-    /// (4 bytes). The reader doesn't consume either field today; we
-    /// emit `Some(max_distance)` so the bit is advertised.
+    /// LZ4 record. Payload is `__le16 max_distance; __le16
+    /// max_pcluster_blks; u8 reserved[10]` (14 bytes, as erofs-utils
+    /// writes it). `Some(max_distance)` sets `max_distance`;
+    /// `max_pcluster_blks` is the largest pcluster the image holds.
     pub lz4: Option<u16>,
     /// LZMA record. Payload is `__le32 dict_size; __le16 format; u8
     /// reserved[8];` (14 bytes). Only `dict_size` is propagated to the
@@ -604,9 +605,29 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         if let Some(max_distance) = lz4_cfg {
             sb_u1 |= 1 << 0; // Z_EROFS_COMPRESSION_LZ4_BIT
                              // LZ4 record: __le16 max_distance; __le16 max_pcluster_blks;
-            compr_cfgs_bytes.extend_from_slice(&4u16.to_le_bytes());
+                             // u8 reserved[10]. FOURTEEN BYTES, as erofs-utils writes it:
+                             // the four-byte record this wrote made `fsck.erofs` refuse the
+                             // whole image at the superblock ("invalid lz4 cfgs, size=4"),
+                             // and its max_pcluster_blks of zero said no pcluster may hold
+                             // a block (#57). The count is the largest pcluster this image
+                             // wrote, and at least one.
+            let max_pcluster_blks = plan
+                .iter()
+                .filter_map(|node| match &node.kind {
+                    PlanKind::Compressed { pclusters, .. } => {
+                        pclusters.iter().map(|p| p.pcluster_block_count).max()
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let max_pcluster_blks = u16::try_from(max_pcluster_blks)
+                .map_err(|_| Error::BadInode("pcluster too large for the LZ4 cfgs record"))?;
+            compr_cfgs_bytes.extend_from_slice(&14u16.to_le_bytes());
             compr_cfgs_bytes.extend_from_slice(&max_distance.to_le_bytes());
-            compr_cfgs_bytes.extend_from_slice(&0u16.to_le_bytes()); // max_pcluster_blks
+            compr_cfgs_bytes.extend_from_slice(&max_pcluster_blks.to_le_bytes());
+            compr_cfgs_bytes.extend_from_slice(&[0u8; 10]); // reserved
         }
         if let Some(lzma) = lzma_cfg {
             sb_u1 |= 1 << 1; // Z_EROFS_COMPRESSION_LZMA_BIT
@@ -3840,6 +3861,46 @@ mod tests {
         assert_eq!(dict.len(), 1);
         assert_eq!(dict[0].base_index, ns::USER);
         assert_eq!(dict[0].infix, b"app");
+    }
+
+    /// The LZ4 record is the fourteen bytes erofs-utils writes and
+    /// requires, with a real max_pcluster_blks, and the image still opens
+    /// and reads (#57). Here rather than only beside the fsck oracle,
+    /// which is ignore-gated: the default `cargo test` has to hold it.
+    #[test]
+    fn compr_cfgs_lz4_record_is_fourteen_bytes() {
+        let cfg = ComprCfgsConfig {
+            lz4: Some(0xFFFF),
+            ..ComprCfgsConfig::default()
+        };
+        let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(20);
+        let opts = BuildOptions {
+            compr_cfgs: Some(cfg),
+            ..BuildOptions::default()
+        };
+        let img = build_image_with(
+            dir(vec![(
+                "c.bin",
+                compressed_with(CompressedAlgo::Lz4, &payload),
+            )]),
+            12,
+            opts,
+        )
+        .unwrap();
+        // The blob follows the 128-byte superblock: size, max_distance,
+        // max_pcluster_blks, then ten reserved bytes -- and nothing of the
+        // next record, since LZ4 is the only one.
+        assert_eq!(
+            &img[1152..1168],
+            &[0x0e, 0x00, 0xff, 0xff, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "the LZ4 record's size, max_distance, max_pcluster_blks and reserved bytes"
+        );
+        let fs = open(img);
+        assert!(fs.superblock().feature_incompat & EROFS_FEATURE_INCOMPAT_COMPR_CFGS != 0);
+        let inode = fs.lookup_path("/c.bin").unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(buf, payload);
     }
 
     #[test]
