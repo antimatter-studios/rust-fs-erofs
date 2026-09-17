@@ -952,6 +952,56 @@ fn fsck_passes_on_image_with_compr_cfgs() {
     );
 }
 
+/// An LZ4 COMPR_CFGS record is the fourteen bytes erofs-utils writes and
+/// declares a real pcluster size: a four-byte record made `fsck.erofs`
+/// refuse the image at the superblock (#57). The LZMA test above is the
+/// only one that built a cfgs blob, and it never set the LZ4 record.
+#[test]
+#[ignore = "needs fsck.erofs (erofs-utils)"]
+fn fsck_passes_on_image_with_lz4_compr_cfgs() {
+    if !fsck_erofs_available() {
+        eprintln!("skipping: fsck.erofs not on PATH");
+        return;
+    }
+    use fs_erofs::mkfs::{CompressedAlgo, CompressedFileSpec, CompressedIndexFormat};
+    let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(20);
+    let cfg = mkfs::ComprCfgsConfig {
+        lz4: Some(0xFFFF),
+        ..mkfs::ComprCfgsConfig::default()
+    };
+    let opts = mkfs::BuildOptions {
+        compr_cfgs: Some(cfg),
+        ..mkfs::BuildOptions::default()
+    };
+    let n = mkfs::Node::CompressedFile(CompressedFileSpec {
+        mode: mkfs::DEFAULT_FILE_MODE,
+        data: payload,
+        algo: CompressedAlgo::Lz4,
+        lclusterbits: 0,
+        meta: mkfs::NodeMeta::default(),
+        xattrs: Vec::new(),
+        index_format: CompressedIndexFormat::Legacy,
+        ztailpacking: false,
+        target_pcluster_blocks: CompressedFileSpec::default_target_pcluster_blocks(),
+    });
+    let img = mkfs::build_image_with(dir(vec![("c.bin", n)]), 12, opts).unwrap();
+    // The blob follows the 128-byte superblock at byte 1152: size 14,
+    // max_distance, then max_pcluster_blks -- one, the only pcluster
+    // size this writer makes.
+    assert_eq!(
+        &img[1152..1158],
+        &[0x0e, 0x00, 0xff, 0xff, 0x01, 0x00],
+        "the LZ4 record's size, max_distance and max_pcluster_blks"
+    );
+    let (path, _guard) = stage_image(&img);
+    let (code, stdout, stderr) = run_fsck(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
 #[test]
 #[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_image_with_correct_nlink() {
