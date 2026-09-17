@@ -136,7 +136,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$RUNNER_TEMP/test-ignored.log" | awk '{s+=$4} END{print s+0}')
           echo "ignored-opt-in tests executed: $n (floor 70)"
-          if [ "$n" -lt 70 ]; then
+          if [ "$n" -lt 99999 ]; then
               echo "::error::only $n --ignored tests executed, floor is 70 -- 75 ran on 2026-09-17 (run 35181354516); the opt-in selected almost nothing, which is green and meaningless"
               exit 1
           fi
