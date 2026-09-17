@@ -3863,6 +3863,46 @@ mod tests {
         assert_eq!(dict[0].infix, b"app");
     }
 
+    /// The LZ4 record is the fourteen bytes erofs-utils writes and
+    /// requires, with a real max_pcluster_blks, and the image still opens
+    /// and reads (#57). Here rather than only beside the fsck oracle,
+    /// which is ignore-gated: the default `cargo test` has to hold it.
+    #[test]
+    fn compr_cfgs_lz4_record_is_fourteen_bytes() {
+        let cfg = ComprCfgsConfig {
+            lz4: Some(0xFFFF),
+            ..ComprCfgsConfig::default()
+        };
+        let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(20);
+        let opts = BuildOptions {
+            compr_cfgs: Some(cfg),
+            ..BuildOptions::default()
+        };
+        let img = build_image_with(
+            dir(vec![(
+                "c.bin",
+                compressed_with(CompressedAlgo::Lz4, &payload),
+            )]),
+            12,
+            opts,
+        )
+        .unwrap();
+        // The blob follows the 128-byte superblock: size, max_distance,
+        // max_pcluster_blks, then ten reserved bytes -- and nothing of the
+        // next record, since LZ4 is the only one.
+        assert_eq!(
+            &img[1152..1168],
+            &[0x0e, 0x00, 0xff, 0xff, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "the LZ4 record's size, max_distance, max_pcluster_blks and reserved bytes"
+        );
+        let fs = open(img);
+        assert!(fs.superblock().feature_incompat & EROFS_FEATURE_INCOMPAT_COMPR_CFGS != 0);
+        let inode = fs.lookup_path("/c.bin").unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(buf, payload);
+    }
+
     #[test]
     fn compr_cfgs_lzma_dict_size_emitted() {
         // Build an image whose COMPR_CFGS blob carries a non-default
