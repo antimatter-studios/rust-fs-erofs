@@ -138,6 +138,29 @@ fn runs_with_overflow_checks(script: &str) -> Vec<String> {
 /// next one: `-j4 -r` is release, `-pr` names a package `r`. Everything
 /// after `--` belongs to the test harness, where `-r` is not cargo's.
 fn selects_release_by_short_flag(command: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let mut at = 0;
+    while at < words.len() {
+        // `cargo` by name or by path, then any `+toolchain`, then `test`.
+        let is_cargo = words[at] == "cargo" || words[at].ends_with("/cargo");
+        let mut next = at + 1;
+        while is_cargo && words.get(next).is_some_and(|w| w.starts_with('+')) {
+            next += 1;
+        }
+        if is_cargo && words.get(next) == Some(&"test") && release_in(&words[next + 1..]) {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
+/// Whether `cargo test`'s `arguments`, up to the end of its own command,
+/// carry `-r`. See [`selects_release_by_short_flag`].
+///
+/// A shell separator ends the command: `cargo test --lib && rm -rf build`
+/// is a debug run, and the `r` in `-rf` belongs to `rm`.
+fn release_in(arguments: &[&str]) -> bool {
     const LONG_OPTIONS_TAKING_A_VALUE: [&str; 15] = [
         "--package",
         "--exclude",
@@ -155,35 +178,39 @@ fn selects_release_by_short_flag(command: &str) -> bool {
         "--color",
         "--config",
     ];
-    let words: Vec<&str> = command.split_whitespace().collect();
-    let Some(at) = words.windows(2).position(|w| w == ["cargo", "test"]) else {
-        return false;
-    };
     let mut next_is_a_value = false;
-    for argument in &words[at + 2..] {
+    for raw in arguments {
+        if matches!(*raw, "&&" | "||" | ";" | "|" | "&") {
+            return false;
+        }
+        let ends_command = raw.ends_with(';') || raw.ends_with('&') || raw.ends_with('|');
+        let argument = raw.trim_end_matches([';', '&', '|']);
         if std::mem::take(&mut next_is_a_value) {
+            if ends_command {
+                return false;
+            }
             continue;
         }
-        if *argument == "--" {
+        if argument == "--" {
             return false;
         }
         if argument.starts_with("--") {
             next_is_a_value =
-                !argument.contains('=') && LONG_OPTIONS_TAKING_A_VALUE.contains(argument);
-            continue;
-        }
-        let Some(cluster) = argument.strip_prefix('-') else {
-            continue;
-        };
-        for (at, flag) in cluster.char_indices() {
-            match flag {
-                'r' => return true,
-                'p' | 'j' | 'F' | 'Z' => {
-                    next_is_a_value = at + 1 == cluster.len();
-                    break;
+                !argument.contains('=') && LONG_OPTIONS_TAKING_A_VALUE.contains(&argument);
+        } else if let Some(cluster) = argument.strip_prefix('-') {
+            for (at, flag) in cluster.char_indices() {
+                match flag {
+                    'r' => return true,
+                    'p' | 'j' | 'F' | 'Z' => {
+                        next_is_a_value = at + 1 == cluster.len();
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+        }
+        if ends_command {
+            return false;
         }
     }
     false
@@ -861,6 +888,8 @@ EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
             "cargo test --locked -j4 -r",
             "cargo test --locked -j 4 -r --lib",
             "cargo test --locked --features x -r",
+            "/usr/bin/cargo test --locked -r --lib",
+            "cargo +1.95.0 test --locked -r --lib",
         ] {
             assert_eq!(
                 runs_with_overflow_checks(line),
@@ -874,6 +903,8 @@ EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
             "cargo test --locked -F r",
             "cargo test --locked -pr --lib",
             "cargo test --locked -j r --lib",
+            "cargo test --locked --lib && rm -rf build",
+            "cargo test --locked --lib; echo -r",
         ] {
             assert_eq!(
                 runs_with_overflow_checks(line).len(),
