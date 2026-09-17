@@ -13,16 +13,26 @@
 //! `mkfs.erofs` builds an image with one option, and the bit it set is
 //! read straight out of the superblock at offset 0x50.
 //!
-//! Skips when `mkfs.erofs` is not on `PATH`.
+//! `#[ignore]`-gated like the other `mkfs.erofs` oracles, and run where
+//! the tool is installed with `-- --ignored`. It used to run in the
+//! default `cargo test` and pass with a skip line wherever the tool was
+//! missing -- which is every machine a contributor checks a constant on
+//! before opening a pull request (#53). Asked to run without the tool,
+//! it now fails.
 
 mod common;
 use common::{materialize_tree, mkfs_erofs_available, run_mkfs_erofs};
 
 use fs_erofs::mkfs;
 use fs_erofs::superblock::{
-    EROFS_FEATURE_INCOMPAT_DEDUPE, EROFS_FEATURE_INCOMPAT_FRAGMENTS,
-    EROFS_FEATURE_INCOMPAT_ZERO_PADDING, EROFS_FEATURE_INCOMPAT_ZTAILPACKING,
+    EROFS_FEATURE_INCOMPAT_48BIT, EROFS_FEATURE_INCOMPAT_CHUNKED_FILE,
+    EROFS_FEATURE_INCOMPAT_COMPR_CFGS, EROFS_FEATURE_INCOMPAT_DEDUPE,
+    EROFS_FEATURE_INCOMPAT_FRAGMENTS, EROFS_FEATURE_INCOMPAT_METABOX,
+    EROFS_FEATURE_INCOMPAT_XATTR_PREFIXES, EROFS_FEATURE_INCOMPAT_ZERO_PADDING,
+    EROFS_FEATURE_INCOMPAT_ZTAILPACKING, Z_EROFS_COMPRESSION_DEFLATE_BIT,
+    Z_EROFS_COMPRESSION_LZ4_BIT, Z_EROFS_COMPRESSION_LZMA_BIT,
 };
+use fs_erofs::Filesystem;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -89,12 +99,20 @@ fn incompat_for(dir: &Path, label: &str, extra: &[&str]) -> u32 {
     bits
 }
 
+/// The tool, or a failure that says it is missing: an opted-in oracle
+/// that skips reads exactly like one that passed.
+fn require_mkfs_erofs() {
+    assert!(
+        mkfs_erofs_available(),
+        "mkfs.erofs is not on PATH; this oracle measures what it writes, so install \
+         erofs-utils or leave it to the job that runs `cargo test -- --ignored`"
+    );
+}
+
 #[test]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn each_option_sets_the_bit_this_crate_names() {
-    if !mkfs_erofs_available() {
-        eprintln!("mkfs.erofs not on PATH — skipping");
-        return;
-    }
+    require_mkfs_erofs();
     let dir = tempfile::tempdir().expect("tempdir");
     materialize_tree(&dir.path().join("src"), &source_tree());
 
@@ -147,4 +165,112 @@ fn each_option_sets_the_bit_this_crate_names() {
         EROFS_FEATURE_INCOMPAT_FRAGMENTS, EROFS_FEATURE_INCOMPAT_ZTAILPACKING,
         "fragments is 0x20 and ztailpacking is 0x10; they were once both 0x10 here"
     );
+}
+
+/// The bits set by options that are not about compression, each against
+/// an uncompressed baseline.
+#[test]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
+fn the_layout_options_set_the_bits_this_crate_names() {
+    require_mkfs_erofs();
+    let dir = tempfile::tempdir().expect("tempdir");
+    materialize_tree(&dir.path().join("src"), &source_tree());
+
+    let plain = incompat_for(dir.path(), "uncompressed", &[]);
+    for (label, args, want, name) in [
+        (
+            "chunked",
+            &["--chunksize=65536"][..],
+            EROFS_FEATURE_INCOMPAT_CHUNKED_FILE,
+            "CHUNKED_FILE",
+        ),
+        (
+            "xattr-prefix",
+            &["--xattr-prefix=user.foo"][..],
+            EROFS_FEATURE_INCOMPAT_XATTR_PREFIXES,
+            "XATTR_PREFIXES",
+        ),
+        (
+            "48bit",
+            &["-E48bit"][..],
+            EROFS_FEATURE_INCOMPAT_48BIT,
+            "48BIT",
+        ),
+        (
+            "metabox",
+            &["-m65536"][..],
+            EROFS_FEATURE_INCOMPAT_METABOX | EROFS_FEATURE_INCOMPAT_48BIT,
+            "METABOX | 48BIT",
+        ),
+    ] {
+        let bits = incompat_for(dir.path(), label, args);
+        assert_eq!(
+            bits ^ plain,
+            want,
+            "{args:?} should add EROFS_FEATURE_INCOMPAT_{name} ({want:#x}) and nothing else"
+        );
+    }
+}
+
+/// COMPR_CFGS is the one incompat bit the reader branches on: it gates
+/// the configuration blob after the superblock, walked per algorithm by
+/// `available_compr_algs` bit (#53). So it is checked twice. The bit each
+/// option adds must be `EROFS_FEATURE_INCOMPAT_COMPR_CFGS`, the algorithm
+/// bitmap in the superblock must carry the bit this crate names for that
+/// codec, and the image must open and read back through the walk.
+#[test]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
+fn compression_configurations_set_compr_cfgs_and_still_read() {
+    require_mkfs_erofs();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = source_tree();
+    materialize_tree(&dir.path().join("src"), &tree);
+    let mkfs::Node::Dir { entries, .. } = &tree else {
+        unreachable!("the source tree is a directory")
+    };
+    let mkfs::Node::File { data: big, .. } = &entries["big.bin"] else {
+        unreachable!("big.bin is a file")
+    };
+
+    let lz4 = incompat_for(dir.path(), "lz4", &["-zlz4"]);
+    assert_eq!(
+        lz4 & EROFS_FEATURE_INCOMPAT_COMPR_CFGS,
+        0,
+        "plain LZ4 records no configuration: the superblock slot holds lz4_max_distance"
+    );
+    for (label, args, algorithm) in [
+        ("lzma", &["-zlzma"][..], Z_EROFS_COMPRESSION_LZMA_BIT),
+        (
+            "deflate",
+            &["-zdeflate"][..],
+            Z_EROFS_COMPRESSION_DEFLATE_BIT,
+        ),
+        (
+            "lz4hc-big-pcluster",
+            &["-zlz4hc", "-C65536"][..],
+            Z_EROFS_COMPRESSION_LZ4_BIT,
+        ),
+    ] {
+        let bits = incompat_for(dir.path(), label, args);
+        assert_eq!(
+            bits ^ lz4,
+            EROFS_FEATURE_INCOMPAT_COMPR_CFGS,
+            "{args:?} should add COMPR_CFGS to the compressed baseline"
+        );
+        let bytes = std::fs::read(dir.path().join(format!("{label}.img"))).unwrap();
+        let fs = Filesystem::open(common::MemDev::arc(bytes))
+            .unwrap_or_else(|e| panic!("{label}: an image with COMPR_CFGS did not open: {e:?}"));
+        assert_eq!(
+            fs.superblock().u1,
+            algorithm,
+            "{label}: available_compr_algs is not the bit this crate names for the codec"
+        );
+        let inode = fs
+            .lookup_path("/big.bin")
+            .unwrap_or_else(|e| panic!("{label}: lookup: {e:?}"));
+        let mut buf = vec![0u8; big.len()];
+        fs.read_file(&inode, 0, &mut buf)
+            .unwrap_or_else(|e| panic!("{label}: read: {e:?}"));
+        assert!(&buf == big, "{label}: big.bin read back differently");
+    }
 }
