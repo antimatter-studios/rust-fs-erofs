@@ -1,9 +1,19 @@
 //! Oracle-compatibility tests: feed our reader an image produced by
 //! the canonical `mkfs.erofs` (erofs-utils) and verify the directory
 //! listing + file contents. Each test runs `mkfs.erofs` with a
-//! specific flag combination so we can prove which on-disk variants
-//! the reader handles -- and which currently surface as
-//! `Error::UnsupportedLayout(_)` (the to-do list for Phase 2/3).
+//! specific flag combination, and every one of them requires the image
+//! to read back: an image this reader cannot open, cannot look a path
+//! up in, or errors on reading is a FAILURE here, not a result to be
+//! noted (#116). The arrangement where a refusal counted as a pass
+//! dated from when these formats were still on the to-do list, and it
+//! outlived that: it made a reader that had stopped reading anything
+//! at all look exactly like a reader that read everything.
+//!
+//! A format this crate genuinely does not implement belongs in a test
+//! that names the layout and asserts the specific error, so the test
+//! fails both when reading breaks and when support arrives. There is
+//! no such case left in this file; `tests/oracle_verdicts.rs` refuses
+//! the blanket shape coming back.
 //!
 //! All tests in this file are `#[ignore]`-gated so a fresh checkout
 //! without erofs-utils still has a green `cargo test` run. Opt in
@@ -74,9 +84,10 @@ fn assert_sample_matches(fs: &Filesystem) {
     assert_tree_matches(fs, &refs);
 }
 
-/// Try opening + reading; categorize the outcome so we can both pass
-/// the "fails with UnsupportedLayout" tests AND surface a clear
-/// regression signal when the reader starts returning real bytes.
+/// Try opening + reading; categorize the outcome so a failure says
+/// WHICH step gave way -- open, lookup or read -- instead of only
+/// that something did. Every caller asserts `Match`; the other
+/// variants exist to be printed in the panic message.
 #[derive(Debug)]
 #[allow(dead_code)] // string payloads are diagnostic-only
 enum ReadOutcome {
@@ -145,115 +156,92 @@ fn oracle_default() {
 
 #[test]
 #[ignore = "needs mkfs.erofs (erofs-utils)"]
-fn oracle_uncompacted_legacy_index() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
-    // Disable the modern features so mkfs falls back to the legacy
-    // uncompacted index (which Phase 2 v0.1 fully supports).
-    let img = build_with_mkfs_erofs(&["-E^ztailpacking,^fragments,^dedupe"], &sample_tree());
-    let outcome = try_read_sample(img.bytes);
-    println!("oracle_uncompacted_legacy_index: {outcome:?}");
-    match outcome {
-        ReadOutcome::Match => {}
-        ReadOutcome::OpenError(_) | ReadOutcome::LookupError(_) | ReadOutcome::ReadError(_) => {}
-        ReadOutcome::Mismatch(s) => panic!("silent corruption: {s}"),
-    }
-}
-
-#[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_lz4_explicit() {
     if !mkfs_erofs_available() {
         eprintln!("skipping: mkfs.erofs not on PATH");
         return;
     }
+    // `-z lz4` over the whole sample tree: a nested directory, an
+    // empty file, a 12-byte file, a 200-byte incompressible one and a
+    // compressible 5 KiB one, all in the one image.
+    // `our_compacted2b_image_compatible_with_kernel_oracle` also builds
+    // `-z lz4`, but from a single 1 MiB file at the root, so it never
+    // looks a nested path up or reads a zero-length inode.
     let img = build_with_mkfs_erofs(&["-z", "lz4"], &sample_tree());
     let outcome = try_read_sample(img.bytes);
     println!("oracle_lz4_explicit: {outcome:?}");
-    match outcome {
-        ReadOutcome::Match => {}
-        ReadOutcome::OpenError(_) | ReadOutcome::LookupError(_) | ReadOutcome::ReadError(_) => {}
-        ReadOutcome::Mismatch(s) => panic!("silent corruption: {s}"),
-    }
+    assert!(
+        matches!(outcome, ReadOutcome::Match),
+        "the mkfs.erofs -z lz4 image does not read back: {outcome:?}"
+    );
 }
 
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils); LZMA may not be wired through zmap"]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_lzma() {
     if !mkfs_erofs_available() {
         eprintln!("skipping: mkfs.erofs not on PATH");
         return;
     }
+    // `oracle_lzma_default_round_trip` pins `-b 4096` and a single
+    // 3584-byte file to stay inside one lcluster; this one takes
+    // mkfs.erofs's own block-size default and the whole sample tree,
+    // so BIG_PCLUSTER and the directory walk are both in the image.
     let img = build_with_mkfs_erofs(&["-z", "lzma"], &sample_tree());
     let outcome = try_read_sample(img.bytes);
     println!("oracle_lzma: {outcome:?}");
-    match outcome {
-        ReadOutcome::Match => {}
-        ReadOutcome::OpenError(_) | ReadOutcome::LookupError(_) | ReadOutcome::ReadError(_) => {}
-        ReadOutcome::Mismatch(s) => panic!("silent corruption: {s}"),
-    }
+    assert!(
+        matches!(outcome, ReadOutcome::Match),
+        "the mkfs.erofs -z lzma image does not read back: {outcome:?}"
+    );
 }
 
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils); DEFLATE may not be wired through zmap"]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_deflate() {
     if !mkfs_erofs_available() {
         eprintln!("skipping: mkfs.erofs not on PATH");
         return;
     }
+    // The DEFLATE twin of `oracle_lzma`, and the same relationship to
+    // `oracle_deflate_default_round_trip`.
     let img = build_with_mkfs_erofs(&["-z", "deflate"], &sample_tree());
     let outcome = try_read_sample(img.bytes);
     println!("oracle_deflate: {outcome:?}");
-    match outcome {
-        ReadOutcome::Match => {}
-        ReadOutcome::OpenError(_) | ReadOutcome::LookupError(_) | ReadOutcome::ReadError(_) => {}
-        ReadOutcome::Mismatch(s) => panic!("silent corruption: {s}"),
-    }
+    assert!(
+        matches!(outcome, ReadOutcome::Match),
+        "the mkfs.erofs -z deflate image does not read back: {outcome:?}"
+    );
 }
 
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils); chunk-based files"]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_chunked() {
     if !mkfs_erofs_available() {
         eprintln!("skipping: mkfs.erofs not on PATH");
         return;
     }
+    // Chunk-based inodes. `incompat_gate.rs`'s
+    // `oracle_chunked_opens_and_48bit_is_refused` builds the same
+    // `--chunksize=65536` image, but reads one 13-byte file out of a
+    // two-entry tree; here a 5 KiB chunk spanning more than one block,
+    // and a zero-length file, are read too.
     let img = build_with_mkfs_erofs(&["--chunksize=65536"], &sample_tree());
     let outcome = try_read_sample(img.bytes);
     println!("oracle_chunked: {outcome:?}");
-    match outcome {
-        ReadOutcome::Match => {}
-        ReadOutcome::OpenError(_) | ReadOutcome::LookupError(_) | ReadOutcome::ReadError(_) => {}
-        ReadOutcome::Mismatch(s) => panic!("silent corruption: {s}"),
-    }
+    assert!(
+        matches!(outcome, ReadOutcome::Match),
+        "the mkfs.erofs --chunksize=65536 image does not read back: {outcome:?}"
+    );
 }
 
-#[test]
-#[ignore = "needs mkfs.erofs (erofs-utils); xattrs"]
-fn oracle_with_xattrs() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
-    // -x N sets the xattr inline tolerance (default 2; -x 1 enables
-    // xattr inlining for files with at most 1 inline xattr). Reader
-    // should ignore xattr presence for plain reads.
-    let img = build_with_mkfs_erofs(&["-x", "1"], &sample_tree());
-    let outcome = try_read_sample(img.bytes);
-    println!("oracle_with_xattrs: {outcome:?}");
-    match outcome {
-        ReadOutcome::Match => {}
-        ReadOutcome::OpenError(_) | ReadOutcome::LookupError(_) | ReadOutcome::ReadError(_) => {}
-        ReadOutcome::Mismatch(s) => panic!("silent corruption: {s}"),
-    }
-}
-
-// ---- variants that we EXPECT to read cleanly today --------------------
+// ---- the same images, read through the tree-walking helpers ----------
 
 /// Plain (no -z) build with modern features stripped should yield
-/// FLAT_PLAIN/FLAT_INLINE inodes and read perfectly.
+/// FLAT_PLAIN/FLAT_INLINE inodes and read perfectly. This is also
+/// where `oracle_uncompacted_legacy_index` went (#116): it built the
+/// identical image from the identical tree with the identical
+/// `-E^ztailpacking,^fragments,^dedupe`, and asserted less about it.
 #[test]
 #[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_plain_uncompressed() {
@@ -391,6 +379,13 @@ fn a_failed_xattr_set_reports_what_each_tool_said() {
 /// SAME xattr value, so mkfs deduplicates it into the shared block area.
 /// Verify our reader resolves both inline and shared entries and returns
 /// the full set per file.
+///
+/// This and `oracle_custom_xattr_prefix_round_trip` are the xattr
+/// oracles. `oracle_with_xattrs` passed `-x 1` over a tree on which no
+/// xattr had been set, and `mkfs.erofs -U <fixed> -T 0 -x 1` emits an
+/// image byte-identical to the one it emits without `-x` for such a
+/// tree -- so it was `oracle_default` under another name, minus the
+/// verdict. Removed in #116.
 #[test]
 #[ignore = "needs mkfs.erofs (erofs-utils) + xattr/setfattr; shared xattrs"]
 fn oracle_shared_xattrs_round_trip() {
