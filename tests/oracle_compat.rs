@@ -1582,97 +1582,321 @@ fn our_deflate_writer_sha256_round_trip_100kib() {
     );
 }
 
-/// W4 milestone: end-to-end proof that an image emitted by our writer
-/// is mountable by the live Linux EROFS kernel module. Requires:
+/// The tree the kernel-mountability check writes, and what every file in
+/// it must read back as through the mount.
 ///
-/// - Linux host (the EROFS module + `mount` syscall are kernel APIs).
-/// - root or `mount -o user`-permissive sudoers entry to invoke
-///   `mount`/`umount`.
-/// - the `loop` driver loaded.
+/// Deliberately more than one inode layout: a tail-inlined small file, a
+/// file that is exactly one block, a multi-block one, an empty one, a
+/// symlink and two levels of directory. A mount proves the superblock
+/// parses; only reading every one of these back proves the inodes,
+/// directory blocks and data layout the writer emitted are the ones the
+/// kernel thinks they are.
+#[cfg(target_os = "linux")]
+fn kernel_mount_sample() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node) {
+    let mut big = Vec::with_capacity(100_000);
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    while big.len() < 100_000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        big.extend_from_slice(&seed.to_le_bytes());
+    }
+    big.truncate(100_000);
+    let exact_block = vec![0x5Au8; 4096];
+    let leaf = vec![0x11u8; 5000];
+
+    let files: Vec<(String, Vec<u8>)> = vec![
+        ("/a.bin", vec![0xABu8; 200]),
+        ("/big.bin", big.clone()),
+        ("/empty", Vec::new()),
+        ("/exact_block.bin", exact_block.clone()),
+        ("/hello.txt", b"hello\n".to_vec()),
+        ("/sub/deeper/leaf.bin", leaf.clone()),
+        ("/sub/nested.txt", b"nested\n".to_vec()),
+    ]
+    .into_iter()
+    .map(|(p, b)| (p.to_string(), b))
+    .collect();
+
+    let tree = dir(vec![
+        ("hello.txt", file(b"hello\n")),
+        ("a.bin", file(&[0xABu8; 200])),
+        ("empty", file(b"")),
+        ("exact_block.bin", file(&exact_block)),
+        ("big.bin", file(&big)),
+        (
+            "link.txt",
+            fs_erofs::mkfs::Node::Symlink {
+                mode: 0o120777,
+                target: "hello.txt".to_string(),
+                meta: fs_erofs::mkfs::NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+        ),
+        (
+            "sub",
+            dir(vec![
+                ("nested.txt", file(b"nested\n")),
+                ("deeper", dir(vec![("leaf.bin", file(&leaf))])),
+            ]),
+        ),
+    ]);
+    (files, tree)
+}
+
+/// True when this process is already root, so `sudo` is neither needed
+/// nor necessarily installed.
+#[cfg(target_os = "linux")]
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+/// Run `argv` with the privilege `mount(2)` needs: directly when this
+/// process is root, through `sudo -n` otherwise.
 ///
-/// On macOS / non-Linux hosts, the test is `cfg`-skipped at compile
-/// time (so `cargo test` on developer macOS hosts stays green). It is
-/// `#[ignore]`-gated unconditionally so even on Linux the suite stays
-/// green when the harness lacks mount privileges.
+/// `-n` NEVER PROMPTS. A sudo that asks for a password from a test would
+/// hang a CI job until the job timeout, which reads as an infrastructure
+/// fault rather than as the missing privilege it is. Failing at once,
+/// with sudo's own stderr, is what the caller can act on.
+#[cfg(target_os = "linux")]
+fn run_privileged(argv: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut cmd = if running_as_root() {
+        std::process::Command::new(argv[0])
+    } else {
+        let mut c = std::process::Command::new("sudo");
+        c.arg("-n").arg(argv[0]);
+        c
+    };
+    cmd.args(&argv[1..]).output()
+}
+
+/// Unmounts on every exit path, including a panicking assertion.
 ///
-/// What we test: build a tree with our `mkfs::build_image`, write the
-/// bytes to a tempfile, mount it via `mount -t erofs -o loop <img>
-/// <mountpoint>`, list the mountpoint, and unmount. If mount fails the
-/// captured stderr is included in the panic to make CI diagnosis easy.
+/// The mount is made with `-o loop`, and the kernel marks a loop device
+/// set up that way autoclear: unmounting detaches it. So the unmount is
+/// the whole of the cleanup, and it has to happen even when the content
+/// comparison below fails -- otherwise `tempdir`'s cleanup deletes the
+/// mountpoint out from under a live filesystem and the runner keeps a
+/// loop device pinned to a file that no longer exists.
+#[cfg(target_os = "linux")]
+struct KernelMount {
+    mountpoint: std::path::PathBuf,
+    image: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for KernelMount {
+    fn drop(&mut self) {
+        let mp = self.mountpoint.display().to_string();
+        let ok = matches!(run_privileged(&["umount", &mp]), Ok(o) if o.status.success());
+        if !ok {
+            // Lazy detach rather than leaving it mounted: a second
+            // failure here is worth printing, but a mounted tempdir is
+            // worse than a noisy log.
+            let lazy = run_privileged(&["umount", "-l", &mp]);
+            eprintln!(
+                "umount {mp} failed; lazy umount: {:?}",
+                lazy.map(|o| o.status)
+            );
+        }
+        // Prove the loop device went with it rather than assuming the
+        // autoclear happened: a leaked device survives the job and the
+        // next test to ask for one gets a different answer.
+        if let Ok(out) = run_privileged(&["losetup", "-j", &self.image.display().to_string()]) {
+            let left = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !left.is_empty() {
+                eprintln!("loop device still attached after umount: {left}");
+                if let Some(dev) = left.split(':').next() {
+                    let _ = run_privileged(&["losetup", "-d", dev]);
+                }
+            }
+        }
+    }
+}
+
+/// Every regular file under `root`, keyed by its path relative to the
+/// mountpoint, with the bytes the kernel returns for it.
+#[cfg(target_os = "linux")]
+fn read_mounted_tree(
+    root: &std::path::Path,
+    dir_path: &std::path::Path,
+    files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    dirs: &mut std::collections::BTreeSet<String>,
+    links: &mut std::collections::BTreeMap<String, String>,
+) {
+    let entries = std::fs::read_dir(dir_path)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir_path.display()));
+    for entry in entries {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let rel = format!(
+            "/{}",
+            path.strip_prefix(root)
+                .expect("entry under mountpoint")
+                .display()
+        );
+        let meta = std::fs::symlink_metadata(&path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+        if meta.is_dir() {
+            dirs.insert(rel);
+            read_mounted_tree(root, &path, files, dirs, links);
+        } else if meta.is_symlink() {
+            let target = std::fs::read_link(&path)
+                .unwrap_or_else(|e| panic!("readlink {}: {e}", path.display()));
+            links.insert(rel, target.display().to_string());
+        } else {
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("read {} through the mount: {e}", path.display()));
+            assert_eq!(
+                bytes.len() as u64,
+                meta.len(),
+                "{rel}: stat size {} but {} bytes read back",
+                meta.len(),
+                bytes.len()
+            );
+            files.insert(rel, bytes);
+        }
+    }
+}
+
+/// W4 milestone: end-to-end proof that an image emitted by our writer is
+/// mountable by the live Linux EROFS kernel module, and that what the
+/// kernel then reads out of it is what the writer put in.
+///
+/// # A skip here is a failure
+///
+/// This test spent its whole existence returning early. It invoked
+/// `mount` unprivileged, matched the refusal against a list of
+/// permission-denied wordings, printed "skipping" and returned ok --
+/// and CI opts it in on every run, so the repository's strongest claim
+/// about its writer was answered by a `mount` that was never allowed to
+/// run (#117).
+///
+/// The privilege was available the whole time: GitHub's runners have
+/// passwordless `sudo` and the `loop` driver, which is how the btrfs and
+/// squashfs siblings mount their fixtures. So the mount is made through
+/// `sudo -n`, and a mount that cannot be made **fails** whenever `CI` is
+/// set, naming what the job was supposed to have provided. On a laptop
+/// without sudo it still skips, because there it really is the harness
+/// and not the writer.
+///
+/// # What it proves
+///
+/// `mount(2)` succeeding proves the superblock is acceptable and nothing
+/// more. So after mounting, every file in the tree is read back through
+/// the kernel and compared by name, by size and by SHA-256 of its
+/// contents, the directories are compared as a set, and the symlink's
+/// target is read. A writer defect that produces a mountable image with
+/// the wrong bytes in it fails here.
+///
+/// `#[cfg(target_os = "linux")]`: the EROFS module and `mount` are
+/// kernel APIs, so on macOS there is nothing to ask. `#[ignore]` keeps a
+/// fresh checkout green; CI's `--ignored` run opts it back in.
 #[test]
-#[ignore = "kernel-mountability check; needs Linux + mount privileges"]
+#[ignore = "kernel-mountability check; needs Linux + mount privileges, which CI provides"]
 #[cfg(target_os = "linux")]
 fn our_writer_image_kernel_mountable() {
     use std::path::PathBuf;
 
-    let img_bytes = mkfs::build_image(
-        dir(vec![
-            ("hello.txt", file(b"hello\n")),
-            ("a.bin", file(&[0xAB; 200])),
-            ("sub", dir(vec![("nested.txt", file(b"nested\n"))])),
-        ]),
-        12,
-    )
-    .expect("build_image");
+    let (expected_files, tree) = kernel_mount_sample();
+    let img_bytes = mkfs::build_image(tree, 12).expect("build_image");
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let img_path: PathBuf = tmp.path().join("our.img");
     std::fs::write(&img_path, &img_bytes).expect("write image file");
     let mountpoint: PathBuf = tmp.path().join("mnt");
     std::fs::create_dir_all(&mountpoint).expect("create mountpoint");
+    // The kernel mounts as root and the image's inodes are owned by root
+    // with our writer's default 0755/0644 modes, so the unprivileged
+    // test process can read the tree back. It cannot traverse the
+    // tempdir as root, though, if the tempdir is not searchable -- it is
+    // 0700 by default and the reader here is the same user that made it,
+    // so this is only about the kernel's own lookup of the image file.
+    let in_ci = std::env::var_os("CI").is_some();
 
-    let mount = std::process::Command::new("mount")
-        .arg("-t")
-        .arg("erofs")
-        .arg("-o")
-        .arg("loop")
-        .arg(&img_path)
-        .arg(&mountpoint)
-        .output()
-        .expect("spawn mount");
-    if !mount.status.success() {
-        let stderr = String::from_utf8_lossy(&mount.stderr);
-        // Skip rather than fail when the harness lacks the privileges
-        // this test needs. GitHub Actions ubuntu runners run unprivileged
-        // and can't `losetup` -- exit 32 with "failed to setup loop
-        // device" or "Permission denied" or "must be superuser" comes
-        // from that, not from a writer bug.
-        let no_priv = stderr.contains("setup loop device")
-            || stderr.contains("Permission denied")
-            || stderr.contains("must be superuser")
-            || stderr.contains("Operation not permitted");
-        if no_priv {
-            eprintln!(
-                "skipping: harness lacks mount privileges (need root + loop module); stderr: {}",
-                stderr.trim()
-            );
-            return;
-        }
-        // Otherwise it's a writer bug -- surface stderr for diagnosis.
-        panic!(
-            "kernel mount of our writer's EROFS image FAILED:\n  exit: {:?}\n  stderr: {}\n  stdout: {}",
-            mount.status.code(),
-            stderr,
-            String::from_utf8_lossy(&mount.stdout)
+    let mount = run_privileged(&[
+        "mount",
+        "-t",
+        "erofs",
+        "-o",
+        "loop,ro",
+        img_path.to_str().expect("utf-8 image path"),
+        mountpoint.to_str().expect("utf-8 mountpoint"),
+    ]);
+    let failure = match &mount {
+        Err(e) => Some(format!("could not run mount: {e}")),
+        Ok(out) if !out.status.success() => Some(format!(
+            "exit {:?}; stderr: {}; stdout: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        )),
+        Ok(_) => None,
+    };
+    if let Some(detail) = failure {
+        assert!(
+            !in_ci,
+            "the kernel mount of our writer's EROFS image did not happen, and CI is set. \
+             This job exists to run it: the runner has passwordless sudo, the loop driver \
+             and an EROFS module, so a mount that cannot be made here is a defect in the \
+             image or in the job, not a missing privilege to skip over ({detail})"
+        );
+        eprintln!(
+            "skipping: this host cannot mount (no passwordless sudo, no loop driver, or no \
+             EROFS module). CI fails instead of skipping. Detail: {detail}"
+        );
+        return;
+    }
+    let _mounted = KernelMount {
+        mountpoint: mountpoint.clone(),
+        image: img_path.clone(),
+    };
+
+    let mut files = std::collections::BTreeMap::new();
+    let mut dirs = std::collections::BTreeSet::new();
+    let mut links = std::collections::BTreeMap::new();
+    read_mounted_tree(&mountpoint, &mountpoint, &mut files, &mut dirs, &mut links);
+
+    let want: std::collections::BTreeMap<String, Vec<u8>> = expected_files.into_iter().collect();
+    assert_eq!(
+        files.keys().cloned().collect::<Vec<_>>(),
+        want.keys().cloned().collect::<Vec<_>>(),
+        "the mounted tree holds different files from the ones the writer was given"
+    );
+    assert_eq!(
+        dirs.iter().cloned().collect::<Vec<_>>(),
+        vec!["/sub".to_string(), "/sub/deeper".to_string()],
+        "the mounted tree's directories"
+    );
+    assert_eq!(
+        links.get("/link.txt").map(String::as_str),
+        Some("hello.txt"),
+        "the symlink the writer emitted, as the kernel reads it: {links:?}"
+    );
+
+    for (path, want_bytes) in &want {
+        let got = &files[path];
+        assert_eq!(
+            got.len(),
+            want_bytes.len(),
+            "{path}: size through the kernel mount"
+        );
+        assert_eq!(
+            hex_encode(&sha256(got)),
+            hex_encode(&sha256(want_bytes)),
+            "{path}: SHA-256 of the bytes the kernel read differs from what the writer wrote"
         );
     }
-
-    // Sanity-list the mounted tree. We only need *some* listing to
-    // succeed -- the mount succeeding is the headline. Any read errors
-    // here would be a kernel-side decode bug we'd want to know about.
-    let listing = std::fs::read_dir(&mountpoint)
-        .expect("read mounted dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name())
-        .collect::<Vec<_>>();
-    assert!(!listing.is_empty(), "mounted EROFS image had empty root");
-
-    // Always unmount, even if a later assert fails — but here we run
-    // the unmount eagerly because `tempdir` cleanup of the mountpoint
-    // would race with a still-mounted FS.
-    let _ = std::process::Command::new("umount")
-        .arg(&mountpoint)
-        .output();
+    eprintln!(
+        "the kernel mounted our writer's image and returned all {} files, {} directories and \
+         the symlink byte for byte",
+        files.len(),
+        dirs.len()
+    );
 }
 
 /// Forty files alternating compressible and random runs of uneven
