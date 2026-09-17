@@ -83,11 +83,11 @@ jobs:
       # same green as a full run. Nothing in this workflow could tell
       # those apart before #118; only a count can.
       #
-      # Measured 2026-09-17 on run 35181354516 (main 0c16b34), this
-      # step alone: 437 tests executed, identically on ubuntu-latest
-      # and ubuntu-24.04-arm. Floor 400. It moves UP with the suite and
-      # never down -- a floor that is lowered to make a red run green
-      # is the same blindness with a number beside it.
+      # Measured 2026-09-18 on run 35285775541 (PR #122, 526f160),
+      # this step alone: 447 tests executed, identically on
+      # ubuntu-latest and ubuntu-24.04-arm. Floor 400. It moves UP with
+      # the suite and never down -- a floor that is lowered to make a
+      # red run green is the same blindness with a number beside it.
       #
       # This is the FIRST of three floors, one per run selection. The
       # `--ignored` run below and the debug `--lib` run below that
@@ -106,7 +106,7 @@ jobs:
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$RUNNER_TEMP/test-release.log" | awk '{s+=$4} END{print s+0}')
           echo "tests executed: $n (floor 400)"
           if [ "$n" -lt 400 ]; then
-              echo "::error::only $n tests executed, floor is 400 -- 437 ran on 2026-09-17 (run 35181354516), and a run that executes fewer than that stopped early rather than passed"
+              echo "::error::only $n tests executed, floor is 400 -- 447 ran on 2026-09-18 (run 35285775541), and a run that executes fewer than that stopped early rather than passed"
               exit 1
           fi
           exit "$rc"
@@ -116,7 +116,7 @@ jobs:
           # INVERTS the selection: it runs exactly the tests the run
           # above skipped, so the two counts are disjoint and either
           # can go to zero while the other is untouched. Folded into a
-          # single number, 437 + 75 still clears any floor worth
+          # single number, 447 + 73 still clears any floor worth
           # setting even when this run selects nothing at all -- and
           # this run selecting nothing is the realistic accident: an
           # `#[ignore = "..."]` reason string edited, the oracle tests
@@ -124,9 +124,12 @@ jobs:
           # tests migrate into the run above and vanish from here
           # without changing the total. See #118.
           #
-          # Measured 2026-09-17 on run 35181354516 (main 0c16b34),
-          # this step alone: 75 tests executed, identically on
-          # ubuntu-latest and ubuntu-24.04-arm. Floor 70.
+          # Measured 2026-09-18 on run 35285775541 (PR #122,
+          # 526f160), this step alone: 73 tests executed, identically
+          # on ubuntu-latest and ubuntu-24.04-arm. Floor 70. It was 75
+          # until #116 deleted two oracle tests that duplicated a
+          # stricter one; the floor did not move, and a floor is never
+          # lowered to make a red run green.
           #
           # Oracle tests are #[ignore]-gated so a fresh checkout without
           # erofs-utils still passes `cargo test`. CI installed the
@@ -137,7 +140,7 @@ jobs:
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$RUNNER_TEMP/test-ignored.log" | awk '{s+=$4} END{print s+0}')
           echo "ignored-opt-in tests executed: $n (floor 70)"
           if [ "$n" -lt 70 ]; then
-              echo "::error::only $n --ignored tests executed, floor is 70 -- 75 ran on 2026-09-17 (run 35181354516); the opt-in selected almost nothing, which is green and meaningless"
+              echo "::error::only $n --ignored tests executed, floor is 70 -- 73 ran on 2026-09-18 (run 35285775541); the opt-in selected almost nothing, which is green and meaningless"
               exit 1
           fi
           exit "$rc"
@@ -187,16 +190,18 @@ jobs:
           # here and still asks the build to check; only a count proves
           # anything actually ran.
           #
-          # Measured 2026-09-17 on run 35181354516 (main 0c16b34),
-          # this step alone: 235 tests executed, identically on
-          # ubuntu-latest and ubuntu-24.04-arm. Floor 215.
+          # Measured 2026-09-18 on run 35285775541 (PR #122,
+          # 526f160), this step alone: 235 tests executed, identically
+          # on ubuntu-latest and ubuntu-24.04-arm -- unchanged, as the
+          # unit tests under src/ are a different selection again.
+          # Floor 215.
           set +e
           EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib 2>&1 | tee "$RUNNER_TEMP/test-lib.log"
           rc=${PIPESTATUS[0]}
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$RUNNER_TEMP/test-lib.log" | awk '{s+=$4} END{print s+0}')
           echo "debug --lib tests executed: $n (floor 215)"
           if [ "$n" -lt 215 ]; then
-              echo "::error::only $n --lib tests executed, floor is 215 -- 235 ran on 2026-09-17 (run 35181354516), and the overflow handshake is one of the tests a short run can silently drop"
+              echo "::error::only $n --lib tests executed, floor is 215 -- 235 ran on 2026-09-18 (run 35285775541), and the overflow handshake is one of the tests a short run can silently drop"
               exit 1
           fi
           exit "$rc"
