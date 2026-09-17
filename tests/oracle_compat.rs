@@ -13,7 +13,7 @@ mod common;
 
 use common::{build_with_mkfs_erofs, dir, file, mkfs_erofs_available, open_image, MemDev};
 use fs_core::BlockRead;
-use fs_erofs::{mkfs, Error, Filesystem};
+use fs_erofs::{mkfs, Filesystem};
 use std::sync::Arc;
 
 /// Walk the FS exhaustively, asserting every regular file is readable
@@ -129,19 +129,18 @@ fn oracle_default() {
         eprintln!("skipping: mkfs.erofs not on PATH");
         return;
     }
-    // Modern default: compacted-2B index + ztailpacking + LZ4 if it
-    // helps. Expected to surface UnsupportedLayout in Phase 2 v0.1.
+    // What `mkfs.erofs` writes with no options must read back, byte for
+    // byte. The defaults move between erofs-utils releases, and this is
+    // the test that notices when they move somewhere the reader cannot
+    // follow -- which it could not while an open, lookup or read error
+    // counted as a pass (#55).
     let img = build_with_mkfs_erofs(&[], &sample_tree());
     let outcome = try_read_sample(img.bytes);
     println!("oracle_default: {outcome:?}");
-    // Pass the test on EITHER full match OR a clean Unsupported* error
-    // -- both are acceptable Phase 0/2-v0.1 outcomes. Panic ONLY on
-    // wrong bytes (silent corruption).
-    match outcome {
-        ReadOutcome::Match => {}
-        ReadOutcome::OpenError(_) | ReadOutcome::LookupError(_) | ReadOutcome::ReadError(_) => {}
-        ReadOutcome::Mismatch(s) => panic!("silent corruption: {s}"),
-    }
+    assert!(
+        matches!(outcome, ReadOutcome::Match),
+        "the default mkfs.erofs image does not read back: {outcome:?}"
+    );
 }
 
 #[test]
@@ -1674,54 +1673,6 @@ fn our_writer_image_kernel_mountable() {
     let _ = std::process::Command::new("umount")
         .arg(&mountpoint)
         .output();
-}
-
-/// A thoroughness check: build with modern defaults; if the reader
-/// rejects it, confirm the rejection is `UnsupportedLayout(_)` (a clean
-/// "we know we don't handle this") rather than a panic or wrong-bytes.
-#[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
-fn oracle_modern_default_returns_clean_error_or_match() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
-    let img = build_with_mkfs_erofs(&[], &sample_tree());
-    let dev = common::MemDev::arc(img.bytes);
-    let fs = match Filesystem::open(dev) {
-        Ok(fs) => fs,
-        Err(e) => {
-            // Acceptable: clean refusal at SB level (e.g. unsupported
-            // feature_incompat bits). Not acceptable: a parse panic.
-            eprintln!("modern-default SB refused: {e:?}");
-            return;
-        }
-    };
-    // Walk every entry; any UnsupportedLayout is acceptable, but
-    // mismatched bytes are not.
-    for (path, want) in sample_expected() {
-        let inode = match fs.lookup_path(path) {
-            Ok(i) => i,
-            Err(Error::UnsupportedLayout(n)) => {
-                eprintln!("path {path}: UnsupportedLayout({n}) -- acceptable");
-                continue;
-            }
-            Err(e) => {
-                eprintln!("path {path}: {e:?} -- acceptable for modern default");
-                continue;
-            }
-        };
-        let mut buf = vec![0u8; want.len()];
-        match fs.read_file(&inode, 0, &mut buf) {
-            Ok(()) => assert_eq!(buf, want, "{path} silent corruption"),
-            Err(Error::UnsupportedLayout(n)) => {
-                eprintln!("read {path}: UnsupportedLayout({n}) -- acceptable");
-            }
-            Err(e) => {
-                eprintln!("read {path}: {e:?} -- acceptable");
-            }
-        }
-    }
 }
 
 /// Files alternating compressible and random runs, compressed with
