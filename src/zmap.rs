@@ -1475,7 +1475,13 @@ fn compact_count_simple(geom: &PackGeom, bitstream: &[u8], intra_pack: u32) -> R
                 ));
             }
             i -= lo as i32;
-        } else if i >= 0 {
+        }
+        // Whatever `i` now names -- the entry just decoded, or the HEAD
+        // a NONHEAD run pointed back to -- is one pcluster and one
+        // block. Counting only in the else-branch skipped the HEAD at
+        // the end of every jump, so each multi-lcluster pcluster earlier
+        // in the pack made every later one resolve a block too low.
+        if i >= 0 {
             nblk = nblk
                 .checked_add(1)
                 .ok_or(Error::BadInode("compact nblk overflow"))?;
@@ -1954,6 +1960,43 @@ mod tests {
         assert_eq!(m1.pcluster_blkaddr, 100);
         assert_eq!(m1.cluster_type, Z_EROFS_LCLUSTER_TYPE_HEAD1);
         assert_eq!(m1.lcluster_idx, 1);
+    }
+
+    /// A compressed pcluster spanning several lclusters, followed in the
+    /// same 2B pack by more pclusters, resolves each later one to its
+    /// own block. The layout is measured: `mkfs.erofs -b4096 -zlz4hc`
+    /// on a file alternating compressible and random runs, whose extents
+    /// `dump.erofs -e` lists at blocks 26, 27, 28 (lclusters 2..9), then
+    /// 29, 30 and 31 for the PLAIN, PLAIN, HEAD at lclusters 9, 10, 11.
+    /// The pack's base is 25. Before the fix those three resolved to 28,
+    /// 29 and 30: the walk back over lclusters 3..8 landed on the HEAD at
+    /// 2 and did not count it.
+    #[test]
+    fn compact_2b_a_nonhead_run_counts_its_head_block() {
+        let geom = PackGeom::two_byte(12);
+        let mut bitstream = [0u8; 28];
+        let mut entries = vec![
+            (Z_EROFS_LCLUSTER_TYPE_PLAIN, 0),
+            (Z_EROFS_LCLUSTER_TYPE_PLAIN, 0),
+            (Z_EROFS_LCLUSTER_TYPE_HEAD1, 0),
+        ];
+        for delta in 1..=6 {
+            entries.push((Z_EROFS_LCLUSTER_TYPE_NONHEAD, delta));
+        }
+        entries.push((Z_EROFS_LCLUSTER_TYPE_PLAIN, 619));
+        entries.push((Z_EROFS_LCLUSTER_TYPE_PLAIN, 619));
+        entries.push((Z_EROFS_LCLUSTER_TYPE_HEAD1, 619));
+        for (idx, (ty, lo)) in entries.iter().enumerate() {
+            write_packed_entry(&mut bitstream, idx * 14, geom.lobits, *ty, *lo);
+        }
+        let base = 25;
+        for (intra, block) in [(0, 26), (1, 27), (2, 28), (9, 29), (10, 30), (11, 31)] {
+            assert_eq!(
+                base + compact_count_simple(&geom, &bitstream, intra).unwrap(),
+                block,
+                "lcluster {intra}"
+            );
+        }
     }
 
     #[test]
