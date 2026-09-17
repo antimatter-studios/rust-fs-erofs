@@ -966,6 +966,62 @@ impl Filesystem {
         let pcluster_remaining = (extent.source_end_byte - file_offset) as usize;
         let take = out.len().min(pcluster_remaining);
 
+        if extent.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN && is_inline_tail_pc {
+            // An uncompressed ztailpacked tail: the extent's bytes are
+            // the inline data after the inode, and there is no codec to
+            // hand them to. They went to the compressed path, which asked
+            // for PLAIN's codec and failed, so every file whose tail
+            // mkfs.erofs stored uncompressed was unreadable past its last
+            // block (#113).
+            let (inline_off, inline_len) = inline_tail.expect("checked above");
+            if zmap.has_interlaced_pcluster() {
+                // Interlaced, the inline data is laid out from the start
+                // of the tail's lcluster, as one block would be: byte `k`
+                // of the extent is inline byte `(start % bs + k) % bs`.
+                // Measured on `mkfs.erofs -b4096 -zlz4hc
+                // -Eall-fragments,ztailpacking`, whose packed inode ends
+                // in such a tail.
+                //
+                // That tail's inline data stops `start % bs` bytes short
+                // of the extent's end: mkfs sizes the packed inode as if
+                // the data began at the extent start rather than at the
+                // lcluster start. The kernel copies whatever follows on
+                // disk for those bytes. No fragment refers to them, but a
+                // whole-block read reaches them, so they read as zeros
+                // here rather than failing the read of every file packed
+                // before them. A byte the rotation puts BEFORE the inline
+                // data's end must exist, and is still refused if not.
+                let head_in_block = (extent.source_start_byte % bs) as usize;
+                let mut inline = vec![0u8; inline_len as usize];
+                self.read_source(metadata, 0, inline_off, &mut inline)?;
+                let inline_len = inline_len as usize;
+                for (k, byte) in out[..take].iter_mut().enumerate() {
+                    let off = off_in_pcluster + k;
+                    let at = interlaced_index(bs as usize, bs as usize, head_in_block, off);
+                    *byte = match inline.get(at) {
+                        Some(b) => *b,
+                        None if at >= inline_len && off < bs as usize - head_in_block => 0,
+                        None => {
+                            return Err(Error::BadInode(
+                                "interlaced inline PLAIN tail shorter than its extent",
+                            ))
+                        }
+                    };
+                }
+                return Ok(take);
+            }
+            if off_in_pcluster + take > inline_len as usize {
+                return Err(Error::BadInode("inline PLAIN tail shorter than its extent"));
+            }
+            self.read_source(
+                metadata,
+                0,
+                inline_off + off_in_pcluster as u64,
+                &mut out[..take],
+            )?;
+            return Ok(take);
+        }
+
         if extent.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN && !is_inline_tail_pc {
             if zmap.has_interlaced_pcluster() {
                 // INTERLACED PLAIN (#49): the extent's bytes sit at their
