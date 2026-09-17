@@ -1777,6 +1777,74 @@ fn oracle_mixed_runs_compacted_2b_round_trip() {
     }
 }
 
+/// `mkfs.erofs -zlz4 -Efragments` stores PLAIN pclusters interlaced, and
+/// every file reads back byte for byte (#49).
+///
+/// The interlaced advise bit is 0x0010; this crate named 0x0040, so the
+/// shifted copy was used for interlaced blocks and returned bytes from
+/// the wrong place in them -- 13 of these 40 files silently wrong at the
+/// default block size. The test asserts the images really carry the bit,
+/// so it cannot pass by never reaching the interlaced path.
+#[test]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
+fn oracle_interlaced_fragments_round_trip() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not on PATH");
+        return;
+    }
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut files = Vec::new();
+    for f in 0..40usize {
+        let mut data = Vec::new();
+        for s in 0..1 + f % 7 {
+            let len = 1000 + (f * 7919 + s * 104_729) % 30_000;
+            if (f + s) % 2 == 0 {
+                data.extend((0..len).map(|i| b"abcdefgh"[i % 8]));
+            } else {
+                data.extend((0..len).map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 24) as u8
+                }));
+            }
+        }
+        files.push((format!("f{f:02}.bin"), data));
+    }
+    let entries: Vec<(&str, fs_erofs::mkfs::Node)> = files
+        .iter()
+        .map(|(name, data)| (name.as_str(), file(data)))
+        .collect();
+    let tree = dir(entries);
+    for args in [
+        &["-zlz4", "-Efragments"][..],
+        &["-b4096", "-zlz4", "-Efragments"][..],
+    ] {
+        let img = build_with_mkfs_erofs(args, &tree);
+        let dev = common::MemDev::arc(img.bytes);
+        let fs = Filesystem::open(dev.clone()).expect("open");
+        let mut interlaced = 0;
+        for (name, want) in &files {
+            let inode = fs
+                .lookup_path(&format!("/{name}"))
+                .unwrap_or_else(|e| panic!("{args:?} lookup {name}: {e:?}"));
+            if let Ok(zmap) = fs_erofs::zmap::ZMap::open(&*dev, fs.superblock(), &inode) {
+                if zmap.has_interlaced_pcluster() {
+                    interlaced += 1;
+                }
+            }
+            let mut buf = vec![0u8; want.len()];
+            fs.read_file(&inode, 0, &mut buf)
+                .unwrap_or_else(|e| panic!("{args:?} read {name}: {e:?}"));
+            assert!(&buf == want, "{args:?}: {name} read back differently");
+        }
+        assert!(
+            interlaced > 0,
+            "{args:?}: fixture: no file carries the interlaced bit, so this checks nothing"
+        );
+    }
+}
+
 // =====================================================================
 // FRAGMENT_PCLUSTER round-trip tests
 // =====================================================================

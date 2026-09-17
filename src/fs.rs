@@ -202,6 +202,19 @@ type PclusterKey = (u64, u32, u64, u64);
 /// unvalidated `u64`.
 pub const MAX_SYMLINK_TARGET: u64 = 4096;
 
+/// Where byte `off` of an interlaced PLAIN extent sits in its pcluster's
+/// `on_disk_len` bytes, when the extent starts `head_in_block` bytes into
+/// a block of `bs` (#49).
+///
+/// The kernel's `Z_EROFS_COMPRESSION_INTERLACED` copy takes the extent's
+/// first `bs - head_in_block` bytes from the tail of the last block and
+/// the rest from the start of the first: a rotation of the pcluster by
+/// `on_disk_len - (bs - head_in_block)`. For a one-block pcluster that is
+/// just `head_in_block`.
+fn interlaced_index(on_disk_len: usize, bs: usize, head_in_block: usize, off: usize) -> usize {
+    (on_disk_len - (bs - head_in_block) + off) % on_disk_len
+}
+
 /// How many bytes a physical cluster covers of the file, or a refusal.
 fn pcluster_span(start_byte: u64, end_byte: u64) -> Result<usize> {
     let span = end_byte
@@ -955,43 +968,35 @@ impl Filesystem {
 
         if extent.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN && !is_inline_tail_pc {
             if zmap.has_interlaced_pcluster() {
-                // INTERLACED PLAIN: source bytes are rotated within the
-                // on-disk block. `clusterofs` is the rotation amount.
-                // Reader reconstructs `source = on_disk[clusterofs..] ++
-                // on_disk[..clusterofs]`. We only need the slice of
-                // bytes covered by `[file_offset, file_offset + take)`,
-                // but the rotation is across the WHOLE pcluster's
-                // on-disk block range, so we materialise the rotated
-                // source into a transient buffer and slice from it.
-                //
-                // Spec: `Z_EROFS_ADVISE_INTERLACED_PCLUSTER` semantics
-                // described in the public EROFS on-disk-format
-                // documentation
-                // (<https://erofs.docs.kernel.org/en/latest/design.html>).
+                // INTERLACED PLAIN (#49): the extent's bytes sit at their
+                // natural in-block positions, so the first
+                // `bs - start % bs` of them are the tail of the pcluster's
+                // last block and the rest wrap round to its start. The
+                // kernel's `Z_EROFS_COMPRESSION_INTERLACED` copy is a
+                // rotation of the pcluster by
+                // `blocks * bs - (bs - start % bs)`.
                 let blocks = extent.pcluster_block_count;
-                let on_disk_len = pcluster_span(extent.source_start_byte, extent.source_end_byte)?
-                    .max(blocks as usize * bs as usize);
-                // Source byte length matches the on-disk block range;
-                // `pcluster_block_count` is the on-disk block count
-                // and the rotated source occupies exactly that many
-                // bytes. For non-BIG_PCLUSTER PLAIN the count is 1.
-                let mut on_disk = vec![0u8; on_disk_len];
-                let dev_off = extent.pcluster_blkaddr as u64 * bs;
-                // Compressed pclusters route through the resolved
-                // device_id (always 0 / primary under the public spec,
-                // but plumbed for symmetry with chunked).
-                self.read_source(metadata, extent.device_id, dev_off, &mut on_disk)?;
-                let rot = extent.head_clusterofs as usize;
-                if rot > on_disk_len {
+                let on_disk_len = (blocks as usize)
+                    .checked_mul(bs as usize)
+                    .ok_or(Error::BadInode("INTERLACED PLAIN: pcluster size overflows"))?;
+                let span = pcluster_span(extent.source_start_byte, extent.source_end_byte)?;
+                if span > on_disk_len {
                     return Err(Error::BadInode(
-                        "INTERLACED PLAIN: clusterofs exceeds on-disk length",
+                        "INTERLACED PLAIN: extent longer than its blocks",
                     ));
                 }
-                // Rotate-and-paste: source[i] = on_disk[(i + rot) % len].
-                let mut source = vec![0u8; on_disk_len];
-                source[..on_disk_len - rot].copy_from_slice(&on_disk[rot..]);
-                source[on_disk_len - rot..].copy_from_slice(&on_disk[..rot]);
-                out[..take].copy_from_slice(&source[off_in_pcluster..off_in_pcluster + take]);
+                let mut on_disk = vec![0u8; on_disk_len];
+                let dev_off = extent.pcluster_blkaddr as u64 * bs;
+                self.read_source(metadata, extent.device_id, dev_off, &mut on_disk)?;
+                let head_in_block = (extent.source_start_byte % bs) as usize;
+                for (k, byte) in out[..take].iter_mut().enumerate() {
+                    *byte = on_disk[interlaced_index(
+                        on_disk_len,
+                        bs as usize,
+                        head_in_block,
+                        off_in_pcluster + k,
+                    )];
+                }
                 return Ok(take);
             }
             // PLAIN (non-interlaced): raw uncompressed bytes. The
@@ -1448,120 +1453,27 @@ mod tests {
         .unwrap()
     }
 
-    /// Synthetic image with an INTERLACED PLAIN pcluster covering one
-    /// 4 KiB lcluster. Source bytes: 4096 bytes laid out as
-    /// `0x00..0x10` for the first 16 bytes and `0xAA` for the rest.
-    /// On-disk bytes: ROTATED such that bytes `[clusterofs..bs)` come
-    /// first, then `[0..clusterofs)`. Reader's INTERLACED handling
-    /// must rotate-and-paste back to the original.
-    ///
-    /// We choose `clusterofs = 100` arbitrarily; the on-disk block is
-    /// `source[100..4096] ++ source[..100]`. The HEAD lcluster's
-    /// `clusterofs` field carries 100, plumbed through
-    /// `PclusterExtent::head_clusterofs`.
+    /// The interlaced copy, as the kernel does it (#49). This replaced a
+    /// synthetic image whose only lcluster was a PLAIN head 100 bytes into
+    /// its block, a layout the kernel refuses (nothing can own the first
+    /// 100 bytes); the real layout is exercised by
+    /// `oracle_interlaced_fragments_round_trip`.
     #[test]
-    fn interlaced_plain_cluster_round_trip() {
-        use crate::zmap::{Z_EROFS_ADVISE_INTERLACED_PCLUSTER, Z_EROFS_LCLUSTER_TYPE_PLAIN};
+    fn interlaced_index_is_the_kernels_rotation() {
         const BS: usize = 4096;
-        // Build the source bytes (what the file should READ as).
-        let mut source = vec![0xAAu8; BS];
-        for (i, b) in source.iter_mut().enumerate().take(16) {
-            *b = i as u8; // 0x00..0x0F at the start
-        }
-        // Last 16 bytes a unique marker so we can verify the wrap.
-        for (i, b) in source.iter_mut().enumerate().skip(BS - 16) {
-            *b = 0x80 | ((i - (BS - 16)) as u8); // 0x80..0x8F at the tail
-        }
-        let clusterofs: usize = 100;
-        // On-disk = source rotated LEFT by clusterofs. I.e.,
-        // on_disk[i] = source[(i + clusterofs) % BS], OR equivalently
-        // on_disk = source[clusterofs..] ++ source[..clusterofs].
-        // Wait — the spec says reader undoes via
-        // `source = on_disk[clusterofs..] ++ on_disk[..clusterofs]`,
-        // so on_disk = source[BS-clusterofs..] ++ source[..BS-clusterofs].
-        // Let's verify: if on_disk = source rotated RIGHT by
-        // `clusterofs` (i.e. on_disk[i] = source[(i - clusterofs + BS) % BS]),
-        // then on_disk[clusterofs..] = source[0..BS-clusterofs] and
-        // on_disk[..clusterofs] = source[BS-clusterofs..]. So the
-        // reader's `on_disk[clusterofs..] ++ on_disk[..clusterofs]`
-        // reconstructs source[0..BS-clusterofs] ++ source[BS-clusterofs..]
-        // = source. Correct.
-        let mut on_disk = vec![0u8; BS];
-        on_disk[clusterofs..].copy_from_slice(&source[..BS - clusterofs]);
-        on_disk[..clusterofs].copy_from_slice(&source[BS - clusterofs..]);
-
-        // Layout: 4 blocks total.
-        //   block 0: SB (offset 0; SB struct at 0x400).
-        //   block 1: meta (root inode + file inode).
-        //   block 2: data (the on-disk rotated bytes).
-        //   block 3: dir block (entry "rotate.bin" -> NID 1).
-        let mut img = vec![0u8; BS * 4];
-        let sb = synth_sb(12, 0, 1, 4);
-        img[EROFS_SUPER_OFFSET as usize..EROFS_SUPER_OFFSET as usize + sb.len()]
-            .copy_from_slice(&sb);
-
-        // Root dir inode at NID 0 (byte BS): FlatPlain dir, size = BS,
-        // raw_blkaddr = 3 (dir block).
-        let root = synth_compact(DataLayout::FlatPlain, 0x41ED, BS as u32, 3);
-        img[BS..BS + 32].copy_from_slice(&root);
-
-        // File inode at NID 1 (byte BS+32): COMPRESSION (compact) layout
-        // with size = BS. raw_u doesn't matter for compressed (the
-        // pcluster blkaddr is in the lcluster index entry).
-        // Compact zmap layout: header + a single compact-4B pack.
-        let raw_format: u16 = (DataLayout::Compression as u16) << 1;
-        let mut file = synth_compact(DataLayout::Compression, 0x81A4, BS as u32, 0);
-        file[0x00..0x02].copy_from_slice(&raw_format.to_le_bytes());
-        img[BS + 32..BS + 64].copy_from_slice(&file);
-
-        // zmap header at body_end = BS+32+32 = BS+64. We only need
-        // h_advise = INTERLACED bit set.
-        let hdr_off = BS + 64;
-        img[hdr_off + 4..hdr_off + 6]
-            .copy_from_slice(&Z_EROFS_ADVISE_INTERLACED_PCLUSTER.to_le_bytes());
-        // h_algorithmtype = 0; h_clusterbits = 0 (lclusterbits=0).
-
-        // ebase = ALIGN(hdr_off, 8) + 8 = hdr_off + 8 (already aligned).
-        // Compact pack: PLAIN with lo=clusterofs (100) at intra=0 only
-        // (single lcluster). Need vcnt=2 in 4B pack; second slot can be
-        // PLAIN/0 (unused since file has 1 lcluster).
-        // Pack 0 = (PLAIN clusterofs=100, PLAIN 0), base = 1 (block 2 = blkaddr 2,
-        // and HEAD/PLAIN lookup adds nblk=1: pcluster_blkaddr = base+nblk = 1+1 = 2).
-        let pack_off = hdr_off + 8;
-        let mut bs_buf = [0u8; 4];
-        // write_packed_entry inlined: lobits=12, encodebits=16.
-        // entry 0: type = PLAIN(0) << 12 | lo=100 = 0x064 = 100. Bits 0..16.
-        // entry 1: type = PLAIN(0) << 12 | lo=0 = 0. Bits 16..32.
-        let entry0: u32 = (Z_EROFS_LCLUSTER_TYPE_PLAIN as u32) << 12 | 100u32;
-        let entry1: u32 = 0;
-        // Write entry0 at bit 0 (4 bytes window).
-        let combined: u32 = entry0 | (entry1 << 16);
-        bs_buf.copy_from_slice(&combined.to_le_bytes());
-        img[pack_off..pack_off + 4].copy_from_slice(&bs_buf);
-        // Pack base = 1 (so PLAIN at intra=0 -> blkaddr = 1 + 1 = 2).
-        img[pack_off + 4..pack_off + 8].copy_from_slice(&1u32.to_le_bytes());
-
-        // Data block at block 2 = byte 2*BS.
-        img[2 * BS..3 * BS].copy_from_slice(&on_disk);
-
-        // Dir block at block 3.
-        let dir = synth_dir_block(&[(1, ftype::REG_FILE, b"rotate.bin")], BS);
-        img[3 * BS..4 * BS].copy_from_slice(&dir);
-
-        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
-        let fs = Filesystem::open(dev).unwrap();
-        let inode = fs.lookup_path("/rotate.bin").unwrap();
-        assert_eq!(inode.size as usize, BS);
-        let mut buf = vec![0u8; BS];
-        fs.read_file(&inode, 0, &mut buf).expect("interlaced read");
-        assert_eq!(buf, source, "rotate-and-paste reconstruction");
-        // Spot-check specific offsets that prove the rotation worked:
-        // start of source (was at on_disk[clusterofs])
-        assert_eq!(buf[0], 0x00);
-        assert_eq!(buf[1], 0x01);
-        // tail of source (was at on_disk[..clusterofs])
-        assert_eq!(buf[BS - 16], 0x80);
-        assert_eq!(buf[BS - 1], 0x8F);
+        // One block, extent starting 100 bytes in: its bytes are at their
+        // in-block positions, wrapping after the block's end.
+        assert_eq!(interlaced_index(BS, BS, 100, 0), 100);
+        assert_eq!(interlaced_index(BS, BS, 100, BS - 101), BS - 1);
+        assert_eq!(interlaced_index(BS, BS, 100, BS - 100), 0);
+        // Starting at the block boundary it is the identity.
+        assert_eq!(interlaced_index(BS, BS, 0, 17), 17);
+        // Two blocks: the first `BS - 100` bytes come from the tail of the
+        // LAST block, then the rest from the start of the first.
+        assert_eq!(interlaced_index(2 * BS, BS, 100, 0), BS + 100);
+        assert_eq!(interlaced_index(2 * BS, BS, 100, BS - 101), 2 * BS - 1);
+        assert_eq!(interlaced_index(2 * BS, BS, 100, BS - 100), 0);
+        assert_eq!(interlaced_index(2 * BS, BS, 0, 0), BS);
     }
 
     // --- zero-progress pcluster (the block-fill loop's exit guard) ------

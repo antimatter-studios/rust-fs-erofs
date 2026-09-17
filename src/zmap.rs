@@ -179,24 +179,25 @@ pub const Z_EROFS_ADVISE_BIG_PCLUSTER_2: u16 = 0x0004;
 pub const Z_EROFS_ADVISE_INLINE_PCLUSTER: u16 = 0x0008;
 
 /// Bit in `z_erofs_map_header::h_advise` meaning "interlaced PLAIN
-/// pcluster". Source bytes are rotated within the on-disk block:
-/// bytes `[0..clusterofs)` of the on-disk block are the END of the
-/// source range; bytes `[clusterofs..lcluster_size)` of the on-disk
-/// block are the START. Reader must concatenate
-/// `on_disk[clusterofs..] ++ on_disk[..clusterofs]` to recover the
-/// source.
+/// pclusters". A PLAIN extent that starts `clusterofs` bytes into its
+/// block keeps its bytes at their natural in-block positions: the first
+/// `bs - clusterofs` bytes of the extent are the tail of the (last)
+/// block, and the rest wrap round to the start. Without the bit
+/// ("shifted") the extent's bytes start at the start of the block. The
+/// bit changes nothing about where an extent starts or ends.
 ///
 /// Only meaningful on PLAIN clusters. Compressed (HEAD1/HEAD2/NONHEAD)
 /// clusters never set this bit -- the codec already produces the
 /// source stream in order.
 ///
-/// Spec source: `Z_EROFS_ADVISE_INTERLACED_PCLUSTER` constant value
-/// 0x0040 in the public EROFS kernel header
-/// `linux/fs/erofs/erofs_fs.h`; rotate-and-paste semantics described
-/// in the public on-disk-format documentation
-/// (<https://erofs.docs.kernel.org/en/latest/design.html>).
+/// Spec source: `Z_EROFS_ADVISE_INTERLACED_PCLUSTER` in the public EROFS
+/// kernel header `linux/fs/erofs/erofs_fs.h` is 0x0010, and the copy is
+/// the kernel's `Z_EROFS_COMPRESSION_INTERLACED` transform. This was
+/// 0x0040, a bit no format flag uses, so no image ever took the
+/// interlaced path and the shifted read returned the wrong bytes; measured
+/// on `mkfs.erofs -zlz4 -Efragments`, whose map headers carry 0x30 (#49).
 /// Independent implementation; license clean.
-pub const Z_EROFS_ADVISE_INTERLACED_PCLUSTER: u16 = 0x0040;
+pub const Z_EROFS_ADVISE_INTERLACED_PCLUSTER: u16 = 0x0010;
 
 /// Bit in `z_erofs_map_header::h_advise` meaning "fragments /
 /// cross-file shared tail packing in use". When set, the union slot
@@ -928,15 +929,10 @@ impl<'a> ZMap<'a> {
         // because there are no bytes left for it to head. Step back one
         // lcluster and let the ordinary walk-back continue.
         //
-        // `interlaced` gates it for the same reason it gates the
-        // sibling in `pcluster_extent`: there `clusterofs` is a
-        // rotation amount rather than a spillover marker. The gate is
-        // copied deliberately rather than reasoned about afresh, so the
-        // two move together -- see #49, which is about that flag's
-        // value being wrong, and which changes both or neither.
+        // It applies on interlaced images too: the interlaced bit changes
+        // how a PLAIN block is copied, not where an extent starts (#49).
         let last_byte_in_lcluster = (self.inode.size - 1) % lcluster_size;
         if is_head_or_plain(entry.cluster_type)
-            && !self.has_interlaced_pcluster()
             && (entry.clusterofs as u64) > last_byte_in_lcluster
             && cursor > 0
         {
@@ -1263,26 +1259,23 @@ impl<'a> ZMap<'a> {
         let mut lcluster_idx = file_offset / lcluster_size;
         let mut in_lcluster = file_offset % lcluster_size;
 
-        // INTERLACED PLAIN reinterprets `clusterofs` as a rotation
-        // amount within the on-disk block (not a "previous pcluster
-        // spilled into me" indicator). The walk-back check below is
-        // therefore disabled when the map header advertises
-        // INTERLACED — the head's pcluster covers the whole lcluster
-        // and we read the full range out via the rotate-and-paste
-        // path in fs.rs.
-        let interlaced = self.has_interlaced_pcluster();
         // Find HEAD for this offset. Walk back through NONHEADs; also
         // back up one lcluster when a HEAD's clusterofs > in_lcluster
-        // (the offset falls in the previous pcluster's tail), unless
-        // INTERLACED is set (in which case clusterofs is a rotation,
-        // not a spillover).
+        // (the offset falls in the previous pcluster's tail).
+        //
+        // INTERLACED DOES NOT CHANGE THIS (#49). The kernel maps extents
+        // the same way whatever `h_advise` says -- `clusterofs` is always
+        // where the HEAD's extent starts -- and the bit only decides how a
+        // PLAIN pcluster's block is copied out (see `fs.rs`). This walk
+        // used to skip the spill-back when the bit was set, which went
+        // unnoticed because the constant named the wrong bit.
         let (head_idx, head_entry) = loop {
             let entry = self.read_lcluster(dev, lcluster_idx)?;
             match entry.cluster_type {
                 Z_EROFS_LCLUSTER_TYPE_PLAIN
                 | Z_EROFS_LCLUSTER_TYPE_HEAD1
                 | Z_EROFS_LCLUSTER_TYPE_HEAD2 => {
-                    if !interlaced && (entry.clusterofs as u64) > in_lcluster {
+                    if (entry.clusterofs as u64) > in_lcluster {
                         // Offset is part of the previous pcluster's
                         // tail that spilled into this HEAD's lcluster.
                         if lcluster_idx == 0 {
@@ -1321,12 +1314,7 @@ impl<'a> ZMap<'a> {
         // amount; the pcluster's source range starts at the lcluster
         // boundary, not at lc*lcsize+clusterofs. Use 0 as the in-
         // lcluster start for INTERLACED head entries.
-        let source_start_byte =
-            if interlaced && head_entry.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN {
-                head_idx * lcluster_size
-            } else {
-                head_idx * lcluster_size + head_entry.clusterofs as u64
-            };
+        let source_start_byte = head_idx * lcluster_size + head_entry.clusterofs as u64;
 
         // Resolve this HEAD's pcluster blkaddr. For both legacy and
         // compact, `read_lcluster` has already folded the per-pack
@@ -2645,7 +2633,9 @@ mod tests {
         let inode = Inode::read(&dev, &sb, 0).unwrap();
         let zmap = ZMap::open(&dev, &sb, &inode).unwrap();
         assert!(zmap.has_interlaced_pcluster());
-        assert_eq!(Z_EROFS_ADVISE_INTERLACED_PCLUSTER, 0x0040);
+        // The kernel header's value, and what mkfs.erofs -Efragments
+        // writes (map headers carry 0x30); 0x0040 was never a flag (#49).
+        assert_eq!(Z_EROFS_ADVISE_INTERLACED_PCLUSTER, 0x0010);
     }
 
     /// HEAD2 cluster_type must dispatch to the codec encoded in the
