@@ -1724,6 +1724,59 @@ fn oracle_modern_default_returns_clean_error_or_match() {
     }
 }
 
+/// Files alternating compressible and random runs, compressed with
+/// LZ4HC at 4 KiB blocks and no big pclusters, read back byte for byte.
+///
+/// The runs make `mkfs.erofs` interleave compressed pclusters spanning
+/// several lclusters with PLAIN ones inside one compacted-2B pack, which
+/// is the layout whose block addresses resolved one too low (every
+/// pcluster after a multi-lcluster one in the same pack): a PLAIN read
+/// returned the previous pcluster's compressed bytes, and a HEAD fed
+/// them to LZ4, which failed. 3 of these 40 files read wrong and 13
+/// failed to read before the fix.
+#[test]
+#[ignore = "needs mkfs.erofs (erofs-utils)"]
+fn oracle_mixed_runs_compacted_2b_round_trip() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not on PATH");
+        return;
+    }
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut files = Vec::new();
+    for f in 0..40usize {
+        let mut data = Vec::new();
+        for s in 0..1 + f % 7 {
+            let len = 1000 + (f * 7919 + s * 104_729) % 30_000;
+            if (f + s) % 2 == 0 {
+                data.extend((0..len).map(|i| b"abcdefgh"[i % 8]));
+            } else {
+                data.extend((0..len).map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 24) as u8
+                }));
+            }
+        }
+        files.push((format!("f{f:02}.bin"), data));
+    }
+    let entries: Vec<(&str, fs_erofs::mkfs::Node)> = files
+        .iter()
+        .map(|(name, data)| (name.as_str(), file(data)))
+        .collect();
+    let img = build_with_mkfs_erofs(&["-b4096", "-zlz4hc"], &dir(entries));
+    let fs = Filesystem::open(common::MemDev::arc(img.bytes)).expect("open");
+    for (name, want) in &files {
+        let inode = fs
+            .lookup_path(&format!("/{name}"))
+            .unwrap_or_else(|e| panic!("lookup {name}: {e:?}"));
+        let mut buf = vec![0u8; want.len()];
+        fs.read_file(&inode, 0, &mut buf)
+            .unwrap_or_else(|e| panic!("read {name}: {e:?}"));
+        assert!(&buf == want, "{name} read back differently");
+    }
+}
+
 // =====================================================================
 // FRAGMENT_PCLUSTER round-trip tests
 // =====================================================================
