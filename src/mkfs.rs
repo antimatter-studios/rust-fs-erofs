@@ -3272,6 +3272,15 @@ mod tests {
             1,
             "the compressed index was opened more than once for one read"
         );
+
+        // And an empty read opens nothing at all.
+        let before = crate::zmap::OPENS.with(|n| n.get());
+        fs.read_file(&inode, 0, &mut []).unwrap();
+        assert_eq!(
+            crate::zmap::OPENS.with(|n| n.get()),
+            before,
+            "an empty read opened the compressed index"
+        );
     }
 
     #[test]

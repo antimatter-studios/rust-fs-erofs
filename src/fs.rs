@@ -699,6 +699,11 @@ impl Filesystem {
         if offset.saturating_add(buf.len() as u64) > inode.size {
             return Err(Error::OutOfRange);
         }
+        if buf.is_empty() {
+            // Nothing asked for, so nothing read: not even the index a
+            // compressed file would open next.
+            return Ok(());
+        }
         let bs = self.sb.block_size();
         let total_blocks = inode.size.div_ceil(bs);
         let zmap = self.zmap_for(inode)?;

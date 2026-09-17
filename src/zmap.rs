@@ -619,8 +619,18 @@ pub struct ZMap<'a> {
     /// function of the header and the index, and the read path asks it
     /// once per pcluster -- a backward walk over the last lclusters each
     /// time (#60).
-    fragment: std::cell::OnceCell<Option<(u32, u64, u64)>>,
+    ///
+    /// `OnceLock`, not `OnceCell`: `ZMap` is public and `Sync`, and a
+    /// memo must not take that away from a caller sharing one.
+    fragment: std::sync::OnceLock<Option<(u32, u64, u64)>>,
 }
+
+/// `ZMap` stays `Send + Sync` with its memo.
+#[cfg(test)]
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ZMap<'static>>();
+};
 
 #[cfg(test)]
 thread_local! {
@@ -735,7 +745,7 @@ impl<'a> ZMap<'a> {
             big_pcluster,
             algo_head1_id,
             algo_head2_id,
-            fragment: std::cell::OnceCell::new(),
+            fragment: std::sync::OnceLock::new(),
         })
     }
 
