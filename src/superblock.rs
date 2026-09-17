@@ -624,15 +624,16 @@ const COMPR_CFGS_MAX_BYTES: u64 = 8 * (2 + 65535);
 
 /// Algorithm bit positions in `Superblock::u1` when the field is
 /// interpreted as `available_compr_algs` (i.e. on images with
-/// `EROFS_FEATURE_INCOMPAT_COMPR_CFGS` set). Empirically confirmed
-/// against `mkfs.erofs -z {lzma,deflate,lz4}` on erofs-utils 1.9
-/// (LZMA image: u1 == 0x02 = bit 1; DEFLATE image: u1 == 0x04 = bit
-/// 2; LZ4 image: COMPR_CFGS feature bit is clear so `u1` is the
-/// `lz4_max_distance` union arm instead).
-const Z_EROFS_COMPRESSION_LZ4_BIT: u16 = 1 << 0;
-const Z_EROFS_COMPRESSION_LZMA_BIT: u16 = 1 << 1;
-const Z_EROFS_COMPRESSION_DEFLATE_BIT: u16 = 1 << 2;
-const Z_EROFS_COMPRESSION_ZSTD_BIT: u16 = 1 << 3;
+/// `EROFS_FEATURE_INCOMPAT_COMPR_CFGS` set). Held against what
+/// `mkfs.erofs` writes by `tests/feature_bits_oracle.rs` (#53): an LZMA
+/// image has `u1 == LZMA_BIT`, a DEFLATE image `DEFLATE_BIT`, and an
+/// LZ4HC image with big pclusters `LZ4_BIT`; a plain LZ4 image leaves
+/// COMPR_CFGS clear, so its `u1` is the `lz4_max_distance` arm instead.
+/// Public so that test can name them.
+pub const Z_EROFS_COMPRESSION_LZ4_BIT: u16 = 1 << 0;
+pub const Z_EROFS_COMPRESSION_LZMA_BIT: u16 = 1 << 1;
+pub const Z_EROFS_COMPRESSION_DEFLATE_BIT: u16 = 1 << 2;
+pub const Z_EROFS_COMPRESSION_ZSTD_BIT: u16 = 1 << 3;
 
 /// Parse the post-superblock COMPR_CFGS blob if the image advertises
 /// it. Returns `Ok(None)` when the feature bit is clear (the common
@@ -649,7 +650,9 @@ const Z_EROFS_COMPRESSION_ZSTD_BIT: u16 = 1 << 3;
 /// Per-codec payload layouts (taken from the public format header
 /// `erofs_fs.h` plus empirical validation against erofs-utils 1.9):
 ///
-/// - LZ4 (`size = 4`): `__le16 max_distance; __le16 max_pcluster_blks;`
+/// - LZ4 (`size = 14`): `__le16 max_distance; __le16 max_pcluster_blks;`
+///   and ten reserved bytes -- measured, `mkfs.erofs -zlz4hc -C65536`
+///   on erofs-utils 1.9 writes `0e00 ffff 1000` then zeros (#53).
 ///   The reader's LZ4 codec doesn't currently use either parameter
 ///   (we lean on `lz4_flex` and accept whatever max_distance the
 ///   writer chose), so this record is parsed but its values aren't
