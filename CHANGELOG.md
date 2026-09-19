@@ -8,6 +8,28 @@ never does.
 
 ### Added
 
+- **The parsers are fuzzed, on two tiers.** EROFS is read-only and mounted
+  from sources the reader did not produce — a container image, an
+  appliance, an OTA payload — and nothing here had a fuzz target.
+  `fuzz/` holds five `cargo-fuzz` targets and runs nightly on a bounded
+  budget; `tests/fuzz_decoders.rs` is the gate, replaying and mutating the
+  same corpus deterministically on the stable toolchain in under half a
+  second.
+
+  The corpus is five images `mkfs.erofs` wrote and `fsck.erofs` accepted —
+  one per compression algorithm, plus a chunk-based one, since the
+  algorithm id and the datalayout each select a different decode path —
+  rebuilt by `scripts/make-fuzz-corpus.sh`. The `image` target opens and
+  walks a mutated one, which is the only way `zmap`, `chunked` and the
+  xattr readers get fuzzed at all: none of them takes a byte slice, so
+  none can be a target on its own. `every_committed_image_opens_and_lists_its_root`
+  keeps the seeds honest — a seed that stopped opening would go on being
+  mutated and go on not failing.
+
+  The gate fails on a hang as well as a panic, naming the target, seed and
+  case; on a case count below a floor; and on a `cargo-fuzz` target with
+  no counterpart in the gate, so the two tiers cannot drift (#127).
+
 - **ZSTD-compressed images can be read.** `mkfs.erofs -zzstd` produces
   images whose compression algorithm id is 3; before this, opening one
   failed at the superblock's COMPR_CFGS blob with

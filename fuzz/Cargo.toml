@@ -1,0 +1,64 @@
+[package]
+name = "fs-erofs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The explorer half of the fuzzing setup. The gate half is
+# tests/fuzz_decoders.rs in the parent crate, which replays and mutates
+# the same corpus on the stable toolchain -- see that file's header for
+# why the work is split in two.
+#
+# Run one target:
+#   cargo +nightly fuzz run image -- -max_total_time=60
+#
+# There is deliberately no standalone `decompress` target. The decoder
+# is reached through `image`, with real pclusters that mkfs.erofs
+# produced at four different algorithms; a separate target would need a
+# corpus of extracted pclusters, and seeding it with bytes that are not
+# pclusters would be coverage in name only.
+# Run all of them, which is what CI does:
+#   scripts/fuzz-all.sh 60
+
+[dependencies]
+libfuzzer-sys = "0.4"
+am-fs-erofs = { path = ".." }
+am-fs-core = { path = "../../rust-fs-core", version = "0.2.10" }
+
+[[bin]]
+name = "image"
+path = "fuzz_targets/image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "superblock"
+path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inode"
+path = "fuzz_targets/inode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dir_block"
+path = "fuzz_targets/dir_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inline_xattrs"
+path = "fuzz_targets/inline_xattrs.rs"
+test = false
+doc = false
+bench = false
