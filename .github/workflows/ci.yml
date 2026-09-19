@@ -270,3 +270,42 @@ jobs:
           diff -r "$src" /tmp/extracted
       - name: Dump superblock + structure for inspection in CI logs
         run: dump.erofs /tmp/out.erofs
+
+  # ONE CHECK GATES A MERGE, AND IT STANDS FOR EVERY JOB (#123).
+  #
+  # Branch protection names checks, and a check is a job name. Naming
+  # each one means the list has to be edited whenever a job is renamed,
+  # split into a matrix leg or added — and until someone does, the new
+  # work is required by nobody. The comment above `test:` says as much:
+  # its name is pinned because a rename would strand the required check.
+  #
+  # The opposite spelling is worse. A required check no job produces
+  # reads as permanently pending, and nothing merges while nothing
+  # fails — which is what christhomas/rust-fs-ext4#263 was.
+  #
+  # `if: always()` because a job that was cancelled or skipped is not a
+  # job that passed, and an aggregate that only runs when its needs
+  # succeeded would be skipped itself — and a skipped required check
+  # never reports at all.
+  ci-ok:
+    name: ci-ok
+    needs: [test, validate-mkfs-bin]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: every gating job must have concluded success
+        run: |
+          echo "test:              ${{ needs.test.result }}"
+          echo "validate-mkfs-bin: ${{ needs.validate-mkfs-bin.result }}"
+          failed=0
+          for one in "test:${{ needs.test.result }}" \
+                     "validate-mkfs-bin:${{ needs.validate-mkfs-bin.result }}"; do
+              job=${one%%:*}
+              result=${one#*:}
+              if [ "$result" != "success" ]; then
+                  echo "::error::$job concluded '$result', not 'success' -- failure, cancellation and skipping all mean the gate did not run to completion"
+                  failed=1
+              fi
+          done
+          [ "$failed" = 0 ] || exit 1
+          echo "all gating jobs succeeded"
