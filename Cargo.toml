@@ -6,6 +6,11 @@ license = "MIT"
 description = "Pure-Rust EROFS (Enhanced Read-Only File System) reader and writer. Clean-room implementation; reads everything mkfs.erofs 1.9 emits (LZ4/LZMA/DEFLATE/ZSTD, compacted-2B, ztailpacking, fragments, big_pcluster) and produces fsck.erofs-clean output."
 repository = "https://github.com/antimatter-studios/rust-fs-erofs"
 
+# The fuzz crate is its own package, on its own toolchain, and is not
+# part of this one. Without this, `cargo package` and `cargo publish`
+# try to include it and fail on the nightly-only dependency.
+exclude = ["fuzz"]
+
 [lib]
 name = "fs_erofs"
 crate-type = ["staticlib", "rlib"]

@@ -27,3 +27,11 @@ tests/fixtures/*.zip
 # consumer to copy out of (`chore artifact` prints this directory).
 /dist/
 .DS_Store
+
+# THE FUZZ CORPUS IS COMMITTED ON PURPOSE, and `*.img` above would
+# otherwise swallow it silently. The images under fuzz/corpus/ are not
+# build output or fixtures a script regenerates on demand -- they are
+# the seeds the gate in tests/fuzz_decoders.rs replays and mutates, and
+# without them that suite has nothing to run and says so only once CI
+# has already gone red.
+!fuzz/corpus/**
