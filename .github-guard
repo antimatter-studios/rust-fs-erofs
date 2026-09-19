@@ -58,6 +58,4 @@
 # checks, all of which have been green on main, declaring the real names is
 # the smaller and more reviewable step.
 [checks]
-	required = test-ubuntu-latest
-	required = test-ubuntu-24.04-arm
-	required = validate mkfs_erofs (fsck.erofs strict)
+	required = ci-ok
