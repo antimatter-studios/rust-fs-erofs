@@ -87,8 +87,15 @@ tasks:
     #
     # This exists so the CI gate can be reproduced locally. If the two
     # ever differ, this is the copy that is wrong.
+    #
+    # agents-core-check is here rather than in a test tier because a stale
+    # agent guide is a lint problem: AGENTS.md is still a valid file, it
+    # just no longer says what the rest of the family says. It prints one
+    # line. ci.yml runs the same script as its own step, because CI does
+    # not call chore.
     cmds:
       - cargo fmt --check
+      - scripts/agents-core-check.sh
       - cargo clippy --locked --all-targets -- -D warnings
 
   build:
@@ -98,6 +105,17 @@ tasks:
   test:
     desc: Test suite
     cmds: ['cargo test']
+
+  test:scripts:
+    desc: The shell tests (tests/scripts/*.sh), every one by glob
+    # By glob, so a test added later needs no edit here — a test that has to
+    # be registered somewhere else is a test that gets silently skipped.
+    #
+    # `set -e` inside the loop: without it the loop's status is the LAST
+    # test's, so a failure anywhere but the end passes. Same class of
+    # mistake as reading `$?` after a pipe.
+    cmds:
+      - bash -c 'set -e; for t in tests/scripts/*.sh; do bash "$t"; done'
 
   clean:
     desc: Remove this crate's cargo output
