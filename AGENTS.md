@@ -179,6 +179,14 @@ an in-progress `CheckRun` reports its conclusion as an empty string, and a
 `StatusContext` has no conclusion field at all. Read `mergeStateStatus` and
 `statusCheckRollup.state`.
 
+`chore check:ci-gate` holds both halves of that mechanically — every job in
+`ci.yml` must appear in `ci-ok`'s `needs:`, and `.github-guard` must require
+`ci-ok` and nothing else. The task names `scripts/ci-gate.sh` and nothing else,
+so the script is what can be tested, reviewed and run without `chore` at all.
+It replaced `tests/ci_aggregate_gate.rs`: that parsed a YAML file and compared
+strings, exercising nothing this crate ships, and as a `cargo test` it counted
+towards the executed-test floor the gate itself enforces.
+
 ## Never grow a shared tool to solve a problem here
 
 **Never grow a shared tool to solve a problem in this repository.** `chore` is

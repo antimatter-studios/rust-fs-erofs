@@ -94,6 +94,7 @@ tasks:
     # line. ci.yml runs the same script as its own step, because CI does
     # not call chore.
     cmds:
+      - scripts/ci-gate.sh
       - cargo fmt --check
       - scripts/agents-core-check.sh
       - cargo clippy --locked --all-targets -- -D warnings
@@ -145,3 +146,16 @@ tasks:
       - 'cd "{{.OUT}}" && pwd -P'
     vars:
       OUT: 'dist'
+
+  check:ci-gate:
+    desc: The one required check stands for every job in ci.yml
+    # A chore task naming a script, and nothing else -- the script is what can
+    # be tested, reviewed and run without chore at all.
+    #
+    # This was tests/ci_aggregate_gate.rs. It was the wrong container twice
+    # over: it parses a YAML file and compares strings, exercising nothing this
+    # crate ships, and as a cargo test it counted towards the executed-test
+    # floor the gate itself enforces -- so the suite could satisfy its floor
+    # partly by checking its own CI config.
+    cmds:
+      - scripts/ci-gate.sh
