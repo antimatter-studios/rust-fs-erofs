@@ -75,6 +75,18 @@ jobs:
             target
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo fmt --check
+      # The agent guide's core block is shared byte-identically across this
+      # family of repositories, so a repo that edits it locally, or is left
+      # behind when it changes, is telling its agents last month's rules.
+      # The script hashes the block; the shell test below proves the script
+      # actually fails on a modified, stale or absent one. `chore lint` runs
+      # the same script -- this step exists because CI does not call chore.
+      - name: AGENTS.md carries the shared agent-core block
+        run: scripts/agents-core-check.sh
+      - name: Shell tests (tests/scripts/*.sh)
+        # `set -e` inside the loop: without it the loop's status is the LAST
+        # test's, so a failure anywhere but the end would pass.
+        run: set -e; for t in tests/scripts/*.sh; do bash "$t"; done
       - run: cargo clippy --locked --all-targets -- -D warnings
       # A FLOOR UNDER THE SUITE, BECAUSE THE FAILURE MODE HERE IS AN
       # ABSENCE. `cargo test` exits 0 on "0 passed; 0 failed", so a
