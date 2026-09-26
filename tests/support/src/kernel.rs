@@ -65,8 +65,14 @@ enum MountExpectation {
 #[track_caller]
 fn run(image: &str, script: &str, expectation: MountExpectation) -> Output {
     session();
+    // OUTSIDE THE REPOSITORY IS ONLY WRONG FROM THE HOST. From here the
+    // guest sees this repository and nothing else, so an image anywhere
+    // else is one the mount cannot reach. Running INSIDE the guest there
+    // is no such restriction, and scratch deliberately lives on the
+    // guest's own disk rather than the 9p mount (see
+    // fs_erofs_test_support::select_temp_dir).
     assert!(
-        std::path::Path::new(image).starts_with(repo()),
+        crate::oracle::in_guest() || std::path::Path::new(image).starts_with(repo()),
         "the kernel oracle was given {image}, which is outside {}. The guest sees this \
          repository and nothing else of the host.",
         repo().display()

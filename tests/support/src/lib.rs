@@ -19,25 +19,69 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEST_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// The scratch root: `<repo>/tmp`, or `FS_EROFS_TEST_TMPDIR` when a
-/// caller supplies an exact directory of its own.
+/// The scratch root: `<repo>/tmp` when the host drives the guest,
+/// [`GUEST_SCRATCH`] when this process is already inside it, or
+/// `FS_EROFS_TEST_TMPDIR` when a caller supplies a directory of its own.
 ///
-/// ONE RULE, AND IT IS THE ORACLE'S. Scratch files are what the oracle
+/// ONE RULE, AND IT IS THE ORACLE'S — BUT IT ONLY APPLIES ONE WAY ROUND.
+///
+/// When the tests run on the HOST, scratch files are what the oracle
 /// tools read, and those tools run in the harness VM, which sees this
 /// repository mounted at the path the host knows it by — and nothing
 /// else of the host. A scratch directory under `/tmp` or `$RUNNER_TEMP`
-/// would not exist there. So it lives in the repository (gitignored),
-/// on every machine and on CI alike, and a caller-supplied directory
+/// would not exist there. So it lives in the repository (gitignored), on
+/// every machine and on CI alike, and a caller-supplied directory
 /// outside the repository is refused rather than quietly breaking every
 /// oracle test.
+///
+/// WHEN THE TESTS RUN INSIDE THE GUEST, THAT RULE INVERTS: the
+/// repository is the 9p MOUNT, and it is the one filesystem the tools
+/// must not work on. `mkfs.erofs` mmaps its output for `-Efragments` and
+/// `-m65536`, and mmap on virtio-9p does not support what it needs.
+/// Measured on CI run 36243473053, the same two commands, same erofs-utils
+/// build, same guest — only the directory differs:
+///
+/// | job | image path | `mkfs.erofs -Efragments` |
+/// |---|---|---|
+/// | `test (x86_64, oracles in the VM)` | host path, tool called over ssh | `-> 0` |
+/// | `suite in the guest` | `/repo/tmp/...` (9p) | `-> 139` (SIGSEGV) |
+///
+/// A segfault is not a refusal, so there was nothing to report but an
+/// exit status: `mkfs.erofs ["-zlz4hc", "-Efragments"] failed: left:
+/// Some(139)`. It passed locally on an aarch64 host, which is why it
+/// reached CI — the 9p implementations differ, and that is precisely the
+/// kind of difference a scratch directory should not be exposed to.
+///
+/// So in the guest, scratch goes on the guest's OWN disk. Nothing is lost:
+/// in that direction there is no host to be invisible to, and the guest
+/// keeps its own copy of everything a tool needs.
 #[track_caller]
 pub fn select_temp_dir(explicit: Option<&OsStr>, worktree: &Path) -> PathBuf {
+    select_temp_dir_for(explicit, worktree, oracle::in_guest())
+}
+
+/// Where the guest puts scratch: its own disk, never the 9p-mounted
+/// repository. `/var/tmp` rather than `/tmp`, because a tmpfs `/tmp` is
+/// sized from the guest's RAM and the fixture images are not small.
+pub const GUEST_SCRATCH: &str = "/var/tmp/fs-erofs-tests";
+
+/// [`select_temp_dir`] with the guest decision passed in, so it can be
+/// tested both ways without setting a process-wide variable.
+#[track_caller]
+pub fn select_temp_dir_for(explicit: Option<&OsStr>, worktree: &Path, in_guest: bool) -> PathBuf {
     let Some(path) = explicit.filter(|path| !path.is_empty()) else {
-        return worktree.join("tmp");
+        return if in_guest {
+            PathBuf::from(GUEST_SCRATCH)
+        } else {
+            worktree.join("tmp")
+        };
     };
     let path = PathBuf::from(path);
+    // An explicit directory is honoured as given in the guest: there is no
+    // host for it to be invisible to, and refusing one would make the
+    // guest the only place the variable does not work.
     assert!(
-        path.starts_with(worktree),
+        in_guest || path.starts_with(worktree),
         "FS_EROFS_TEST_TMPDIR is {}, which is outside {}. The oracle tools run in the \
          harness VM, which sees this repository and nothing else of the host, so scratch \
          files have to live inside it.",
@@ -193,4 +237,75 @@ pub fn assert_fsck_clean(image: &str, tag: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[cfg(test)]
+mod scratch_root {
+    use super::{select_temp_dir_for, GUEST_SCRATCH};
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    // WHY THIS IS A TEST AND NOT A COMMENT. The rule is one-way and it
+    // inverted once already, in the direction that is invisible locally:
+    // writing scratch under the 9p-mounted repository works on an aarch64
+    // host and segfaults `mkfs.erofs -Efragments` on CI's x86_64 guest
+    // (run 36243473053). A test is the only thing that notices the default
+    // moving back.
+
+    #[test]
+    fn the_host_puts_scratch_in_the_repository() {
+        let repo = Path::new("/work/rust-fs-erofs");
+        assert_eq!(
+            select_temp_dir_for(None, repo, false),
+            PathBuf::from("/work/rust-fs-erofs/tmp"),
+            "from the host the guest can see nothing but the repository"
+        );
+    }
+
+    #[test]
+    fn the_guest_puts_scratch_on_its_own_disk_not_the_9p_mount() {
+        let repo = Path::new("/repo");
+        assert_eq!(
+            select_temp_dir_for(None, repo, true),
+            PathBuf::from(GUEST_SCRATCH),
+            "in the guest the repository is the 9p mount, which is the one \
+             filesystem mkfs.erofs must not mmap its output on"
+        );
+    }
+
+    #[test]
+    fn an_explicit_directory_is_taken_as_given() {
+        let repo = Path::new("/work/rust-fs-erofs");
+        let inside = OsStr::new("/work/rust-fs-erofs/scratch");
+        assert_eq!(
+            select_temp_dir_for(Some(inside), repo, false),
+            PathBuf::from("/work/rust-fs-erofs/scratch")
+        );
+        // Honoured in the guest even from outside the repository: there is
+        // no host for it to be invisible to.
+        let outside = OsStr::new("/var/tmp/elsewhere");
+        assert_eq!(
+            select_temp_dir_for(Some(outside), repo, true),
+            PathBuf::from("/var/tmp/elsewhere")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "which is outside")]
+    fn the_host_refuses_a_directory_the_guest_could_not_see() {
+        select_temp_dir_for(
+            Some(OsStr::new("/var/tmp/elsewhere")),
+            Path::new("/work/rust-fs-erofs"),
+            false,
+        );
+    }
+
+    #[test]
+    fn an_empty_variable_is_no_variable() {
+        let repo = Path::new("/work/rust-fs-erofs");
+        assert_eq!(
+            select_temp_dir_for(Some(OsStr::new("")), repo, false),
+            PathBuf::from("/work/rust-fs-erofs/tmp")
+        );
+    }
 }

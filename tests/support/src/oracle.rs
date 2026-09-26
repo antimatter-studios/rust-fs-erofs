@@ -80,7 +80,7 @@ pub(crate) fn vm_script() -> &'static Path {
 }
 
 /// True when this process is itself running inside the harness guest.
-pub(crate) fn in_guest() -> bool {
+pub fn in_guest() -> bool {
     std::env::var_os("FLTH_GUEST").is_some_and(|value| value == "1")
 }
 
@@ -185,7 +185,11 @@ pub fn guest_quote(argument: &str) -> String {
 
 /// A tool invocation, built and then run in the guest.
 ///
-/// ```ignore
+/// Sketched rather than compiled — `text`, not `ignore`: an `ignore`
+/// block is still a doc-test, and it reports as `1 ignored`, which in
+/// this repository reads exactly like a test that declined to run.
+///
+/// ```text
 /// let out = oracle("fsck.erofs").arg(&image).output();
 /// assert_eq!(out.status.code(), Some(0));
 /// ```
@@ -503,8 +507,11 @@ pub fn guest_base64(bytes: &[u8]) -> String {
 #[track_caller]
 pub fn mkfs_from_guest_tree(out: &Path, stage: &str, args: &[&str]) -> Output {
     session();
+    // Same one-way rule as the kernel oracle's: only a HOST-driven call
+    // needs the output inside the repository, because that is all the
+    // guest can see of the host. In the guest, scratch is on its own disk.
     assert!(
-        out.starts_with(repo()),
+        in_guest() || out.starts_with(repo()),
         "mkfs_from_guest_tree was asked to write {}, which is outside {}. The guest \
          sees this repository and nothing else of the host, so the image has to land \
          inside it.",
