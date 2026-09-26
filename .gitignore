@@ -1,4 +1,10 @@
 /target
+# AND ANY NESTED ONE. `/target` is anchored at the root, so it does not match
+# tests/support/target -- the support crate is its own package and cargo gives
+# it its own build directory when it is built on its own (`cargo test -p
+# fs-erofs-test-support`). 14 files and 2.2 MB of fingerprints and lockfiles
+# were committed that way in #134.
+target/
 # Cargo.lock is committed: reproducible, locked dependency resolution for
 # the build/test/clippy gates (cargo … --locked). Do not re-ignore.
 *.img
