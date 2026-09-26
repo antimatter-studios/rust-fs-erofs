@@ -41,8 +41,15 @@ jobs:
 
       # The fuzz crate depends on the same sibling the parent crate
       # does, by path, so both tiers build against one copy of it.
+      #
+      # THE REF MUST MATCH chores.yml's FS_CORE_REF AND Cargo.lock. A path
+      # dependency takes its version from the sibling's own Cargo.toml, so
+      # cloning a different tag than the lock names makes `--locked` refuse
+      # the build outright -- `cannot update the lock file ... because
+      # --locked was passed`. github-guard's rust-deps-pinned check compares
+      # these two and is what caught it.
       - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.10 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: git clone --depth 1 --branch v0.2.13 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
 
       # Nightly, not the pin in rust-toolchain.toml. cargo-fuzz needs
       # `-Z sanitizer`, which stable does not have. The explicit

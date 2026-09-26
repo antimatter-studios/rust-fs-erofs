@@ -711,55 +711,13 @@ fn compressed_file_sequential_reads_use_cache() {
     );
 }
 
-/// PERF DEMO (ignored by default): builds a 4 MiB highly-compressible
-/// compressed file and times 100 full-file reads with the cache
-/// enabled vs. disabled. Prints both timings to stderr. Run with:
-///   cargo test --test round_trip -- --ignored --nocapture \
-///     pcluster_cache_perf_demo
-/// Expected: the cached run is several × faster (gains scale with
-/// codec cost — LZMA more, LZ4 less).
-#[test]
-#[ignore]
-fn pcluster_cache_perf_demo() {
-    use std::time::Instant;
-    let bs: usize = 4096;
-    let n_blocks: usize = 1024; // 4 MiB
-    let payload: Vec<u8> = vec![b'D'; n_blocks * bs];
-    let img = build_compressed_image("perf.bin", &payload);
-
-    // Run cached.
-    let fs = open_image(img.clone());
-    let inode = fs.lookup_path("/perf.bin").unwrap();
-    let mut buf = vec![0u8; payload.len()];
-    let t0 = Instant::now();
-    for _ in 0..100 {
-        fs.read_file(&inode, 0, &mut buf).unwrap();
-    }
-    let cached = t0.elapsed();
-    let (_, _, hits, misses) = fs.pcluster_cache_stats();
-    eprintln!(
-        "[perf] cached:   {} ms (hits={hits} misses={misses}, \
-         hit_rate={:.2}%)",
-        cached.as_millis(),
-        hits as f64 / (hits + misses).max(1) as f64 * 100.0
-    );
-
-    // Run with caching disabled.
-    let fs2 = open_image(img);
-    fs2.set_pcluster_cache_capacity(0);
-    let inode2 = fs2.lookup_path("/perf.bin").unwrap();
-    let mut buf2 = vec![0u8; payload.len()];
-    let t1 = Instant::now();
-    for _ in 0..100 {
-        fs2.read_file(&inode2, 0, &mut buf2).unwrap();
-    }
-    let uncached = t1.elapsed();
-    eprintln!("[perf] uncached: {} ms", uncached.as_millis());
-    eprintln!(
-        "[perf] speedup:  {:.2}×",
-        uncached.as_secs_f64() / cached.as_secs_f64().max(1e-9)
-    );
-}
+// A PERF DEMO STOOD HERE. It built a 4 MiB file, read it a hundred
+// times with the pcluster cache on and once more with it off, and
+// printed the two timings -- it asserted nothing. `#[ignore]` with no
+// reason kept it out of a default run and CI's `--ignored` pass ran it
+// on every push, so the only thing it did was print. The claim it was
+// making is already made, with an assertion, by
+// `compressed_file_sequential_reads_use_cache` above.
 
 // ---- W5: BuildOptions writer extensions round-trips ------------------------
 

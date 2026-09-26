@@ -13,11 +13,11 @@
 //!
 //! Two halves. The first builds an image with this crate's writer and
 //! sets one bit in its superblock, recomputing the superblock checksum so
-//! the case stays valid once the checksum is verified (#52). The second,
-//! `#[ignore]`-gated with the other oracles, asks the real `mkfs.erofs`.
+//! the case stays valid once the checksum is verified (#52). The second
+//! asks the real `mkfs.erofs`, in the fs-linux-test-harness VM.
 
 mod common;
-use common::{build_with_mkfs_erofs, dir, file, mkfs_erofs_available, open_image, MemDev};
+use common::{build_with_mkfs_erofs, dir, file, open_image, MemDev};
 
 use fs_core::BlockRead;
 use fs_erofs::{mkfs, Error, Filesystem};
@@ -120,12 +120,7 @@ fn implemented_bits_still_open_and_read() {
 /// What the real tool writes: chunked files open and read; 48-bit
 /// addressing is refused by name.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_chunked_opens_and_48bit_is_refused() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let chunked = build_with_mkfs_erofs(&["--chunksize=65536"], &tree());
     let fs = open_bytes(chunked.bytes).expect("a --chunksize image opens");
     let inode = fs.lookup_path("/hello.txt").expect("lookup");

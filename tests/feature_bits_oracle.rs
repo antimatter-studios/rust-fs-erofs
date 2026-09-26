@@ -13,15 +13,16 @@
 //! `mkfs.erofs` builds an image with one option, and the bit it set is
 //! read straight out of the superblock at offset 0x50.
 //!
-//! `#[ignore]`-gated like the other `mkfs.erofs` oracles, and run where
-//! the tool is installed with `-- --ignored`. It used to run in the
-//! default `cargo test` and pass with a skip line wherever the tool was
-//! missing -- which is every machine a contributor checks a constant on
-//! before opening a pull request (#53). Asked to run without the tool,
-//! it now fails.
+//! `mkfs.erofs` runs in the fs-linux-test-harness VM, like every oracle
+//! tool here, so this measures one version on every machine. It used to
+//! run in the default `cargo test` and pass with a skip line wherever
+//! the tool was missing -- which is every machine a contributor checks a
+//! constant on before opening a pull request (#53) -- and then spent a
+//! while `#[ignore]`d, which is the same silence with a flag on it.
 
 mod common;
-use common::{materialize_tree, mkfs_erofs_available, run_mkfs_erofs};
+use common::{materialize_tree, run_mkfs_erofs};
+use fs_erofs_test_support::ScratchDir;
 
 use fs_erofs::mkfs;
 use fs_erofs::superblock::{
@@ -99,21 +100,9 @@ fn incompat_for(dir: &Path, label: &str, extra: &[&str]) -> u32 {
     bits
 }
 
-/// The tool, or a failure that says it is missing: an opted-in oracle
-/// that skips reads exactly like one that passed.
-fn require_mkfs_erofs() {
-    assert!(
-        mkfs_erofs_available(),
-        "mkfs.erofs is not on PATH; this oracle measures what it writes, so install \
-         erofs-utils or leave it to the job that runs `cargo test -- --ignored`"
-    );
-}
-
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn each_option_sets_the_bit_this_crate_names() {
-    require_mkfs_erofs();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = ScratchDir::new("feature-bits");
     materialize_tree(&dir.path().join("src"), &source_tree());
 
     let plain = incompat_for(dir.path(), "plain", &["-zlz4hc"]);
@@ -170,10 +159,8 @@ fn each_option_sets_the_bit_this_crate_names() {
 /// The bits set by options that are not about compression, each against
 /// an uncompressed baseline.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn the_layout_options_set_the_bits_this_crate_names() {
-    require_mkfs_erofs();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = ScratchDir::new("feature-bits");
     materialize_tree(&dir.path().join("src"), &source_tree());
 
     let plain = incompat_for(dir.path(), "uncompressed", &[]);
@@ -219,10 +206,8 @@ fn the_layout_options_set_the_bits_this_crate_names() {
 /// bitmap in the superblock must carry the bit this crate names for that
 /// codec, and the image must open and read back through the walk.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn compression_configurations_set_compr_cfgs_and_still_read() {
-    require_mkfs_erofs();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = ScratchDir::new("feature-bits");
     let tree = source_tree();
     materialize_tree(&dir.path().join("src"), &tree);
     let mkfs::Node::Dir { entries, .. } = &tree else {

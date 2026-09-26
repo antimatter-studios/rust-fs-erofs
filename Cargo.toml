@@ -20,7 +20,7 @@ name = "mkfs_erofs"
 path = "src/bin/mkfs_erofs.rs"
 
 [dependencies]
-am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2.12" }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 lzma-rs = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -39,6 +39,11 @@ ruzstd = "0.8"
 lru = "0.12"
 
 [dev-dependencies]
+# The test suite's one way in to a fixture, to an erofs-utils tool and to
+# the kernel — all three of which live in the fs-linux-test-harness VM.
+# Dev-only: it never reaches a consumer of this crate, and it is what
+# tests/test_contract.rs holds every test to.
+fs-erofs-test-support = { path = "tests/support" }
 lz4_flex = { version = "0.11", features = ["safe-encode"] }
 tempfile = "3"
 # CLI integration tests use `Command::cargo_bin("mkfs_erofs")` to spawn

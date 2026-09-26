@@ -12,10 +12,10 @@
 
 use fs_core::BlockRead;
 use fs_erofs::{mkfs, Filesystem};
+use fs_erofs_test_support::{oracle, ScratchDir};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 /// In-memory `BlockRead` impl backed by a `Vec<u8>`. Owned via
@@ -93,58 +93,22 @@ pub fn file(data: &[u8]) -> mkfs::Node {
 }
 
 // ---- erofs-utils oracle plumbing --------------------------------------
-
-/// True if `tool` is on `PATH` and runnable.
-///
-/// A MISSING TOOL IS A SKIP ON A LAPTOP AND A FAILURE IN CI.
-///
-/// Skipping is right on a machine with no erofs-utils: the driver's own
-/// tests still run, and a contributor without the reference tools is
-/// not blocked. It is exactly wrong in CI, where the workflow builds
-/// erofs-utils 1.9.1 from source for the sole purpose of running these
-/// comparisons, and verifies all three binaries with `--version` before
-/// the suite starts.
-///
-/// There, an absent tool means the install step changed or broke -- and
-/// the oracles would report success having compared this driver against
-/// nothing at all. That is the expensive failure to hide, because the
-/// oracles are the only check here that is not this repository marking
-/// its own homework.
-///
-/// `CI` is set on every GitHub Actions runner, unconditionally, which
-/// is what makes the distinction reliable. Measuring whether CI would
-/// catch a broken install means reproducing CI's ENVIRONMENT and not
-/// merely its command: a local run without `CI` set answers the
-/// developer question instead, and answers it more permissively.
-fn tool_available(tool: &str) -> bool {
-    let found = Command::new(tool)
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    assert!(
-        found || std::env::var_os("CI").is_none(),
-        "{tool} is not on PATH, and CI is set. The workflow builds erofs-utils from \
-         source so the oracles can run; without it they would skip and the suite would \
-         pass having compared this driver against nothing."
-    );
-    found
-}
-
-/// Returns true if the `mkfs.erofs` binary is on `PATH` and runnable.
-/// Tests that need it should branch on this and skip, so a checkout
-/// without erofs-utils still runs everything that does not need it.
-pub fn mkfs_erofs_available() -> bool {
-    tool_available("mkfs.erofs")
-}
-
-pub fn fsck_erofs_available() -> bool {
-    tool_available("fsck.erofs")
-}
-
-pub fn dump_erofs_available() -> bool {
-    tool_available("dump.erofs")
-}
+//
+// THE TOOLS RUN IN THE HARNESS VM AND NOWHERE ELSE. What used to be
+// here was a `tool_available()` probe and three `*_available()` helpers
+// whose callers returned early when the answer was no: on a machine
+// without erofs-utils the oracle suites passed having compared this
+// driver against nothing, and the only thing standing between that and
+// CI was an assert keyed on the `CI` environment variable. Measured on
+// this host, `mkfs.erofs` was present and was version 1.5, which does
+// not answer `-V` at all -- so the probe said "absent", every oracle
+// test returned early, and `a_freshly_built_zstd_image_reads_back_exactly`
+// reported ok having built no image.
+//
+// There is now one way in -- fs_erofs_test_support::oracle -- it runs
+// the tool in the guest where erofs-utils 1.9.1 is built from source,
+// and it FAILS when it cannot. tests/test_contract.rs refuses any other
+// shape.
 
 /// Materialize a `mkfs::Node` tree onto disk under `root`. Used to
 /// stage a source tree for `mkfs.erofs` to ingest.
@@ -211,17 +175,15 @@ fn materialize_node(path: &Path, node: &mkfs::Node) {
     }
 }
 
-/// Spawn `mkfs.erofs <extra_args> out_path source_dir`. Returns the
-/// exit status + captured stderr for diagnosis. Tests should panic on
-/// non-zero; this fn just returns the result.
+/// Run `mkfs.erofs <extra_args> out_path source_dir` IN THE GUEST.
+/// Returns the exit status and captured streams for diagnosis; callers
+/// decide what a non-zero status means.
 pub fn run_mkfs_erofs(extra_args: &[&str], out_path: &Path, source_dir: &Path) -> RunResult {
-    let mut cmd = Command::new("mkfs.erofs");
+    let mut call = oracle("mkfs.erofs");
     for a in extra_args {
-        cmd.arg(a);
+        call = call.arg(a);
     }
-    cmd.arg(out_path);
-    cmd.arg(source_dir);
-    let out = cmd.output().expect("spawn mkfs.erofs");
+    let out = call.arg(out_path).arg(source_dir).output();
     RunResult {
         status_code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -230,13 +192,17 @@ pub fn run_mkfs_erofs(extra_args: &[&str], out_path: &Path, source_dir: &Path) -
 }
 
 /// Build an EROFS image with `mkfs.erofs` from an in-memory Node tree
-/// plus an args list. Returns the rendered image bytes (and tempdir
-/// kept alive via `_guard`). Caller MUST hold the guard for the
-/// duration of any path-based use; the bytes alone outlive the guard.
+/// plus an args list. Returns the rendered image bytes, and a path to
+/// the image on disk for tools (fsck/dump) that want one.
+///
+/// THE SOURCE TREE AND THE IMAGE LIVE INSIDE THIS REPOSITORY, under the
+/// scratch directory, because that is the only tree the guest can see.
+/// A `tempfile::tempdir()` under /tmp -- which is what this used to do
+/// -- is a path `mkfs.erofs` in the guest cannot open.
 pub fn build_with_mkfs_erofs(args: &[&str], tree: &mkfs::Node) -> ImageArtifact {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let src = dir.path().join("src");
-    let img = dir.path().join("out.img");
+    let dir = ScratchDir::new("mkfs");
+    let src = dir.join("src");
+    let img = dir.join("out.img");
     materialize_tree(&src, tree);
     let result = run_mkfs_erofs(args, &img, &src);
     if result.status_code != Some(0) {
@@ -253,12 +219,13 @@ pub fn build_with_mkfs_erofs(args: &[&str], tree: &mkfs::Node) -> ImageArtifact 
     }
 }
 
-/// Wraps the bytes of a built image alongside the tempdir keeping its
-/// on-disk twin alive for tools (fsck/dump) that want a path.
+/// Wraps the bytes of a built image alongside the scratch directory
+/// keeping its on-disk twin alive for tools (fsck/dump) that want a
+/// path. The bytes alone outlive the guard.
 pub struct ImageArtifact {
     pub bytes: Vec<u8>,
     pub path: PathBuf,
-    _guard: tempfile::TempDir,
+    _guard: ScratchDir,
 }
 
 #[derive(Debug)]
@@ -266,6 +233,16 @@ pub struct RunResult {
     pub status_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Write `bytes` into the scratch directory and return the path, plus
+/// the guard that deletes it. Inside the repository, so the guest can
+/// read it.
+pub fn stage_image(tag: &str, bytes: &[u8]) -> (PathBuf, ScratchDir) {
+    let dir = ScratchDir::new(tag);
+    let path = dir.join("image.img");
+    std::fs::write(&path, bytes).expect("write image");
+    (path, dir)
 }
 
 // ---- C ABI (capi) test helpers ----------------------------------------

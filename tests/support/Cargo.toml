@@ -1,0 +1,16 @@
+# The test suite's one way in to a fixture, to an erofs-utils tool and to
+# the kernel — all three of which live in the fs-linux-test-harness VM.
+# Dev-only: it never reaches a consumer of this crate, and it is what
+# tests/test_contract.rs holds every test to.
+[package]
+name = "fs-erofs-test-support"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "fs_erofs_test_support"
+path = "src/lib.rs"
+
+[dependencies]

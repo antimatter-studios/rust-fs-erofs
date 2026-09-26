@@ -15,15 +15,19 @@
 //! no such case left in this file; `tests/oracle_verdicts.rs` refuses
 //! the blanket shape coming back.
 //!
-//! All tests in this file are `#[ignore]`-gated so a fresh checkout
-//! without erofs-utils still has a green `cargo test` run. Opt in
-//! with `cargo test -- --ignored`.
+//! `mkfs.erofs` runs in the fs-linux-test-harness VM, where
+//! `scripts/vm-setup.sh` builds erofs-utils 1.9.1 from source with every
+//! codec. These tests were `#[ignore]`-gated so a checkout without the
+//! tool had a green `cargo test` — which is a second way of saying that
+//! on most machines the one check here that is not this crate marking
+//! its own homework never ran.
 
 mod common;
 
-use common::{build_with_mkfs_erofs, dir, file, mkfs_erofs_available, open_image, MemDev};
+use common::{build_with_mkfs_erofs, dir, file, open_image, MemDev};
 use fs_core::BlockRead;
 use fs_erofs::{mkfs, Filesystem};
+use fs_erofs_test_support::{assert_fsck_clean, mkfs_from_guest_tree, ScratchDir};
 use std::sync::Arc;
 
 /// Walk the FS exhaustively, asserting every regular file is readable
@@ -134,12 +138,7 @@ fn try_read_sample(bytes: Vec<u8>) -> ReadOutcome {
 // =====================================================================
 
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_default() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // What `mkfs.erofs` writes with no options must read back, byte for
     // byte. The defaults move between erofs-utils releases, and this is
     // the test that notices when they move somewhere the reader cannot
@@ -155,12 +154,7 @@ fn oracle_default() {
 }
 
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_lz4_explicit() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // `-z lz4` over the whole sample tree: a nested directory, an
     // empty file, a 12-byte file, a 200-byte incompressible one and a
     // compressible 5 KiB one, all in the one image.
@@ -177,12 +171,7 @@ fn oracle_lz4_explicit() {
 }
 
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_lzma() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // `oracle_lzma_default_round_trip` pins `-b 4096` and a single
     // 3584-byte file to stay inside one lcluster; this one takes
     // mkfs.erofs's own block-size default and the whole sample tree,
@@ -197,12 +186,7 @@ fn oracle_lzma() {
 }
 
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_deflate() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // The DEFLATE twin of `oracle_lzma`, and the same relationship to
     // `oracle_deflate_default_round_trip`.
     let img = build_with_mkfs_erofs(&["-z", "deflate"], &sample_tree());
@@ -215,12 +199,7 @@ fn oracle_deflate() {
 }
 
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_chunked() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // Chunk-based inodes. `incompat_gate.rs`'s
     // `oracle_chunked_opens_and_48bit_is_refused` builds the same
     // `--chunksize=65536` image, but reads one 13-byte file out of a
@@ -243,12 +222,7 @@ fn oracle_chunked() {
 /// identical image from the identical tree with the identical
 /// `-E^ztailpacking,^fragments,^dedupe`, and asserted less about it.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_plain_uncompressed() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // No compression, no chunking -- the simplest oracle path. Should
     // read cleanly today.
     let img = build_with_mkfs_erofs(&["-E^ztailpacking,^fragments,^dedupe"], &sample_tree());
@@ -259,12 +233,7 @@ fn oracle_plain_uncompressed() {
 /// Sanity: oracle-built image's superblock is openable and reports the
 /// expected magic + a sane block size.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_superblock_basic() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let img = build_with_mkfs_erofs(&["-E^ztailpacking,^fragments,^dedupe"], &sample_tree());
     let fs = open_image(img.bytes);
     let sb = fs.superblock();
@@ -273,107 +242,25 @@ fn oracle_superblock_basic() {
     assert!(sb.blocks > 0);
 }
 
-/// Set an xattr for an oracle test, or report that it cannot be set.
-///
-/// A CANNOT-SET IS A SKIP ON A LAPTOP AND A FAILURE IN CI -- the same
-/// rule `tool_available` in `tests/common/mod.rs` applies to the
-/// erofs-utils binaries (#91). The two xattr oracles are the only
-/// coverage of the shared-xattr area and the custom-prefix dictionary,
-/// and before this they returned early and reported `ok` whenever the
-/// probe failed, CI included: an `attr` package change or a `TMPDIR` on
-/// a mount without user xattrs would have silently switched them off.
-fn set_xattr(path: &std::path::Path, name: &str, value: &str) -> bool {
-    xattr_outcome(
-        try_set_xattr(path, name, value),
-        std::env::var_os("CI").is_some(),
-    )
-}
-
-/// The decision, separated from the environment so it can be tested.
-fn xattr_outcome(result: Result<(), String>, in_ci: bool) -> bool {
-    match result {
-        Ok(()) => true,
-        Err(why) => {
-            assert!(
-                !in_ci,
-                "cannot set an xattr, and CI is set: {why}. The workflow installs `attr` so \
-                 the xattr oracles run; skipping here would report them as passing having \
-                 checked nothing."
-            );
-            eprintln!("skipping: cannot set xattrs in this environment: {why}");
-            false
-        }
-    }
-}
-
-/// `xattr -w name value path` (macOS), then `setfattr -n name -v value
-/// path` (Linux). On failure, says what each attempt reported, so a CI
-/// failure carries its cause.
-fn try_set_xattr(path: &std::path::Path, name: &str, value: &str) -> Result<(), String> {
-    let attempts: [(&str, Vec<&std::ffi::OsStr>); 2] = [
-        (
-            "xattr",
-            vec![
-                "-w".as_ref(),
-                name.as_ref(),
-                value.as_ref(),
-                path.as_os_str(),
-            ],
-        ),
-        (
-            "setfattr",
-            vec![
-                "-n".as_ref(),
-                name.as_ref(),
-                "-v".as_ref(),
-                value.as_ref(),
-                path.as_os_str(),
-            ],
-        ),
-    ];
-    let mut reports = Vec::new();
-    for (tool, args) in attempts {
-        match std::process::Command::new(tool).args(&args).output() {
-            Ok(out) if out.status.success() => return Ok(()),
-            Ok(out) => reports.push(format!(
-                "`{tool}` exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
-            Err(e) => reports.push(format!("`{tool}` could not run: {e}")),
-        }
-    }
-    Err(reports.join("; "))
-}
-
-#[test]
-fn an_xattr_that_cannot_be_set_in_ci_fails_rather_than_skips() {
-    let outcome = std::panic::catch_unwind(|| xattr_outcome(Err("probe failed".into()), true));
-    assert!(
-        outcome.is_err(),
-        "with CI set, an xattr that cannot be set was treated as a skip (#91)"
-    );
-}
-
-#[test]
-fn an_xattr_that_cannot_be_set_on_a_laptop_is_a_skip() {
-    assert!(!xattr_outcome(Err("probe failed".into()), false));
-    assert!(xattr_outcome(Ok(()), true));
-}
-
-#[test]
-fn a_failed_xattr_set_reports_what_each_tool_said() {
-    // Inside a fresh private directory, so nothing -- a leftover, a
-    // symlink, another process -- can exist at the path and turn this
-    // into an xattr write on somebody else's file.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let missing = dir.path().join("no-such-file");
-    let why = try_set_xattr(&missing, "user.probe", "v").expect_err("the file does not exist");
-    assert!(
-        why.contains("`xattr`") && why.contains("`setfattr`"),
-        "the failure should name both attempts: {why}"
-    );
-}
+// THE XATTR ORACLES STAGE THEIR SOURCE TREE IN THE GUEST.
+//
+// What stood here was a `set_xattr` that tried `xattr -w` then
+// `setfattr -n` on the HOST, and returned false when neither worked --
+// whereupon its two callers returned early. An `attr` package change,
+// or a TMPDIR on a mount without user xattrs, silently switched off the
+// only coverage of the shared-xattr area and the custom-prefix
+// dictionary, and the only thing between that and CI was an assert
+// keyed on the `CI` environment variable (#91). Three further tests
+// existed solely to check that decision.
+//
+// It cannot survive the move in any case: the repository reaches the
+// guest as a 9p mount, so whether a `user.*` attribute set on the host
+// is visible to `mkfs.erofs` in the guest is a property of the
+// transport and of the host's filesystem, and a test about the shared
+// xattr area must not also be a test of that. So the tree is staged on
+// the guest's own disk, by `fs_erofs_test_support::mkfs_from_guest_tree`,
+// where `setfattr` means what it says -- and a `setfattr` that fails
+// fails the test.
 
 /// End-to-end: build an image with mkfs.erofs whose files all carry the
 /// SAME xattr value, so mkfs deduplicates it into the shared block area.
@@ -387,40 +274,31 @@ fn a_failed_xattr_set_reports_what_each_tool_said() {
 /// tree -- so it was `oracle_default` under another name, minus the
 /// verdict. Removed in #116.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils) + xattr/setfattr; shared xattrs"]
 fn oracle_shared_xattrs_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // Stage a tree with three identical-content files. Set the same
     // xattr value on all three so mkfs.erofs collapses them into the
     // shared block area; set a UNIQUE xattr on file 1 to force at
     // least one inline entry alongside the shared references.
-    let dir_t = tempfile::tempdir().expect("tempdir");
-    let src = dir_t.path().join("src");
-    std::fs::create_dir_all(&src).expect("create src");
-    for name in ["f1.txt", "f2.txt", "f3.txt"] {
-        let p = src.join(name);
-        std::fs::write(&p, b"hello\n").expect("write file");
-        if !set_xattr(&p, "user.team", "datastore") {
-            return;
-        }
-    }
-    if !set_xattr(&src.join("f1.txt"), "user.unique", "f1only") {
-        return;
-    }
-
+    //
     // -x 1 forces inline tolerance to 1, encouraging mkfs to push the
     // shared-across-files xattr into the shared area instead of inlining.
-    let img_path = dir_t.path().join("out.img");
-    let result = common::run_mkfs_erofs(&["-x", "1"], &img_path, &src);
-    if result.status_code != Some(0) {
-        panic!(
-            "mkfs.erofs failed: stderr={} stdout={}",
-            result.stderr, result.stdout
-        );
-    }
+    let dir = ScratchDir::new("shared-xattrs");
+    let img_path = dir.join("out.img");
+    let result = mkfs_from_guest_tree(
+        &img_path,
+        r#"for name in f1.txt f2.txt f3.txt; do
+    printf 'hello\n' > "$name"
+    setfattr -n user.team -v datastore "$name"
+done
+setfattr -n user.unique -v f1only f1.txt"#,
+        &["-x", "1"],
+    );
+    assert!(
+        result.status.success(),
+        "staging the tree and running mkfs.erofs -x 1 in the guest failed:\n{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     let bytes = std::fs::read(&img_path).expect("read built image");
     let fs = common::open_image(bytes);
 
@@ -451,36 +329,22 @@ fn oracle_shared_xattrs_round_trip() {
 /// prefix dictionary. Verify our reader looks up the dict and returns
 /// the FULL prefixed name.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils) + xattr/setfattr; custom xattr prefix"]
 fn oracle_custom_xattr_prefix_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
-    let dir_t = tempfile::tempdir().expect("tempdir");
-    let src = dir_t.path().join("src");
-    std::fs::create_dir_all(&src).expect("create src");
-    let p = src.join("file.txt");
-    std::fs::write(&p, b"x").expect("write file");
-    if !set_xattr(&p, "user.dataitem.thing", "v1") {
-        return;
-    }
-    if !set_xattr(&p, "user.dataitem.other", "v2") {
-        return;
-    }
-
-    let img_path = dir_t.path().join("out.img");
-    let result = common::run_mkfs_erofs(
-        &["--xattr-prefix=user.dataitem", "-x", "1"],
+    let dir = ScratchDir::new("xattr-prefix");
+    let img_path = dir.join("out.img");
+    let result = mkfs_from_guest_tree(
         &img_path,
-        &src,
+        r#"printf 'x' > file.txt
+setfattr -n user.dataitem.thing -v v1 file.txt
+setfattr -n user.dataitem.other -v v2 file.txt"#,
+        &["--xattr-prefix=user.dataitem", "-x", "1"],
     );
-    if result.status_code != Some(0) {
-        panic!(
-            "mkfs.erofs failed: stderr={} stdout={}",
-            result.stderr, result.stdout
-        );
-    }
+    assert!(
+        result.status.success(),
+        "staging the tree and running mkfs.erofs --xattr-prefix in the guest failed:\n{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     let bytes = std::fs::read(&img_path).expect("read built image");
     let fs = common::open_image(bytes);
 
@@ -524,12 +388,7 @@ fn oracle_custom_xattr_prefix_round_trip() {
 /// spanning ~13 lclusters at 16 KiB blocks (or 49 lclusters at 4 KiB).
 /// Exact repro from the bug report (only with -Elegacy-compress added).
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_legacy_lz4_multi_lcluster_pcluster_200k() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"aaaa bbbb cccc\n"
         .iter()
         .copied()
@@ -562,12 +421,7 @@ fn oracle_legacy_lz4_multi_lcluster_pcluster_200k() {
 /// size -- 8000-byte file becomes 2 lclusters owned by a single
 /// pcluster (the HEAD-with-clusterofs=0 / sentinel-PLAIN case).
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_legacy_lz4_two_lcluster_pcluster_4k_blocksize() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"aaaa bbbb cccc\n"
         .iter()
         .copied()
@@ -601,12 +455,7 @@ fn oracle_legacy_lz4_two_lcluster_pcluster_4k_blocksize() {
 /// file reads would miss because the boundary is internal to one
 /// pcluster.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_legacy_lz4_mid_pcluster_slice() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"aaaa bbbb cccc\n"
         .iter()
         .copied()
@@ -640,12 +489,7 @@ fn oracle_legacy_lz4_mid_pcluster_slice() {
 /// This is the boundary case the bug report calls out as "the kernel's
 /// `clusterofs` semantics" of HEAD vs sentinel.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_legacy_lz4_sentinel_last_lcluster() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // 5000 bytes spans bytes [0,4096) (lc0 HEAD) + [4096,5000) (lc1
     // sentinel PLAIN with clusterofs=904). Pure regression target.
     let payload: Vec<u8> = b"abcdefghij".iter().copied().cycle().take(5_000).collect();
@@ -664,18 +508,15 @@ fn oracle_legacy_lz4_sentinel_last_lcluster() {
         &tree,
     );
     let fs = open_image(img.bytes);
-    let inode = match fs.lookup_path("/s.bin") {
-        Ok(i) => i,
-        Err(e) => {
-            // mkfs may decide a 5K file isn't worth compressing; skip
-            // gracefully if so.
-            eprintln!("skipping: lookup s.bin: {e:?}");
-            return;
-        }
-    };
-    if !inode.is_regular_file() {
-        return;
-    }
+    // A LOOKUP THAT FAILS IS A FAILURE. This used to say "mkfs may
+    // decide a 5K file isn't worth compressing" and return early, which
+    // is the shape #116 removed from six other tests: whether or not the
+    // file was compressed, it is in the image and this reader has to
+    // find it.
+    let inode = fs
+        .lookup_path("/s.bin")
+        .unwrap_or_else(|e| panic!("lookup /s.bin in the mkfs.erofs image: {e:?}"));
+    assert!(inode.is_regular_file(), "/s.bin is not a regular file");
     let mut buf = vec![0u8; payload.len()];
     fs.read_file(&inode, 0, &mut buf).expect("read s.bin");
     assert_eq!(buf, payload);
@@ -705,12 +546,7 @@ fn oracle_legacy_lz4_sentinel_last_lcluster() {
 ///   "advise=0 compact-4B" + ztailpacking inline-tail path on a modern
 ///   (>= 1.5) erofs-utils install.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_compacted_2b_default_lz4() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // Repro from the bug report.
     let payload: Vec<u8> = b"aaaa bbbb cccc\n"
         .iter()
@@ -733,12 +569,7 @@ fn oracle_compacted_2b_default_lz4() {
 /// case): payload is short enough to leave room in the metadata block,
 /// so mkfs.erofs inlines the LZ4 frame just past the index area.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_compacted_2b_with_ztailpacking() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"aaaa bbbb cccc\n"
         .iter()
         .copied()
@@ -764,12 +595,7 @@ fn oracle_compacted_2b_with_ztailpacking() {
 /// must round-trip; the prior reader zero-filled past the boundary
 /// inside `read_compressed_block`.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_compacted_2b_multi_pcluster() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"aaaa bbbb cccc\n"
         .iter()
         .copied()
@@ -794,12 +620,7 @@ fn oracle_compacted_2b_multi_pcluster() {
 /// `lclusterbits <= 12` is required for 2B packs). The header check at
 /// open time and the middle-region pack walk both get exercised.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_compacted_2b_advise_bit_set_4k_blocks() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"aaaa bbbb cccc\n"
         .iter()
         .copied()
@@ -822,12 +643,7 @@ fn oracle_compacted_2b_advise_bit_set_4k_blocks() {
 /// developer box without a Linux mount, fsck.erofs's clean exit is the
 /// strongest portable evidence that the on-disk layout is spec-correct.
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn our_writer_image_readable_by_kernel_fixture() {
-    if !common::fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // Mixed payload: small + multi-lcluster + incompressible. Each
     // exercises a different path in our writer (PLAIN passthrough vs
     // HEAD1, single-lcluster vs many).
@@ -888,19 +704,10 @@ fn our_writer_image_readable_by_kernel_fixture() {
         ("plain.txt", file(b"alongside-plain\n")),
     ]);
     let img = mkfs::build_image(tree, 12).unwrap();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().join("our.img");
-    std::fs::write(&path, &img).expect("write image");
-    let out = std::process::Command::new("fsck.erofs")
-        .arg(&path)
-        .output()
-        .expect("spawn fsck.erofs");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "fsck.erofs failed on our compressed writer output:\nstdout: {stdout}\nstderr: {stderr}"
+    let (path, _guard) = common::stage_image("writer-readable", &img);
+    assert_fsck_clean(
+        path.to_str().expect("utf-8 image path"),
+        "our compressed writer output",
     );
 }
 
@@ -1041,12 +848,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 /// format), confirm both produce images our reader extracts byte-for-
 /// byte identical to the input.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn our_compacted2b_image_compatible_with_kernel_oracle() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // Highly compressible 1 MiB payload: matches the SHA256 round-trip
     // proof referenced in W2b's milestone description.
     let payload: Vec<u8> = b"yes pattern\n"
@@ -1119,12 +921,7 @@ fn our_compacted2b_image_compatible_with_kernel_oracle() {
 /// limitation tracked as future BIG_PCLUSTER work — orthogonal to the
 /// W3 codec milestone covered by this test.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_lzma_default_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // Single-lcluster payload: 3.5 KiB at default 4 KiB blocks /
     // lcluster_size. Avoids triggering BIG_PCLUSTER on the kernel side.
     let payload: Vec<u8> = b"yes pattern\n"
@@ -1158,12 +955,7 @@ fn oracle_lzma_default_round_trip() {
 /// W3 cross-validation: same as `oracle_lzma_default_round_trip` but
 /// for `-z deflate`. Same single-lcluster restriction applies.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_deflate_default_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"yes pattern\n"
         .iter()
         .copied()
@@ -1211,12 +1003,7 @@ fn oracle_deflate_default_round_trip() {
 /// kernel oracle engages `Z_EROFS_ADVISE_BIG_PCLUSTER_1`; before this
 /// fix our reader rejected the image with `Error::UnsupportedLayout(99)`.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_lzma_big_pcluster_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"the quick brown fox\n"
         .iter()
         .copied()
@@ -1253,12 +1040,7 @@ fn oracle_lzma_big_pcluster_round_trip() {
 /// `mkfs.erofs -z deflate` on a 1 MiB highly-compressible payload.
 /// Same BIG_PCLUSTER expectations as the LZMA variant above.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_deflate_big_pcluster_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"the quick brown fox\n"
         .iter()
         .copied()
@@ -1296,12 +1078,7 @@ fn oracle_deflate_big_pcluster_round_trip() {
 /// off-by-pcluster-base errors that whole-file reads might miss because
 /// the cut falls inside a multi-block pcluster.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_lzma_big_pcluster_mid_slice() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = b"alpha beta gamma\n"
         .iter()
         .copied()
@@ -1577,323 +1354,6 @@ fn our_deflate_writer_sha256_round_trip_100kib() {
     );
 }
 
-/// The tree the kernel-mountability check writes, and what every file in
-/// it must read back as through the mount.
-///
-/// Deliberately more than one inode layout: a tail-inlined small file, a
-/// file that is exactly one block, a multi-block one, an empty one, a
-/// symlink and two levels of directory. A mount proves the superblock
-/// parses; only reading every one of these back proves the inodes,
-/// directory blocks and data layout the writer emitted are the ones the
-/// kernel thinks they are.
-#[cfg(target_os = "linux")]
-fn kernel_mount_sample() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node) {
-    let mut big = Vec::with_capacity(100_000);
-    let mut seed = 0x2545_f491_4f6c_dd1du64;
-    while big.len() < 100_000 {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        big.extend_from_slice(&seed.to_le_bytes());
-    }
-    big.truncate(100_000);
-    let exact_block = vec![0x5Au8; 4096];
-    let leaf = vec![0x11u8; 5000];
-
-    let files: Vec<(String, Vec<u8>)> = vec![
-        ("/a.bin", vec![0xABu8; 200]),
-        ("/big.bin", big.clone()),
-        ("/empty", Vec::new()),
-        ("/exact_block.bin", exact_block.clone()),
-        ("/hello.txt", b"hello\n".to_vec()),
-        ("/sub/deeper/leaf.bin", leaf.clone()),
-        ("/sub/nested.txt", b"nested\n".to_vec()),
-    ]
-    .into_iter()
-    .map(|(p, b)| (p.to_string(), b))
-    .collect();
-
-    let tree = dir(vec![
-        ("hello.txt", file(b"hello\n")),
-        ("a.bin", file(&[0xABu8; 200])),
-        ("empty", file(b"")),
-        ("exact_block.bin", file(&exact_block)),
-        ("big.bin", file(&big)),
-        (
-            "link.txt",
-            fs_erofs::mkfs::Node::Symlink {
-                mode: 0o120777,
-                target: "hello.txt".to_string(),
-                meta: fs_erofs::mkfs::NodeMeta::default(),
-                xattrs: Vec::new(),
-            },
-        ),
-        (
-            "sub",
-            dir(vec![
-                ("nested.txt", file(b"nested\n")),
-                ("deeper", dir(vec![("leaf.bin", file(&leaf))])),
-            ]),
-        ),
-    ]);
-    (files, tree)
-}
-
-/// True when this process is already root, so `sudo` is neither needed
-/// nor necessarily installed.
-#[cfg(target_os = "linux")]
-fn running_as_root() -> bool {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-        .unwrap_or(false)
-}
-
-/// Run `argv` with the privilege `mount(2)` needs: directly when this
-/// process is root, through `sudo -n` otherwise.
-///
-/// `-n` NEVER PROMPTS. A sudo that asks for a password from a test would
-/// hang a CI job until the job timeout, which reads as an infrastructure
-/// fault rather than as the missing privilege it is. Failing at once,
-/// with sudo's own stderr, is what the caller can act on.
-#[cfg(target_os = "linux")]
-fn run_privileged(argv: &[&str]) -> std::io::Result<std::process::Output> {
-    let mut cmd = if running_as_root() {
-        std::process::Command::new(argv[0])
-    } else {
-        let mut c = std::process::Command::new("sudo");
-        c.arg("-n").arg(argv[0]);
-        c
-    };
-    cmd.args(&argv[1..]).output()
-}
-
-/// Unmounts on every exit path, including a panicking assertion.
-///
-/// The mount is made with `-o loop`, and the kernel marks a loop device
-/// set up that way autoclear: unmounting detaches it. So the unmount is
-/// the whole of the cleanup, and it has to happen even when the content
-/// comparison below fails -- otherwise `tempdir`'s cleanup deletes the
-/// mountpoint out from under a live filesystem and the runner keeps a
-/// loop device pinned to a file that no longer exists.
-#[cfg(target_os = "linux")]
-struct KernelMount {
-    mountpoint: std::path::PathBuf,
-    image: std::path::PathBuf,
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for KernelMount {
-    fn drop(&mut self) {
-        let mp = self.mountpoint.display().to_string();
-        let ok = matches!(run_privileged(&["umount", &mp]), Ok(o) if o.status.success());
-        if !ok {
-            // Lazy detach rather than leaving it mounted: a second
-            // failure here is worth printing, but a mounted tempdir is
-            // worse than a noisy log.
-            let lazy = run_privileged(&["umount", "-l", &mp]);
-            eprintln!(
-                "umount {mp} failed; lazy umount: {:?}",
-                lazy.map(|o| o.status)
-            );
-        }
-        // Prove the loop device went with it rather than assuming the
-        // autoclear happened: a leaked device survives the job and the
-        // next test to ask for one gets a different answer.
-        if let Ok(out) = run_privileged(&["losetup", "-j", &self.image.display().to_string()]) {
-            let left = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !left.is_empty() {
-                eprintln!("loop device still attached after umount: {left}");
-                if let Some(dev) = left.split(':').next() {
-                    let _ = run_privileged(&["losetup", "-d", dev]);
-                }
-            }
-        }
-    }
-}
-
-/// Every regular file under `root`, keyed by its path relative to the
-/// mountpoint, with the bytes the kernel returns for it.
-#[cfg(target_os = "linux")]
-fn read_mounted_tree(
-    root: &std::path::Path,
-    dir_path: &std::path::Path,
-    files: &mut std::collections::BTreeMap<String, Vec<u8>>,
-    dirs: &mut std::collections::BTreeSet<String>,
-    links: &mut std::collections::BTreeMap<String, String>,
-) {
-    let entries = std::fs::read_dir(dir_path)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir_path.display()));
-    for entry in entries {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        let rel = format!(
-            "/{}",
-            path.strip_prefix(root)
-                .expect("entry under mountpoint")
-                .display()
-        );
-        let meta = std::fs::symlink_metadata(&path)
-            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
-        if meta.is_dir() {
-            dirs.insert(rel);
-            read_mounted_tree(root, &path, files, dirs, links);
-        } else if meta.is_symlink() {
-            let target = std::fs::read_link(&path)
-                .unwrap_or_else(|e| panic!("readlink {}: {e}", path.display()));
-            links.insert(rel, target.display().to_string());
-        } else {
-            let bytes = std::fs::read(&path)
-                .unwrap_or_else(|e| panic!("read {} through the mount: {e}", path.display()));
-            assert_eq!(
-                bytes.len() as u64,
-                meta.len(),
-                "{rel}: stat size {} but {} bytes read back",
-                meta.len(),
-                bytes.len()
-            );
-            files.insert(rel, bytes);
-        }
-    }
-}
-
-/// W4 milestone: end-to-end proof that an image emitted by our writer is
-/// mountable by the live Linux EROFS kernel module, and that what the
-/// kernel then reads out of it is what the writer put in.
-///
-/// # A skip here is a failure
-///
-/// This test spent its whole existence returning early. It invoked
-/// `mount` unprivileged, matched the refusal against a list of
-/// permission-denied wordings, printed "skipping" and returned ok --
-/// and CI opts it in on every run, so the repository's strongest claim
-/// about its writer was answered by a `mount` that was never allowed to
-/// run (#117).
-///
-/// The privilege was available the whole time: GitHub's runners have
-/// passwordless `sudo` and the `loop` driver, which is how the btrfs and
-/// squashfs siblings mount their fixtures. So the mount is made through
-/// `sudo -n`, and a mount that cannot be made **fails** whenever `CI` is
-/// set, naming what the job was supposed to have provided. On a laptop
-/// without sudo it still skips, because there it really is the harness
-/// and not the writer.
-///
-/// # What it proves
-///
-/// `mount(2)` succeeding proves the superblock is acceptable and nothing
-/// more. So after mounting, every file in the tree is read back through
-/// the kernel and compared by name, by size and by SHA-256 of its
-/// contents, the directories are compared as a set, and the symlink's
-/// target is read. A writer defect that produces a mountable image with
-/// the wrong bytes in it fails here.
-///
-/// `#[cfg(target_os = "linux")]`: the EROFS module and `mount` are
-/// kernel APIs, so on macOS there is nothing to ask. `#[ignore]` keeps a
-/// fresh checkout green; CI's `--ignored` run opts it back in.
-#[test]
-#[ignore = "kernel-mountability check; needs Linux + mount privileges, which CI provides"]
-#[cfg(target_os = "linux")]
-fn our_writer_image_kernel_mountable() {
-    use std::path::PathBuf;
-
-    let (expected_files, tree) = kernel_mount_sample();
-    let img_bytes = mkfs::build_image(tree, 12).expect("build_image");
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let img_path: PathBuf = tmp.path().join("our.img");
-    std::fs::write(&img_path, &img_bytes).expect("write image file");
-    let mountpoint: PathBuf = tmp.path().join("mnt");
-    std::fs::create_dir_all(&mountpoint).expect("create mountpoint");
-    // The kernel mounts as root and the image's inodes are owned by root
-    // with our writer's default 0755/0644 modes, so the unprivileged
-    // test process can read the tree back. It cannot traverse the
-    // tempdir as root, though, if the tempdir is not searchable -- it is
-    // 0700 by default and the reader here is the same user that made it,
-    // so this is only about the kernel's own lookup of the image file.
-    let in_ci = std::env::var_os("CI").is_some();
-
-    let mount = run_privileged(&[
-        "mount",
-        "-t",
-        "erofs",
-        "-o",
-        "loop,ro",
-        img_path.to_str().expect("utf-8 image path"),
-        mountpoint.to_str().expect("utf-8 mountpoint"),
-    ]);
-    let failure = match &mount {
-        Err(e) => Some(format!("could not run mount: {e}")),
-        Ok(out) if !out.status.success() => Some(format!(
-            "exit {:?}; stderr: {}; stdout: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim(),
-            String::from_utf8_lossy(&out.stdout).trim()
-        )),
-        Ok(_) => None,
-    };
-    if let Some(detail) = failure {
-        assert!(
-            !in_ci,
-            "the kernel mount of our writer's EROFS image did not happen, and CI is set. \
-             This job exists to run it: the runner has passwordless sudo, the loop driver \
-             and an EROFS module, so a mount that cannot be made here is a defect in the \
-             image or in the job, not a missing privilege to skip over ({detail})"
-        );
-        eprintln!(
-            "skipping: this host cannot mount (no passwordless sudo, no loop driver, or no \
-             EROFS module). CI fails instead of skipping. Detail: {detail}"
-        );
-        return;
-    }
-    let _mounted = KernelMount {
-        mountpoint: mountpoint.clone(),
-        image: img_path.clone(),
-    };
-
-    let mut files = std::collections::BTreeMap::new();
-    let mut dirs = std::collections::BTreeSet::new();
-    let mut links = std::collections::BTreeMap::new();
-    read_mounted_tree(&mountpoint, &mountpoint, &mut files, &mut dirs, &mut links);
-
-    let want: std::collections::BTreeMap<String, Vec<u8>> = expected_files.into_iter().collect();
-    assert_eq!(
-        files.keys().cloned().collect::<Vec<_>>(),
-        want.keys().cloned().collect::<Vec<_>>(),
-        "the mounted tree holds different files from the ones the writer was given"
-    );
-    assert_eq!(
-        dirs.iter().cloned().collect::<Vec<_>>(),
-        vec!["/sub".to_string(), "/sub/deeper".to_string()],
-        "the mounted tree's directories"
-    );
-    assert_eq!(
-        links.get("/link.txt").map(String::as_str),
-        Some("hello.txt"),
-        "the symlink the writer emitted, as the kernel reads it: {links:?}"
-    );
-
-    for (path, want_bytes) in &want {
-        let got = &files[path];
-        assert_eq!(
-            got.len(),
-            want_bytes.len(),
-            "{path}: size through the kernel mount"
-        );
-        assert_eq!(
-            hex_encode(&sha256(got)),
-            hex_encode(&sha256(want_bytes)),
-            "{path}: SHA-256 of the bytes the kernel read differs from what the writer wrote"
-        );
-    }
-    eprintln!(
-        "the kernel mounted our writer's image and returned all {} files, {} directories and \
-         the symlink byte for byte",
-        files.len(),
-        dirs.len()
-    );
-}
-
 /// Forty files alternating compressible and random runs of uneven
 /// lengths. `mkfs.erofs` stores the random runs as PLAIN pclusters that
 /// start partway into a block, beside compressed pclusters spanning
@@ -1933,12 +1393,7 @@ fn mixed_run_files() -> Vec<(String, Vec<u8>)> {
 /// them to LZ4, which failed. 3 of these 40 files read wrong and 13
 /// failed to read before the fix.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_mixed_runs_compacted_2b_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let files = mixed_run_files();
     let entries: Vec<(&str, fs_erofs::mkfs::Node)> = files
         .iter()
@@ -1966,12 +1421,7 @@ fn oracle_mixed_runs_compacted_2b_round_trip() {
 /// default block size. The test asserts the images really carry the bit,
 /// so it cannot pass by never reaching the interlaced path.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_interlaced_fragments_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let files = mixed_run_files();
     let entries: Vec<(&str, fs_erofs::mkfs::Node)> = files
         .iter()
@@ -2014,12 +1464,7 @@ fn oracle_interlaced_fragments_round_trip() {
 /// codec, which has none for PLAIN: `header_algo: cluster_type has no
 /// codec`, for 15 of these 40 files at 4 KiB blocks.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_uncompressed_ztailpacked_tail_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let files = mixed_run_files();
     let entries: Vec<(&str, fs_erofs::mkfs::Node)> = files
         .iter()
@@ -2097,12 +1542,7 @@ fn fragments_sample_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node) {
 /// fragment redirect this previously failed at `Filesystem::open`
 /// with `Error::UnsupportedLayout(98)`.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_fragments_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let (expected, tree) = fragments_sample_tree();
     let img = build_with_mkfs_erofs(&["-z", "lz4", "-Efragments"], &tree);
     let fs = open_image(img.bytes);
@@ -2138,12 +1578,7 @@ fn oracle_fragments_round_trip() {
 /// that mkfs.erofs commits to actual LZMA pclusters (not full-
 /// fragment dedup or PLAIN passthrough).
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_lzma_compr_cfgs_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // Mixed-phrase pseudo-random text, ~100 KiB. The LCG ordering
     // gives some redundancy without triggering full-fragment dedup
     // (which mkfs.erofs uses for repeated single-phrase content).
@@ -2263,12 +1698,7 @@ fn wide_fragment_sample_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node)
 /// compressed extent with no blocks behind it. `fsck.erofs` calls the
 /// same image clean.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_fragments_wider_than_one_lcluster_round_trip() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let (expected, tree) = wide_fragment_sample_tree();
     let img = build_with_mkfs_erofs(&["-z", "lz4", "-Efragments", "-C65536"], &tree);
     let fs = open_image(img.bytes);
@@ -2294,12 +1724,7 @@ fn oracle_fragments_wider_than_one_lcluster_round_trip() {
 /// files. The reader's fragment-takes-precedence policy must keep
 /// each file's bytes correct.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_fragments_with_ztailpacking_combined() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let (expected, tree) = fragments_sample_tree();
     let img = build_with_mkfs_erofs(&["-z", "lz4", "-Eztailpacking,fragments"], &tree);
     let fs = open_image(img.bytes);
@@ -2459,12 +1884,7 @@ fn oracle_multidevice_round_trip() {
 /// ceiling, and demands the bytes back rather than tolerating an error
 /// the way the surveys above do.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn a_pcluster_decoding_to_more_than_a_megabyte_still_reads() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     // Compressible enough that one pcluster covers megabytes.
     let payload = vec![0u8; 24 * 1024 * 1024];
     let tree = dir(vec![("zeros.bin", file(&payload))]);

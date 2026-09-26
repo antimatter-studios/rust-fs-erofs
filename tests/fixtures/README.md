@@ -41,11 +41,14 @@ brew install android-platform-tools
 ### Run the test
 
 ```sh
-cargo test --test oracle_gsi -- --ignored
+chore test:gsi
 ```
 
-The test is `#[ignore]`-gated so a fresh checkout without the fixture
-still has a green `cargo test`.
+`test:gsi` is its own tier and nothing else runs it: the image is ~2 GiB
+and not ours to redistribute, so it cannot be a CI artefact. Inside that
+tier a missing fixture **fails**, naming this script. It used to be
+`#[ignore]`-gated and to print "skipping" and return, which is how the
+suite reported ok on every run without ever opening an image (#54).
 
 ## License posture
 
