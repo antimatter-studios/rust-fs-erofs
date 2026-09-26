@@ -71,5 +71,28 @@ else
     bad "tests/support/src/lib.rs's GUEST_SCRATCH no longer matches this script's"
 fi
 
+# EVERY REPO-CONTAINMENT ASSERTION MUST BE ONE-WAY.
+#
+# "Everything a tool touches is inside this repository" is true only when the
+# HOST drives the guest. There were three such assertions -- the kernel
+# oracle's, mkfs_from_guest_tree's and Oracle::check_path's -- and they were
+# found ONE CI RUN AT A TIME, because each only fires once the one before it
+# has been relaxed. A fourth would cost another round trip, so it is checked
+# by shape instead: an `in_guest()` escape has to appear within a few lines
+# above the assertion.
+guard_fails=0
+while IFS=: read -r file line _; do
+    [ -n "${file:-}" ] || continue
+    from=$(( line > 15 ? line - 15 : 1 ))
+    if ! sed -n "${from},${line}p" "$file" | grep -q 'in_guest()'; then
+        guard_fails=$((guard_fails + 1))
+        printf '  FAIL  %s:%s asserts a path is inside the repository with no in_guest() escape\n' \
+            "$file" "$line"
+    fi
+done <<EOF
+$(grep -n 'starts_with(repo' tests/support/src/*.rs || true)
+EOF
+if [ "$guard_fails" -eq 0 ]; then ok; else fail=$((fail + guard_fails)); fi
+
 printf '  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

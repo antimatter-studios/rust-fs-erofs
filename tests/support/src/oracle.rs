@@ -397,11 +397,22 @@ impl Oracle {
         )
     }
 
-    /// Everything a tool touches is inside this repository, because that
-    /// is the tree the guest has. Caught here, where the rule can be
-    /// explained, rather than in the guest as a missing file.
+    /// Everything a tool touches is inside this repository, because from
+    /// the host that is the only tree the guest has. Caught here, where the
+    /// rule can be explained, rather than in the guest as a missing file.
+    ///
+    /// THE RULE IS ONE-WAY, and this is the third place that matters — the
+    /// kernel oracle and `mkfs_from_guest_tree` have the same relaxation.
+    /// Running INSIDE the guest there is no host to be invisible to, every
+    /// path is simply a local path, and scratch deliberately lives on the
+    /// guest's own disk rather than the 9p-mounted repository (see
+    /// `fs_erofs_test_support::select_temp_dir` for why: mmap over 9p made
+    /// `mkfs.erofs -Efragments` die of SIGSEGV on CI's x86_64 guest).
     #[track_caller]
     fn check_path(&self, argument: &str) {
+        if in_guest() {
+            return;
+        }
         if !argument.starts_with('/') || !Path::new(argument).exists() {
             return;
         }
