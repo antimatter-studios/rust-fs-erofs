@@ -1,299 +1,313 @@
 name: CI
 
+# EVERY JOB RUNS CHORE TASKS, so a green local `chore test` is the same
+# evidence as a green run here (see the test contract at the top of
+# chores.yml):
+#
+#   unit         `chore test:unit` on a runner with NO fixtures: the tests
+#                that need no tool, no fixture and no VM, in the debug
+#                profile that traps an arithmetic overflow. That the job
+#                passes with test-disks/ holding only the committed ZSTD
+#                image is what proves the split.
+#   fixtures     `chore fixtures`: the mkfs.erofs-made images, built in the
+#                fs-linux-test-harness VM under KVM on x86_64, and handed
+#                to the other jobs as an artifact (they are disk images,
+#                the same for every architecture).
+#   test         x86_64, where GitHub gives us KVM: `chore lint` and
+#                `chore test` — the whole gate, with EVERY erofs-utils call
+#                and every kernel mount happening inside the harness VM.
+#                Nothing installs erofs-utils on the runner, and the log
+#                shows `[oracle vm]` / `[kernel vm]` for each one.
+#   test-arm64   aarch64 matters on its own (c_char is unsigned there, and
+#                it is what DiskJockey ships on) but GitHub's arm64
+#                runners have NO KVM, so no VM can run: this job runs the
+#                tiers that need none — lint, the unit tier, and the
+#                fixture-reading tests. Before the fixtures existed, that
+#                meant aarch64 read no mkfs.erofs image at all.
+#   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
+#                the guest. That is how a macOS host runs a Linux suite,
+#                and this job is what keeps that path working.
+#   ci-ok        the one required check: green only when every job above
+#                ran and succeeded (failed, cancelled OR skipped fails it).
+#
+# WHAT IS NO LONGER HERE. A 604-line source build of erofs-utils 1.9.1 on
+# the runner, in two jobs; a `validate mkfs_erofs (fsck.erofs strict)` job
+# that shelled out to the writer and fsck by hand; and three `cargo test`
+# steps that printed 1,393 lines between them. The tool build moved into
+# the guest (scripts/vm-setup.sh), the validation became the `oracle`
+# tier, and the tiers print a verdict. #131 measured the old shape at
+# 6,035 lines across three jobs, with none of them kept.
+#
+# THE OUTPUT BUDGET IS IN THE TASKS, so it is in this workflow too. Each
+# tier writes its full output to tmp/logs/<tier>.log and prints a verdict;
+# a tier that prints more than its measured budget FAILS (exit 65), which
+# is how a job that starts emitting thousands of lines turns red here
+# rather than being noticed by whoever scrolls it next. Every job that
+# runs a tier uploads those logs with `if: always()`, so the detail
+# survives the runner.
+
 on:
   push:
     branches: [main]
     tags: ['v*']
+  # NO BRANCH FILTER ON PULL REQUESTS. With `branches: [main]` a pull
+  # request based on anything else runs no CI at all — and still collects
+  # its review-bot ticks, so it reads as verified. Stacked pull requests
+  # are how work arrives here.
   pull_request:
-    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CHORE_VERSION: "0.11.0"
 
 jobs:
-  test:
-    # The job name stays keyed on `os`: branch protection requires the
-    # context `test-ubuntu-latest` by name, and renaming it would leave
-    # that required check permanently pending.
-    name: test-${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      # One architecture failing must not cancel the other's evidence.
-      fail-fast: false
-      matrix:
-        # Natively on both, not a cross-target `cargo check`: `c_char` is
-        # signed on x86_64-linux and unsigned on aarch64-linux, so a cast
-        # through it can be real on one and a clippy error on the other
-        # (#89), and only a native run also lints and executes there.
-        include:
-          - arch: x86_64
-            os: ubuntu-latest
-          - arch: aarch64
-            os: ubuntu-24.04-arm
+  unit:
+    name: unit (no tools, no VM)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      # The crate has a path dep on am-fs-core (../rust-fs-core).
-      # Clone the sibling repo alongside so cargo can resolve it.
-      # Anonymous HTTPS clone — rust-fs-core is public.
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.10 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        # Pinned (CHORE_VERSION) and checked against the release's
+        # checksums: the siblings, the tools and the tests all come
+        # through it.
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core (the path dependency) and fs-linux-test-harness, at
+        # the refs pinned in chores.yml.
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # erofs-utils provides mkfs.erofs / fsck.erofs / dump.erofs — the
-      # oracle binaries the #[ignore]-gated round-trip and oracle_compat
-      # tests shell out to. ubuntu-latest's apt erofs-utils is 1.7.1
-      # which predates variable block-size + the dump.erofs "Filesystem
-      # blocksize:" line our writer tests assert against, so we
-      # source-build 1.9.1 instead. `attr` provides setfattr/getfattr
-      # for the xattr oracle paths.
-      - name: Install erofs-utils 1.9.1 from source + attr
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            attr \
-            autoconf automake libtool pkg-config \
-            uuid-dev libselinux1-dev liblz4-dev liblzma-dev libzstd-dev zlib1g-dev
-          curl -sSL https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-1.9.1.tar.gz | tar -xz
-          cd erofs-utils-1.9.1
-          ./autogen.sh
-          ./configure --enable-fuse=no
-          make -j"$(nproc)"
-          sudo make install
-          mkfs.erofs --version | head -1
-          fsck.erofs --version | head -1
-          dump.erofs --version | head -1
-          # The xattr oracles need setfattr. Verified here as well as in the
-          # tests, which also fail in CI when a set fails for any other
-          # reason (#91). Not piped through `head`: without pipefail the
-          # pipeline's status would be head's, and a missing tool would pass.
-          setfattr --version
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo fmt --check
-      # The agent guide's core block is shared byte-identically across this
-      # family of repositories, so a repo that edits it locally, or is left
-      # behind when it changes, is telling its agents last month's rules.
-      # The script hashes the block; the shell test below proves the script
-      # actually fails on a modified, stale or absent one. `chore lint` runs
-      # the same script -- this step exists because CI does not call chore.
-      - name: AGENTS.md carries the shared agent-core block
-        run: scripts/agents-core-check.sh
-      - name: Shell tests (tests/scripts/*.sh)
-        # `set -e` inside the loop: without it the loop's status is the LAST
-        # test's, so a failure anywhere but the end would pass.
-        run: set -e; for t in tests/scripts/*.sh; do bash "$t"; done
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      # A FLOOR UNDER THE SUITE, BECAUSE THE FAILURE MODE HERE IS AN
-      # ABSENCE. `cargo test` exits 0 on "0 passed; 0 failed", so a
-      # filter that selects nothing, a build that produced no test
-      # binaries, or a suite list that came out empty all report the
-      # same green as a full run. Nothing in this workflow could tell
-      # those apart before #118; only a count can.
-      #
-      # Measured 2026-09-18 on run 35285775541 (PR #122, 526f160),
-      # this step alone: 447 tests executed, identically on
-      # ubuntu-latest and ubuntu-24.04-arm. Floor 400. It moves UP with
-      # the suite and never down -- a floor that is lowered to make a
-      # red run green is the same blindness with a number beside it.
-      #
-      # This is the FIRST of three floors, one per run selection. The
-      # `--ignored` run below and the debug `--lib` run below that
-      # select DISJOINT sets, and either can empty on its own without
-      # this one noticing.
-      - name: Test suite (release), with an executed-test floor
+          key: ${{ runner.os }}-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: No generated fixtures are present
+        # The committed ZSTD image stays; everything `chore fixtures`
+        # makes must be absent, or this job is not proving the split.
         run: |
-          # The runner's default shell is `bash -eo pipefail`, so a
-          # failing cargo would end the step right here and the count
-          # would never run. A truncated run is precisely what is worth
-          # naming, so the status is kept by hand and re-raised at the
-          # end instead.
-          set +e
-          cargo test --locked --release 2>&1 | tee "$RUNNER_TEMP/test-release.log"
-          rc=${PIPESTATUS[0]}
-          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$RUNNER_TEMP/test-release.log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 400)"
-          if [ "$n" -lt 400 ]; then
-              echo "::error::only $n tests executed, floor is 400 -- 447 ran on 2026-09-18 (run 35285775541), and a run that executes fewer than that stopped early rather than passed"
-              exit 1
+          set -euo pipefail
+          if ls test-disks/erofs-plain.img test-disks/erofs-lz4.img >/dev/null 2>&1; then
+            echo "::error::test-disks/ has generated images; this job must prove the unit tier needs none"
+            exit 1
           fi
-          exit "$rc"
-      - name: Oracle suite (--ignored), with its own executed-test floor
-        run: |
-          # ITS OWN FLOOR, NOT A SHARE OF THE ONE ABOVE. `--ignored`
-          # INVERTS the selection: it runs exactly the tests the run
-          # above skipped, so the two counts are disjoint and either
-          # can go to zero while the other is untouched. Folded into a
-          # single number, 447 + 73 still clears any floor worth
-          # setting even when this run selects nothing at all -- and
-          # this run selecting nothing is the realistic accident: an
-          # `#[ignore = "..."]` reason string edited, the oracle tests
-          # moved to another file, or a `#[ignore]` dropped so the
-          # tests migrate into the run above and vanish from here
-          # without changing the total. See #118.
-          #
-          # Measured 2026-09-18 on run 35285775541 (PR #122,
-          # 526f160), this step alone: 73 tests executed, identically
-          # on ubuntu-latest and ubuntu-24.04-arm. Floor 70. It was 75
-          # until #116 deleted two oracle tests that duplicated a
-          # stricter one; the floor did not move, and a floor is never
-          # lowered to make a red run green.
-          #
-          # Oracle tests are #[ignore]-gated so a fresh checkout without
-          # erofs-utils still passes `cargo test`. CI installed the
-          # oracle above, so we opt them in here.
-          set +e
-          cargo test --locked --release -- --ignored 2>&1 | tee "$RUNNER_TEMP/test-ignored.log"
-          rc=${PIPESTATUS[0]}
-          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$RUNNER_TEMP/test-ignored.log" | awk '{s+=$4} END{print s+0}')
-          echo "ignored-opt-in tests executed: $n (floor 70)"
-          if [ "$n" -lt 70 ]; then
-              echo "::error::only $n --ignored tests executed, floor is 70 -- 73 ran on 2026-09-18 (run 35285775541); the opt-in selected almost nothing, which is green and meaningless"
-              exit 1
-          fi
-          exit "$rc"
+      - name: chore test:unit
+        run: chore test:unit
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-unit
+          path: tmp/logs/*.log
+          if-no-files-found: error
 
-      # AND ONCE WITHOUT `--release` -- THE PR GATE COULD NOT SEE AN
-      # OVERFLOW OTHERWISE.
-      #
-      # overflow-checks defaults on in [profile.dev] and off in
-      # [profile.release]. Cargo.toml's [profile.release] carries lto,
-      # codegen-units, opt-level and panic only, and its [profile.dev]
-      # carries opt-level and panic only -- neither overrides the
-      # default, so the two runs above wrap a bad addition silently and
-      # report success. This repository already has a debug run --
-      # release.yml:71, `cargo test --locked --all-targets` -- but that
-      # workflow triggers on a version TAG, not a pull request, so a
-      # wrapping defect merges green here and only surfaces days later,
-      # detached from the change and from the reviewer who could have
-      # caught it, when someone else cuts the next release. See #68.
-      #
-      # `--lib` only: a second compile of the same sources, no oracle
-      # binaries needed, and the arithmetic lives in the unit tests.
-      # `EXPECT_OVERFLOW_CHECKS=1` tells
-      # `overflow_checks::the_build_the_gate_asked_to_check_does_check`
-      # in src/lib.rs that this is the run that must trap an overflow --
-      # asking the build directly rather than inferring it from which
-      # spellings of "disabled" happen to be absent from Cargo.toml. The
-      # release steps must NOT set it: the checks are off there
-      # deliberately, because that is what ships.
-      #
-      # Do not remove this as a duplicate of the runs above it, and do
-      # not drop the variable from it: tests/ci_profile.rs asserts that
-      # ci.yml -- this workflow specifically, not release.yml -- still
-      # runs a `cargo test` without `--release` that sets it, and says
-      # why release.yml having one is not enough.
-      - name: Debug --lib run (overflow checks), with its own floor
-        run: |
-          # THE THIRD RUN SELECTION, AND THE THIRD FLOOR. `--lib`
-          # selects only the unit tests inside src/, a different set
-          # again from the two runs above, and it is the only run that
-          # arms
-          # `overflow_checks::the_build_the_gate_asked_to_check_does_check`.
-          # If this selection ever empties -- the unit tests moved out
-          # of src/, `--lib` stopped matching, the binary failed to
-          # build any tests -- the handshake test is among the tests
-          # that did not run, and the step reports the same green as a
-          # full pass. tests/ci_profile.rs proves the STEP is still
-          # here and still asks the build to check; only a count proves
-          # anything actually ran.
-          #
-          # Measured 2026-09-18 on run 35285775541 (PR #122,
-          # 526f160), this step alone: 235 tests executed, identically
-          # on ubuntu-latest and ubuntu-24.04-arm -- unchanged, as the
-          # unit tests under src/ are a different selection again.
-          # Floor 215.
-          set +e
-          EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib 2>&1 | tee "$RUNNER_TEMP/test-lib.log"
-          rc=${PIPESTATUS[0]}
-          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$RUNNER_TEMP/test-lib.log" | awk '{s+=$4} END{print s+0}')
-          echo "debug --lib tests executed: $n (floor 215)"
-          if [ "$n" -lt 215 ]; then
-              echo "::error::only $n --lib tests executed, floor is 215 -- 235 ran on 2026-09-18 (run 35285775541), and the overflow handshake is one of the tests a short run can silently drop"
-              exit 1
-          fi
-          exit "$rc"
-
-  # Validate the mkfs_erofs CLI binary's output by running upstream's
-  # fsck.erofs (from erofs-utils) against an image we generated. This is
-  # the canonical "does the kernel-shipped reader think this is a valid
-  # EROFS volume?" check — much stricter than our own crate's read-path
-  # round-trip because it exercises every superblock / inode / layout
-  # assertion in the upstream tooling, including CRC32C verification.
-  #
-  # Runs on every PR + push so a regression in the mkfs path is caught
-  # before the binary ships to a tag.
-  validate-mkfs-bin:
-    name: validate mkfs_erofs (fsck.erofs strict)
-    runs-on: ubuntu-latest
+  fixtures:
+    name: fixtures (harness VM, x86_64 KVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # The crate has a path dep on am-fs-core (../rust-fs-core).
-      # Clone the sibling repo alongside so cargo can resolve it.
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.10 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore fixtures
+        run: chore fixtures
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks/erofs-*.img
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: test (x86_64, oracles in the VM)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      # Same 1.9.1-from-source path as the test job: apt's 1.7.1 is too
-      # old to print "Filesystem blocksize:" and rejects images with
-      # variable block sizes that our writer can produce.
-      - name: Install erofs-utils 1.9.1 from source
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            autoconf automake libtool pkg-config \
-            uuid-dev libselinux1-dev liblz4-dev liblzma-dev libzstd-dev zlib1g-dev
-          curl -sSL https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-1.9.1.tar.gz | tar -xz
-          cd erofs-utils-1.9.1
-          ./autogen.sh
-          ./configure --enable-fuse=no
-          make -j"$(nproc)"
-          sudo make install
-          fsck.erofs --version | head -1
-      - name: Cache cargo registry
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-mkfs-${{ hashFiles('**/Cargo.lock') }}
-      - name: Build mkfs_erofs
-        run: cargo build --locked --release --bin mkfs_erofs
-      - name: Build a small source tree, mkfs it, validate with fsck.erofs
+          key: ${{ runner.os }}-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore tools
+        run: chore tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      # THE EVIDENCE, NOT THE CLAIM. If a runner ever has erofs-utils on
+      # it, every one of its programs is replaced with a stub that fails
+      # loudly. Nothing this job runs may use them: the tools belong to
+      # the guest, and a test that reached for one here would turn the
+      # run red with a message saying so, rather than quietly passing on
+      # a version too old to mean anything.
+      - name: Make any erofs-utils on the runner unusable
         run: |
-          src=/tmp/src
-          out=/tmp/out.erofs
-          mkdir -p "$src/sub/nested"
-          echo "hello world" > "$src/file.txt"
-          echo "another" > "$src/sub/another.txt"
-          printf '0123456789%.0s' {1..200} > "$src/sub/nested/longer.txt"
-          ./target/release/mkfs_erofs "$out" "$src"
-          ls -la "$out"
-          # fsck.erofs's clean exit is the canonical "this is a valid
-          # EROFS image" signal. Verbose flag prints the structural
-          # walk so failures point at the offending inode/block.
-          fsck.erofs --extract=/tmp/extracted "$out"
-          # Cross-check: extracted tree byte-matches the source.
-          diff -r "$src" /tmp/extracted
-      - name: Dump superblock + structure for inspection in CI logs
-        run: dump.erofs /tmp/out.erofs
+          set -eu
+          for tool in mkfs.erofs fsck.erofs dump.erofs erofsfuse; do
+            path="$(command -v "$tool" 2>/dev/null || true)"
+            [ -n "$path" ] || continue
+            sudo mv "$path" "$path.host-copy"
+            printf '#!/bin/sh\necho "::error::%s ran on the runner; the oracle tools belong in the VM" >&2\nexit 97\n' \
+              "$tool" | sudo tee "$path" >/dev/null
+            sudo chmod +x "$path"
+            echo "poisoned $path"
+          done
+      - name: chore lint
+        run: chore lint
+      - name: chore test
+        run: chore test
+      - name: Keep the tier logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-x86_64
+          path: tmp/logs/*.log
+          if-no-files-found: error
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+
+  test-arm64:
+    name: test (aarch64, no KVM on this runner)
+    needs: fixtures
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      - name: chore lint
+        run: chore lint
+      # `c_char` is signed on x86_64-linux and unsigned on aarch64-linux,
+      # so a cast through it can be real on one and a clippy error on the
+      # other (#89): only a native run here lints and executes.
+      - name: chore test:unit
+        run: chore test:unit
+      # Everything that reads a fixture but needs no VM. The oracle and
+      # kernel tiers cannot run here — GitHub's arm64 runners have no
+      # /dev/kvm — and they are not architecture-specific: they read the
+      # same bytes the x86_64 job's guest reads.
+      - name: chore test:images
+        run: chore test:images
+      - name: Keep the tier logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-aarch64
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  suite-in-vm:
+    name: suite in the guest (the macOS path)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      # No Rust on the runner: the toolchain that matters is the one the
+      # guest installs from rust-toolchain.toml. That is the point of the
+      # job — on a Mac there is no usable host toolchain for these tests
+      # either.
+      - name: chore test:vm
+        run: chore test:vm
+      - name: Keep the tier logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-suite-in-vm
+          path: tmp/logs/*.log
+          if-no-files-found: error
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
 
   # ONE CHECK GATES A MERGE, AND IT STANDS FOR EVERY JOB (#123).
   #
   # Branch protection names checks, and a check is a job name. Naming
   # each one means the list has to be edited whenever a job is renamed,
   # split into a matrix leg or added — and until someone does, the new
-  # work is required by nobody. The comment above `test:` says as much:
-  # its name is pinned because a rename would strand the required check.
-  #
-  # The opposite spelling is worse. A required check no job produces
-  # reads as permanently pending, and nothing merges while nothing
-  # fails — which is what christhomas/rust-fs-ext4#263 was.
+  # work is required by nobody.
   #
   # `if: always()` because a job that was cancelled or skipped is not a
   # job that passed, and an aggregate that only runs when its needs
@@ -301,23 +315,19 @@ jobs:
   # never reports at all.
   ci-ok:
     name: ci-ok
-    needs: [test, validate-mkfs-bin]
     if: always()
+    needs: [unit, fixtures, test, test-arm64, suite-in-vm]
     runs-on: ubuntu-latest
     steps:
-      - name: every gating job must have concluded success
+      - name: Every job ran and succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo "test:              ${{ needs.test.result }}"
-          echo "validate-mkfs-bin: ${{ needs.validate-mkfs-bin.result }}"
-          failed=0
-          for one in "test:${{ needs.test.result }}" \
-                     "validate-mkfs-bin:${{ needs.validate-mkfs-bin.result }}"; do
-              job=${one%%:*}
-              result=${one#*:}
-              if [ "$result" != "success" ]; then
-                  echo "::error::$job concluded '$result', not 'success' -- failure, cancellation and skipping all mean the gate did not run to completion"
-                  failed=1
-              fi
-          done
-          [ "$failed" = 0 ] || exit 1
-          echo "all gating jobs succeeded"
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad="$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")')"
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $bad (failed, cancelled or skipped)"
+            exit 1
+          fi
+          echo "all required jobs succeeded"

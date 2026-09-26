@@ -23,11 +23,11 @@
 //! --extract` reproduced the source tree from it byte for byte.
 
 mod common;
-use common::{mkfs_erofs_available, open_image, MemDev};
+use common::{open_image, MemDev};
+use fs_erofs_test_support::{oracle, ScratchDir};
 
 use fs_erofs::Filesystem;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// The generator the fixture's incompressible files were filled with.
 /// Written out rather than stored, so the expectation is a statement
@@ -165,41 +165,16 @@ fn partial_reads_of_a_zstd_file_land_where_they_should() {
     assert!(fs.read_file(&inode, 16380, &mut buf).is_err());
 }
 
-/// True when the `mkfs.erofs` on PATH was built against libzstd. It is
-/// not enough for the binary to exist: ZSTD support is a compile-time
-/// option and a build without it lists only `lz4, lz4hc, lzma, deflate`
-/// and fails `-zzstd` with "Cannot find a valid compressor zstd".
-fn mkfs_erofs_speaks_zstd() -> bool {
-    if !mkfs_erofs_available() {
-        return false;
-    }
-    let speaks = Command::new("mkfs.erofs")
-        .arg("-V")
-        .output()
-        .map(|o| {
-            let text = String::from_utf8_lossy(&o.stdout).to_lowercase()
-                + &String::from_utf8_lossy(&o.stderr).to_lowercase();
-            text.contains("zstd")
-        })
-        .unwrap_or(false);
-    // A CAPABILITY, BUT NOT AN OPTIONAL ONE IN CI. The workflow installs
-    // `libzstd-dev` before building erofs-utils from source precisely so
-    // this returns true, so a build here that cannot speak ZSTD means
-    // the install step changed -- the same class of breakage as the tool
-    // being absent, and worth the same loud failure rather than a line
-    // on stderr nobody reads.
-    //
-    // The distribution's packaged erofs-utils frequently lacks it, which
-    // is why the skip exists at all and why it stays for a developer.
-    assert!(
-        speaks || std::env::var_os("CI").is_none(),
-        "the mkfs.erofs on PATH was built without libzstd, and CI is set. The workflow \
-         installs libzstd-dev and builds erofs-utils from source so this comparison can \
-         run; without it the ZSTD oracle would skip and the suite would pass having \
-         checked the codec against nothing it did not write itself."
-    );
-    speaks
-}
+// THE GUEST'S mkfs.erofs SPEAKS ZSTD, AND THAT IS PROVISIONED, NOT
+// PROBED. What stood here was `mkfs_erofs_speaks_zstd()`, which read the
+// tool's banner for the word "zstd" and returned false when it was
+// absent -- whereupon the test below printed a line and returned ok. ZSTD
+// support is a compile-time option and most packaged builds are built
+// without it, so on an ordinary machine that probe answered "no" and the
+// only coverage of a freshly built ZSTD image quietly went away.
+// scripts/vm-setup.sh builds erofs-utils in the guest with libzstd and
+// FAILS THE PROVISION if the result cannot write a zstd image, so by the
+// time a test runs the question is already answered.
 
 /// The same content, compressed by whatever `mkfs.erofs` is installed
 /// rather than by the one that made the fixture, and under several
@@ -213,10 +188,6 @@ fn mkfs_erofs_speaks_zstd() -> bool {
 /// move it into a shared packed file.
 #[test]
 fn a_freshly_built_zstd_image_reads_back_exactly() {
-    if !mkfs_erofs_speaks_zstd() {
-        eprintln!("mkfs.erofs is absent or was built without libzstd — skipping");
-        return;
-    }
     let files = expected();
     for flags in [
         &["-b4096", "-zzstd"][..],
@@ -232,21 +203,22 @@ fn a_freshly_built_zstd_image_reads_back_exactly() {
         // Adding it here would leave this test red for a reason it is
         // not about.
     ] {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let src = dir.path().join("src");
+        // Inside the repository, because the guest sees this tree and
+        // nothing else of the host.
+        let dir = ScratchDir::new("zstd");
+        let src = dir.join("src");
         std::fs::create_dir_all(src.join("sub")).expect("create source tree");
         for (path, data) in &files {
             std::fs::write(src.join(path.trim_start_matches('/')), data)
                 .expect("write source file");
         }
-        let img = dir.path().join("out.img");
-        let out = Command::new("mkfs.erofs")
+        let img = dir.join("out.img");
+        let out = oracle("mkfs.erofs")
             .args(flags)
             .args(["-T0", "--all-time"])
             .arg(&img)
             .arg(&src)
-            .output()
-            .expect("spawn mkfs.erofs");
+            .output();
         assert!(
             out.status.success(),
             "mkfs.erofs {flags:?} failed: {}",

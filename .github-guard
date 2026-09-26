@@ -3,59 +3,29 @@
 # git-config format: check with `git config -f .github-guard --list`, and
 # double-quote any value containing # or ;.
 
-# Required status checks for main. A declaration beats discovery exactly.
+# What must pass before main takes a merge. github-guard reads this from the
+# default branch on the server and applies it to branch protection.
 #
-# Until this file existed the list lived in the settings page and nothing in
-# the repository could be compared against it, so a job could be added to
-# ci.yml, report on every pull request, and never gate a merge — which is
-# exactly what happened. Branch protection required only
+#   ci-ok   ci.yml: the one always-run gate. It fails when any job it needs
+#           failed, was cancelled or was skipped: the unit tier with no
+#           generated fixtures, the mkfs.erofs-made fixtures built in the
+#           fs-linux-test-harness VM, the whole suite (lint, unit, images,
+#           the erofs-utils oracles, the kernel mounts) on x86_64, the tiers
+#           that need no VM on aarch64, and the suite compiled and run
+#           inside the guest.
 #
-#     ["test-ubuntu-latest","validate mkfs_erofs (fsck.erofs strict)"]
+# Requiring the gate rather than each job means a job can be renamed, split or
+# made conditional without leaving a required check that never reports, which
+# would block every pull request with nothing to point at. The list this
+# replaced named `test-ubuntu-latest`, `test-ubuntu-24.04-arm` and
+# `validate mkfs_erofs (fsck.erofs strict)` — three names that had to be
+# edited by hand, and two of which no longer exist.
 #
-# while the last main run produced three green checks. #118 is that gap.
+# release.yml is deliberately absent: it triggers on a version tag, so
+# requiring any check of its would block every pull request forever.
 #
-# Discovery is not the answer either. It requires checks BY JOB NAME, which is
-# a guess at the PR gate and drifts silently: a renamed job, an added
-# workflow, or any future check reporting under the github-actions app changes
-# what is required without anyone deciding to. Pinning it costs nothing and
-# makes the intent reviewable in a diff.
-#
-# WHY `test-ubuntu-24.04-arm` IS HERE, AND WHY IT IS NOT A LUXURY.
-#
-# It is this repository's only aarch64 coverage, and it runs the full suite
-# including the `--ignored` oracle opt-in, so it is the only place a
-# target-dependent defect can be observed at all. The failures it sees and
-# `test-ubuntu-latest` cannot are the ones that depend on the target rather
-# than on the code: `c_char` is `u8` on aarch64-linux and `i8` on x86_64, so a
-# cast through it is correct on one and a clippy error on the other (#89);
-# alignment and pointer-width assumptions differ the same way. `rust-fs-ntfs`
-# added this exact leg and it immediately found that class of failure
-# (rust-fs-ntfs#268). Advisory, it could report red on every pull request and
-# merge anyway — which is a check nobody reads.
-#
-# WHY THE NAMES LOOK DIFFERENT FROM rust-fs-core'S.
-#
-# The `test` job sets `name: test-${{ matrix.os }}` explicitly, so GitHub
-# reports `test-ubuntu-latest`, NOT the `test / ubuntu-latest` spelling a
-# matrix job without a `name:` produces (rust-fs-core declares that form). The
-# names below are copied from what the API actually reported for main
-# 0c16b34, not read off the YAML — a required context that never reports is
-# a permanent block on merging, so this is not a place to infer a spelling.
-#
-# Everything declared here runs on `pull_request` (ci.yml's `on:` block
-# carries `pull_request: branches: [main]`). release.yml is deliberately
-# absent: it triggers on a version tag, so requiring any check of its would
-# block every pull request forever.
-#
-# Third-party reviewers need no mention: github-protect-main.sh filters
-# `select(.app.slug=="github-actions")` on every query it makes, so nothing
-# reporting under another app can enter the required set through this file or
-# through discovery.
-#
-# The better end state is one always-run aggregate job that `needs:` all three
-# and fails on failure/cancelled/skipped — then the matrix can grow a leg
-# without anyone editing this file. That is not in this change: with three
-# checks, all of which have been green on main, declaring the real names is
-# the smaller and more reviewable step.
+# scripts/ci-gate.sh checks both halves — that ci-ok needs every job in
+# ci.yml, and that this file requires ci-ok and nothing else — and `chore
+# lint` runs it.
 [checks]
 	required = ci-ok

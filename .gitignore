@@ -23,6 +23,18 @@ tests/fixtures/*.zip
 # chore fingerprint cache (sources:/generates: checksums). Derived data.
 .chore/
 
+# THE SUITE'S SCRATCH DIRECTORY, AND IT IS INSIDE THE REPOSITORY ON
+# PURPOSE. The oracle tools run in the fs-linux-test-harness VM, which
+# sees this repository at the path the host knows it by and nothing else
+# of the host -- so an image under /tmp is a path the tool asked to read
+# it cannot open. scripts/test.sh and fs_erofs_test_support::temp_dir
+# both put scratch here, and the tier logs live in tmp/logs/.
+/tmp/
+
+# The harness's shared directory (fs-linux-test-harness.toml's [share]):
+# what a run hands across to the guest and back.
+/.vm-share/
+
 # Build output. `chore staticlib` writes the archive and headers here for a
 # consumer to copy out of (`chore artifact` prints this directory).
 /dist/

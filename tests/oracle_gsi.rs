@@ -6,11 +6,21 @@
 //!
 //! ```sh
 //! tests/fixtures/download-gsi.sh
-//! cargo test --test oracle_gsi -- --ignored
+//! chore test:gsi
 //! ```
 //!
-//! The test is `#[ignore]`-gated so a fresh checkout without the
-//! fixture still has a green default `cargo test`.
+//! IT DOES NOT SKIP, AND IT IS NOT IN `chore test`. It used to be
+//! `#[ignore]`-gated AND to print "skipping" and return when the fixture
+//! was absent — two layers of silence over a suite that had never
+//! executed anywhere, CI included (#54): a run of `cargo test --
+//! --ignored` reported it ok having opened no image at all.
+//!
+//! The fixture cannot be a CI artefact: it is ~2 GiB and not ours to
+//! redistribute. So this suite is its own tier, `chore test:gsi`, which
+//! nothing else runs — and inside that tier a missing fixture FAILS,
+//! naming the script that fetches it. A tier somebody has to ask for is
+//! honest about what it covers; a test that reports ok having read
+//! nothing is not.
 //!
 //! License posture: the GSI is an Apache-2.0 userspace + GPL-2 kernel
 //! image distributed by Google. We treat it as an opaque black-box
@@ -30,18 +40,21 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(FIXTURE)
 }
 
-/// Returns the fixture path if it exists, else `None`. The 2 GiB GSI
-/// image isn't redistributable so the fixture is gitignored and absent
-/// in fresh checkouts / CI; tests that call this via `?` should
-/// `eprintln!("skipping: ...")` and return early when `None`, keeping
-/// the `--ignored` suite green when the fixture isn't downloaded.
-fn maybe_fixture() -> Option<PathBuf> {
+/// The fixture, or a failure that says how to fetch it.
+///
+/// The 2 GiB GSI image is not redistributable, so it is gitignored and
+/// absent from a fresh checkout. That is a reason to make this tier
+/// opt-in, not a reason to pass without it.
+#[track_caller]
+fn require_fixture() -> PathBuf {
     let p = fixture_path();
-    if p.exists() {
-        Some(p)
-    } else {
-        None
-    }
+    assert!(
+        p.exists(),
+        "{FIXTURE} is missing. Fetch it with tests/fixtures/download-gsi.sh (~2 GiB, \
+         AOSP-licensed, not redistributable from here), then run `chore test:gsi`. \
+         Tests never skip on a missing fixture."
+    );
+    p
 }
 
 fn open_fs(path: &Path) -> Filesystem {
@@ -177,20 +190,12 @@ fn find_small_file(
 }
 
 // =====================================================================
-// Test cases. All `#[ignore]`-gated -- depend on the fixture.
+// Test cases. They depend on the fixture, and fail without it.
 // =====================================================================
 
 #[test]
-#[ignore = "needs tests/fixtures/system.img (run tests/fixtures/download-gsi.sh)"]
 fn open_and_walk_gsi() {
-    let Some(path) = maybe_fixture() else {
-        eprintln!(
-            "skipping: fixture missing at {} -- run tests/fixtures/download-gsi.sh \
-             to fetch the GSI (~2 GiB, not redistributable so absent from CI)",
-            FIXTURE
-        );
-        return;
-    };
+    let path = require_fixture();
     let fs = open_fs(&path);
 
     // ---- superblock + root sanity ----
@@ -268,9 +273,10 @@ fn open_and_walk_gsi() {
             text.lines().next().unwrap_or("")
         );
     } else {
-        eprintln!(
-            "gsi: WARN no build.prop found in any of {buildprop_candidates:?} \
-             -- fixture may be a non-system partition; skipping content check"
+        panic!(
+            "no build.prop found in any of {buildprop_candidates:?}. This suite exists to \
+             read a real Android system image; a fixture without one is the wrong fixture, \
+             not a content check to pass over."
         );
     }
 

@@ -1,7 +1,7 @@
 //! Multi-megabyte file round-trips. Uses a deterministic PRNG so the
 //! test is reproducible without storing megabytes of expected bytes.
 //!
-//! The 100 MB case is `#[ignore]`-gated -- it allocates ~300 MB peak
+//! The 100 MB case allocates ~300 MB peak
 //! (plaintext + image + read-back buffer) and would slow down a fast
 //! `cargo test` cycle.
 
@@ -62,8 +62,12 @@ fn eight_mb_round_trip() {
     round_trip_size(8 * 1024 * 1024, 0xaaaa_bbbb_cccc_dddd);
 }
 
+/// A HUNDRED MEGABYTES, AND IT RUNS. It was `#[ignore]`d for being slow
+/// under a bare `cargo test`, which meant it ran only in CI's
+/// `--ignored` pass -- and when that pass selected nothing, as it can,
+/// nobody would have noticed. It is a few seconds in the release profile
+/// the tiers use.
 #[test]
-#[ignore = "100 MB allocation is slow under default cargo test; opt in with --ignored"]
 fn one_hundred_mb_round_trip() {
     round_trip_size(100 * 1024 * 1024, 0x9999_8888_7777_6666);
 }

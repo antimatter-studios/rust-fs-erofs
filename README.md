@@ -109,8 +109,11 @@ am-fs-core = { path = "../rust-fs-core" }
 ```sh
 git clone https://github.com/antimatter-studios/rust-fs-erofs
 cd rust-fs-erofs
+chore siblings          # ../rust-fs-core and ../fs-linux-test-harness, at their pinned refs
+chore tools             # what the HOST needs: python3 and the VM
+chore fixtures          # the mkfs.erofs-made images, built inside the VM
 cargo build --release
-cargo test
+chore test
 ```
 
 The `mkfs_erofs` binary lives at `target/release/mkfs_erofs`.
@@ -204,31 +207,66 @@ If your application needs writable-volume semantics (e.g. for a fuse / WinFsp ad
 
 ## Testing
 
-```sh
-cargo test                     # 243 default tests
-cargo test -- --include-ignored  # +64 ignored = 307 total
+Every Linux thing happens inside the
+[fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness)
+VM: the `erofs-utils` oracles, the kernel mounts, and the fixtures. A
+workstation installs none of it, and on a host that is not Linux the
+suite itself runs in there too.
 
+```sh
+chore test              # everything, exactly as CI runs it
+chore test:unit         # no tool, no fixture, no VM (debug: overflow checks on)
+chore test:images       # the mkfs.erofs-made fixtures, read with no VM
+chore test:oracle       # mkfs.erofs / fsck.erofs / dump.erofs, in the guest
+chore test:kernel       # the real EROFS driver mounts our images, in the guest
+chore test:vm           # the whole suite compiled and run inside the guest
+chore test:scripts      # the shell guards
+chore lint              # fmt, clippy with warnings denied, the CI gate
+
+chore test -- --verbose # stream the whole run instead of a verdict per tier
+```
+
+Each tier prints one verdict line and writes everything else to
+`tmp/logs/<tier>.log`. A tier that prints more than its measured budget
+fails with status 65, and a tier that runs fewer tests than its measured
+floor fails too — a suite that stopped early reports no failures at all,
+so only a count can see it.
+
+**Why the oracle tools are not installed on your machine.** `mkfs.erofs`
+only compiles ZSTD in when libzstd was present at configure time, and
+most packaged builds were not built that way; Debian 12 packages 1.5 and
+Ubuntu 24.04 packages 1.7.1, neither of which knows the options the
+writer tests use. `scripts/vm-setup.sh` builds 1.9.1 from source in the
+guest, with every codec, and fails the provision if any of them is
+missing. One version, one platform, the same answers everywhere.
+
+**Nothing skips.** A missing tool, fixture or VM fails the test that
+needed it and names the task that provides it.
+`tests/test_contract.rs` refuses a test that spawns an oracle tool
+itself, mounts a filesystem itself, or prints a skip notice.
+
+```sh
 # Coverage report
 cargo install cargo-llvm-cov
 rustup component add llvm-tools-preview
 cargo llvm-cov --html --workspace
 open target/llvm-cov/html/index.html
-
-# Lint
-cargo clippy --all-targets    # zero warnings
 ```
-
-The `--ignored` tests exercise the oracle integration suite — they spawn `mkfs.erofs` / `fsck.erofs` / `dump.erofs` from `erofs-utils` (Homebrew: `brew install erofs-utils`; Debian/Ubuntu: `apt install erofs-utils`) to cross-validate every emitted feature.
 
 ## Real-world fixture (Android GSI)
 
 ```sh
-# Optional: fetch a small Android GSI for end-to-end testing
 ./tests/fixtures/download-gsi.sh
-cargo test --test oracle_gsi -- --ignored
+chore test:gsi
 ```
 
-The GSI is large (~1 GB) and gitignored. The script verifies a pinned SHA256 and unwraps the sparse-image format if needed (requires `simg2img` from `android-platform-tools`).
+The GSI is large (~2 GB), not ours to redistribute, and gitignored, so
+`test:gsi` is its own tier: `chore test` does not run it and CI cannot.
+Inside the tier a missing fixture **fails**, naming the script — it used
+to print "skipping" and return, which is how the suite reported ok on
+every run without ever opening an image. The script verifies a pinned
+SHA256 and unwraps the sparse-image format if needed (requires
+`simg2img` from `android-platform-tools`).
 
 ## Performance notes
 
@@ -262,7 +300,7 @@ External tools (`mkfs.erofs`, `fsck.erofs`, `dump.erofs`, `mount`) are invoked a
 ## Contributing
 
 Issues + PRs welcome. Before opening:
-- Run `cargo test` (full suite) and `cargo clippy --all-targets` (zero warnings).
+- Run `chore test` (the whole gate) and `chore lint` (zero warnings).
 - For format-spec changes, cite the public docs above (NOT kernel `.c` files — clean-room posture).
 - New features should land with both unit tests and an oracle test against `erofs-utils` where applicable.
 - Maintain coverage ≥ 94% line.

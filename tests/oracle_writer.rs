@@ -1,29 +1,30 @@
 //! Inverse-direction oracle tests: build an image with our mkfs, run
-//! `fsck.erofs` over it, and (optionally) cross-check `dump.erofs`
-//! output against our reader's view of the same image. Skipped when
-//! the erofs-utils tooling isn't on PATH.
+//! `fsck.erofs` over it, and cross-check `dump.erofs` output against
+//! our reader's view of the same image.
+//!
+//! Both tools run inside the fs-linux-test-harness VM, where
+//! `scripts/vm-setup.sh` builds erofs-utils 1.9.1 from source. These
+//! were `#[ignore]`-gated and, underneath that, returned early when the
+//! tool was not on PATH -- two layers of silence over the one check here
+//! that is not this crate marking its own homework.
 
 mod common;
 
-use common::{dir, dump_erofs_available, file, fsck_erofs_available, open_image_path};
+use common::{dir, file, open_image_path};
 use fs_erofs::mkfs;
-use std::process::Command;
-
-/// Helper: write `bytes` to a tempfile and return the path + tempdir
-/// guard. Caller must hold the guard for the lifetime of any path
-/// access.
-fn stage_image(bytes: &[u8]) -> (std::path::PathBuf, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("our.img");
-    std::fs::write(&path, bytes).expect("write image");
-    (path, dir)
+use fs_erofs_test_support::oracle;
+/// Write `bytes` into the repository's scratch directory and return the
+/// path plus the guard that deletes it.
+///
+/// INSIDE THE REPOSITORY, not under /tmp: the guest sees this tree and
+/// nothing else of the host, so an image anywhere else is a path the
+/// tool asked to read it cannot open.
+fn stage_image(bytes: &[u8]) -> (std::path::PathBuf, fs_erofs_test_support::ScratchDir) {
+    common::stage_image("writer", bytes)
 }
 
 fn run_fsck(path: &std::path::Path) -> (Option<i32>, String, String) {
-    let out = Command::new("fsck.erofs")
-        .arg(path)
-        .output()
-        .expect("spawn fsck.erofs");
+    let out = oracle("fsck.erofs").arg(path).output();
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -32,11 +33,8 @@ fn run_fsck(path: &std::path::Path) -> (Option<i32>, String, String) {
 }
 
 fn run_dump(path: &std::path::Path) -> (Option<i32>, String, String) {
-    let out = Command::new("dump.erofs")
-        .arg("-s") // print superblock info
-        .arg(path)
-        .output()
-        .expect("spawn dump.erofs");
+    // -s: print superblock info
+    let out = oracle("dump.erofs").arg("-s").arg(path).output();
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -45,12 +43,7 @@ fn run_dump(path: &std::path::Path) -> (Option<i32>, String, String) {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_simple_tree() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let img = mkfs::build_image(
         dir(vec![
             ("a.txt", file(b"hello\n")),
@@ -70,12 +63,7 @@ fn fsck_passes_on_simple_tree() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_empty_dir() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let img = mkfs::build_image(dir(vec![]), 12).unwrap();
     let (path, _guard) = stage_image(&img);
     let (code, stdout, stderr) = run_fsck(&path);
@@ -87,12 +75,7 @@ fn fsck_passes_on_empty_dir() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_multi_block_file() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // 50 KiB file -> spans many blocks at default 4 KiB.
     let payload: Vec<u8> = (0..50_000u32).map(|i| (i & 0xFF) as u8).collect();
     let img = mkfs::build_image(dir(vec![("p.bin", file(&payload))]), 12).unwrap();
@@ -106,12 +89,7 @@ fn fsck_passes_on_multi_block_file() {
 }
 
 #[test]
-#[ignore = "needs dump.erofs (erofs-utils)"]
 fn dump_superblock_matches_our_reader() {
-    if !dump_erofs_available() {
-        eprintln!("skipping: dump.erofs not on PATH");
-        return;
-    }
     let img = mkfs::build_image(dir(vec![("a.txt", file(b"hello\n"))]), 12).unwrap();
     let (path, _guard) = stage_image(&img);
     let (code, stdout, stderr) = run_dump(&path);
@@ -140,12 +118,7 @@ fn dump_superblock_matches_our_reader() {
 // ---- W1 oracle coverage: each new feature ------------------------------
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_blksize_512() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = (0..1500u32).map(|i| (i & 0xFF) as u8).collect();
     let img = mkfs::build_image(dir(vec![("p.bin", file(&payload))]), 9).unwrap();
     let (path, _guard) = stage_image(&img);
@@ -158,12 +131,7 @@ fn fsck_passes_on_blksize_512() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_wide_dir_500() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let mut entries = Vec::new();
     for i in 0..500 {
         let name = format!("file_{:04}.txt", i);
@@ -182,12 +150,7 @@ fn fsck_passes_on_wide_dir_500() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_flat_inline() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let img = mkfs::build_image(dir(vec![("tiny.bin", file(b"tiny content"))]), 12).unwrap();
     let (path, _guard) = stage_image(&img);
     let (code, stdout, stderr) = run_fsck(&path);
@@ -199,12 +162,7 @@ fn fsck_passes_on_flat_inline() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_extended_inode() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let f = mkfs::Node::File {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: b"hi".to_vec(),
@@ -226,12 +184,7 @@ fn fsck_passes_on_extended_inode() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_xattrs() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     use fs_erofs::xattr::ns;
     let xattrs = vec![
         mkfs::XattrSpec::new(ns::USER, b"color".to_vec(), b"red".to_vec()),
@@ -254,12 +207,7 @@ fn fsck_passes_on_xattrs() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_special_files() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     use fs_erofs::inode::{S_IFBLK, S_IFCHR, S_IFIFO, S_IFSOCK};
     let entries = vec![
         (
@@ -308,12 +256,7 @@ fn fsck_passes_on_special_files() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_chunked_file() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let bs: usize = 4096;
     let chunk0: Vec<u8> = vec![b'A'; bs];
     let chunk2: Vec<u8> = vec![b'C'; bs];
@@ -336,12 +279,7 @@ fn fsck_passes_on_chunked_file() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_chunked_file_indexed() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let bs: usize = 4096;
     let chunk0: Vec<u8> = vec![b'X'; bs];
     let chunk1: Vec<u8> = vec![b'Y'; bs];
@@ -396,12 +334,7 @@ fn compressed_lz4_compacted2b(data: &[u8], ztailpacking: bool) -> mkfs::Node {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compressed_lz4_small() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(20);
     let img = mkfs::build_image(dir(vec![("c.bin", compressed_lz4(&payload))]), 12).unwrap();
     let (path, _guard) = stage_image(&img);
@@ -414,12 +347,7 @@ fn fsck_passes_on_compressed_lz4_small() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compressed_lz4_multi_lcluster() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // 5 lclusters at 4 KiB blocks; W2a default policy emits 5 separate
     // pclusters (one per lcluster). Highly compressible so HEAD1
     // engages on every lcluster.
@@ -436,12 +364,7 @@ fn fsck_passes_on_compressed_lz4_multi_lcluster() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compressed_lz4_incompressible() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // LCG-derived bytes don't compress; PLAIN passthrough engages on
     // every lcluster.
     let bs: usize = 4096;
@@ -467,12 +390,7 @@ fn fsck_passes_on_compressed_lz4_incompressible() {
 // ---- W2b oracle coverage: compacted-2B + ztailpacking -----------------
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compacted2b_small() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(20);
     let img = mkfs::build_image(
         dir(vec![("c.bin", compressed_lz4_compacted2b(&payload, false))]),
@@ -489,12 +407,7 @@ fn fsck_passes_on_compacted2b_small() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compacted2b_multi_pack() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // 12 lclusters at 4 KiB blocks: 1 pack of 6 (initial) + 3 4B packs.
     let bs: usize = 4096;
     let payload: Vec<u8> = vec![b'a'; 12 * bs];
@@ -513,12 +426,7 @@ fn fsck_passes_on_compacted2b_multi_pack() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compacted2b_2b_middle_region() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // 22 lclusters: trips the COMPACTED_2B advise bit (16-entry middle
     // 2B pack + 6 initial 4B-form entries).
     let bs: usize = 4096;
@@ -538,12 +446,7 @@ fn fsck_passes_on_compacted2b_2b_middle_region() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compacted2b_ztailpacking() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let payload = b"hello compressed inline tail bytes pattern\n".repeat(10);
     let img = mkfs::build_image(
         dir(vec![("c.bin", compressed_lz4_compacted2b(&payload, true))]),
@@ -583,15 +486,10 @@ fn collated_lz4_test_node(
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_collated_compressed() {
     // 64 KiB highly-compressible payload that the greedy collator
     // squashes into far fewer pclusters than lclusters. Verifies
     // fsck.erofs accepts the resulting NONHEAD-bearing index area.
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let payload: Vec<u8> = vec![b'k'; 64 * 1024];
     let img = mkfs::build_image(
         dir(vec![(
@@ -611,15 +509,10 @@ fn fsck_passes_on_collated_compressed() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_collated_compressed_legacy_index() {
     // Same coverage in the legacy / 8-byte-per-lcluster index
     // format. Two lclusters of 'a' collate into 1 HEAD + 1 NONHEAD
     // entry; fsck must accept the NONHEAD's `delta[0]` walk-back.
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let bs: usize = 4096;
     let payload: Vec<u8> = vec![b'q'; 4 * bs];
     let img = mkfs::build_image(
@@ -658,12 +551,7 @@ fn compressed_with(algo: mkfs::CompressedAlgo, data: &[u8]) -> mkfs::Node {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compressed_lzma_small() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(20);
     let img = mkfs::build_image(
         dir(vec![(
@@ -683,12 +571,7 @@ fn fsck_passes_on_compressed_lzma_small() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compressed_lzma_multi_lcluster() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // 5 lclusters of repeating bytes -> highly compressible LZMA frames.
     let bs: usize = 4096;
     let payload: Vec<u8> = vec![b'a'; 5 * bs];
@@ -710,12 +593,7 @@ fn fsck_passes_on_compressed_lzma_multi_lcluster() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compressed_deflate_small() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(20);
     let img = mkfs::build_image(
         dir(vec![(
@@ -735,12 +613,7 @@ fn fsck_passes_on_compressed_deflate_small() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_compressed_deflate_multi_lcluster() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     let bs: usize = 4096;
     let payload: Vec<u8> = vec![b'a'; 5 * bs];
     let img = mkfs::build_image(
@@ -768,12 +641,7 @@ fn fsck_passes_on_compressed_deflate_multi_lcluster() {
 // confirmed by the upstream oracle.
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_validates_sb_checksum() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // Any non-trivial tree exercises the writer's SB checksum emission.
     // fsck.erofs explicitly verifies the CRC when feature_compat bit 0 is
     // set; this test fails fast if the bit is set but the CRC is wrong.
@@ -796,12 +664,7 @@ fn fsck_validates_sb_checksum() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_validates_dirent_hash_order() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // Names whose alphabetical order disagrees with full_name_hash order.
     // fsck.erofs walks every dir block and validates the hash-sort
     // invariant internally; if our writer emitted the entries in any
@@ -828,7 +691,6 @@ fn fsck_validates_dirent_hash_order() {
 }
 
 #[test]
-#[ignore = "needs dump.erofs (erofs-utils)"]
 fn dump_validates_dirent_hash_order() {
     // dump.erofs --ls prints dirents in stored order. We ensure the dump
     // succeeds (so the on-disk layout is sane) and that fsck.erofs --
@@ -836,10 +698,6 @@ fn dump_validates_dirent_hash_order() {
     // don't parse dump.erofs's free-form output here; a successful
     // fsck/dump round-trip on a tree whose alphabetical and hash orders
     // diverge is the load-bearing signal.
-    if !dump_erofs_available() {
-        eprintln!("skipping: dump.erofs not on PATH");
-        return;
-    }
     let img = mkfs::build_image(
         dir(vec![
             ("zebra", file(b"z")),
@@ -851,23 +709,23 @@ fn dump_validates_dirent_hash_order() {
     )
     .unwrap();
     let (path, _guard) = stage_image(&img);
-    let out = Command::new("dump.erofs")
+    let out = oracle("dump.erofs")
         .arg("--ls")
         .arg("--path=/")
         .arg(&path)
-        .output()
-        .expect("spawn dump.erofs --ls");
-    if !out.status.success() {
-        // Older dump.erofs may not support --ls / --path; treat that as
-        // a soft skip so this test stays useful on the toolchains where
-        // it does work.
-        eprintln!(
-            "dump.erofs --ls not supported (exit {:?}); skipping:\nstderr: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return;
-    }
+        .output();
+    // NO SOFT SKIP ON AN OLDER dump.erofs. This used to return early
+    // when `--ls` was refused, which is what an erofs-utils older than
+    // 1.9 does -- so on every machine with a packaged build the
+    // directory listing was never compared. scripts/vm-setup.sh pins the
+    // version in the guest, so a refusal here is a real result.
+    assert!(
+        out.status.success(),
+        "dump.erofs --ls --path=/ exited {:?}:\n{}{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Sanity: every name we wrote must appear in the listing.
     for name in ["apple", "banana", "mango", "zebra"] {
@@ -881,12 +739,7 @@ fn dump_validates_dirent_hash_order() {
 // ---- W5 oracle: BuildOptions writer extensions -----------------------------
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_image_with_xattr_prefix_dict() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     use fs_erofs::xattr::{ns, XattrLongPrefix};
     let opts = mkfs::BuildOptions {
         xattr_prefixes: vec![
@@ -912,12 +765,7 @@ fn fsck_passes_on_image_with_xattr_prefix_dict() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_image_with_compr_cfgs() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     use fs_erofs::mkfs::{CompressedAlgo, CompressedFileSpec, CompressedIndexFormat};
     let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(20);
     let cfg = mkfs::ComprCfgsConfig {
@@ -957,12 +805,7 @@ fn fsck_passes_on_image_with_compr_cfgs() {
 /// refuse the image at the superblock (#57). The LZMA test above is the
 /// only one that built a cfgs blob, and it never set the LZ4 record.
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_image_with_lz4_compr_cfgs() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     use fs_erofs::mkfs::{CompressedAlgo, CompressedFileSpec, CompressedIndexFormat};
     let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(20);
     let cfg = mkfs::ComprCfgsConfig {
@@ -1003,12 +846,7 @@ fn fsck_passes_on_image_with_lz4_compr_cfgs() {
 }
 
 #[test]
-#[ignore = "needs fsck.erofs (erofs-utils)"]
 fn fsck_passes_on_image_with_correct_nlink() {
-    if !fsck_erofs_available() {
-        eprintln!("skipping: fsck.erofs not on PATH");
-        return;
-    }
     // Tree with multiple subdirs at one level so writer's nlink math
     // (2 + child_dirs) is exercised. fsck.erofs may or may not check
     // nlink, but it MUST NOT reject a tree whose nlink is correct.

@@ -10,28 +10,26 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned tag of the sibling am-fs-core repo used to satisfy the path dep
-  # during local build/verify. Bump in lockstep with the am-fs-core version
-  # constraint in Cargo.toml when releasing a new fs-erofs minor.
-  FS_CORE_REF: v0.2.10
+  CHORE_VERSION: "0.11.0"
 
 jobs:
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
-      # The crate has a path dep on am-fs-core (../rust-fs-core). Clone the
-      # sibling repo alongside, pinned to FS_CORE_REF, so cargo resolves it.
-      # Anonymous HTTPS clone — rust-fs-core is public.
-      - name: clone am-fs-core sibling
-        shell: bash
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core (the path dependency) and fs-linux-test-harness, at
+        # the refs pinned in chores.yml.
+        run: chore siblings
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
       - name: verify tag matches Cargo.toml version
@@ -43,38 +41,34 @@ jobs:
             exit 1
           fi
 
-      # erofs-utils provides mkfs.erofs / fsck.erofs / dump.erofs — the
-      # oracle binaries the #[ignore]-gated round-trip and oracle_compat
-      # tests shell out to. ubuntu-latest's apt erofs-utils is 1.7.1 which
-      # predates variable block-size + the dump.erofs "Filesystem
-      # blocksize:" line our writer tests assert against, so we source-build
-      # 1.9.1 instead (same path as ci.yml). `attr` provides setfattr /
-      # getfattr for the xattr oracle paths.
-      - name: install erofs-utils 1.9.1 from source + attr
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            attr \
-            autoconf automake libtool pkg-config \
-            uuid-dev libselinux1-dev liblz4-dev liblzma-dev libzstd-dev zlib1g-dev
-          curl -sSL https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-1.9.1.tar.gz | tar -xz
-          cd erofs-utils-1.9.1
-          ./autogen.sh
-          ./configure --enable-fuse=no
-          make -j"$(nproc)"
-          sudo make install
-          mkfs.erofs --version | head -1
-          fsck.erofs --version | head -1
-          dump.erofs --version | head -1
+      # THE ORACLE TOOLS ARE NOT INSTALLED HERE. They live in the
+      # fs-linux-test-harness guest, built from source by
+      # scripts/vm-setup.sh, which is the same place `chore test` reaches
+      # them from on a developer's machine. What stood here was a 60-line
+      # source build of erofs-utils 1.9.1 on the runner, duplicated from
+      # ci.yml, and `cargo test -- --ignored` to opt the oracles back in.
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
 
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --all-targets
-      # Oracle tests are #[ignore]-gated so a fresh checkout without
-      # erofs-utils still passes `cargo test`. The oracle is installed
-      # above, so opt them in here — this is the canonical "does the
-      # kernel-shipped tooling accept what we emit / can we read what it
-      # emits" gate, the strongest signal the release artifact is sound.
-      - run: cargo test --locked --all-targets -- --ignored
+      - name: chore fixtures
+        run: chore fixtures
+      - name: chore lint
+        run: chore lint
+      - name: chore test
+        run: chore test
+      - name: Keep the tier logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-release
+          path: tmp/logs/*.log
+          if-no-files-found: error
 
   publish:
     name: publish to crates.io
@@ -87,9 +81,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: clone am-fs-core sibling
-        shell: bash
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
 
       - uses: dtolnay/rust-toolchain@stable
 

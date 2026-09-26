@@ -15,7 +15,8 @@
 //! implementation, rather than with this crate's own writer.
 
 mod common;
-use common::{build_with_mkfs_erofs, dir, file, mkfs_erofs_available, run_mkfs_erofs, MemDev};
+use common::{build_with_mkfs_erofs, dir, file, run_mkfs_erofs, MemDev};
+use fs_erofs_test_support::ScratchDir;
 
 use fs_core::BlockRead;
 use fs_erofs::{mkfs, Error, Filesystem};
@@ -118,36 +119,28 @@ fn every_block_size_this_writer_emits_verifies() {
 
 /// The external implementation at every block size it will write.
 #[test]
-#[ignore = "needs mkfs.erofs (erofs-utils)"]
 fn oracle_every_block_size_verifies_and_damage_is_refused() {
-    if !mkfs_erofs_available() {
-        eprintln!("skipping: mkfs.erofs not on PATH");
-        return;
-    }
     let tree = dir(vec![
         ("a.txt", file(b"alpha\n")),
         ("sub", dir(vec![("b.txt", file(&[7u8; 9000]))])),
     ]);
     let mut verified = Vec::new();
+    let mut refused = Vec::new();
     for bs in ["512", "1024", "4096", "16384"] {
         let flag = format!("-b{bs}");
-        // mkfs.erofs refuses a block size above the host's page size --
-        // 16 KiB on a 4 KiB Linux runner, the Apple silicon page size it
-        // is here for. That refusal is the tool's, not a verdict on the
-        // reader, so that size is skipped and said so; the smaller three
-        // must still run.
-        let probe = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(probe.path().join("src")).unwrap();
-        let tried = run_mkfs_erofs(
-            &[&flag],
-            &probe.path().join("probe.img"),
-            &probe.path().join("src"),
-        );
+        // mkfs.erofs refuses a block size above the GUEST's page size,
+        // which is 4 KiB -- so `-b16384` is refused there, every time,
+        // for a stated reason. That refusal is the tool's and not a
+        // verdict on this reader, so it is RECORDED rather than passed
+        // over: a size that is neither verified nor refused for that
+        // reason fails the test below. It used to print "skipping" and
+        // `continue`, which made "the tool said no" and "the tool was
+        // never asked" the same green line.
+        let probe = ScratchDir::new("blocksize-probe");
+        std::fs::create_dir_all(probe.join("src")).unwrap();
+        let tried = run_mkfs_erofs(&[&flag], &probe.join("probe.img"), &probe.join("src"));
         if tried.status_code != Some(0) && tried.stderr.contains("invalid block size") {
-            eprintln!(
-                "skipping {flag}: this host's mkfs.erofs refuses it ({})",
-                tried.stderr.trim()
-            );
+            refused.push((bs, tried.stderr.trim().to_string()));
             continue;
         }
         verified.push(bs);
@@ -164,8 +157,18 @@ fn oracle_every_block_size_verifies_and_damage_is_refused() {
     for required in ["512", "1024", "4096"] {
         assert!(
             verified.contains(&required),
-            "block size {required} was skipped, so the oracle checked less than it claims: {verified:?}"
+            "block size {required} was not verified, so the oracle checked less than it \
+             claims: verified {verified:?}, refused {refused:?}"
         );
+    }
+    assert_eq!(
+        verified.len() + refused.len(),
+        4,
+        "every block size must end up verified or explicitly refused: \
+         verified {verified:?}, refused {refused:?}"
+    );
+    for (bs, why) in &refused {
+        println!("[oracle vm] mkfs.erofs -b{bs} refused: {why}");
     }
 }
 
