@@ -12,7 +12,7 @@ mod common;
 
 use common::{dir, file};
 use fs_erofs::mkfs;
-use fs_erofs_test_support::{guest_kernel_refusal, guest_kernel_report, sha256_hex};
+use fs_erofs_test_support::{fixture, guest_kernel_refusal, guest_kernel_report, sha256_hex};
 
 /// The tree the kernel-mountability check writes, and what every file in
 /// it must read back as through the mount.
@@ -182,4 +182,68 @@ fn a_damaged_superblock_is_refused_by_the_kernel() {
         !said.trim().is_empty(),
         "the kernel refused the image but said nothing about it"
     );
+}
+
+/// THE C ABI's READLINK AGAINST THE KERNEL'S, on an image this crate did
+/// not write.
+///
+/// `/link` in the fixture tree is made by `ln -s` in
+/// test-disks/guest-build-images.sh and packed by `mkfs.erofs`; Linux
+/// mounts the image and `readlink(1)` reads the target back. The C ABI
+/// must return that target's length -- the family contract, `readlink(2)`'s
+/// count -- and write those same bytes followed by a NUL. Two images: the
+/// default layout, and 512-byte blocks, where the inode sits differently
+/// against the block boundary.
+#[test]
+fn capi_readlink_agrees_with_the_kernel_on_mkfs_erofs_images() {
+    use fs_erofs::capi::{fs_erofs_mount, fs_erofs_readlink, fs_erofs_umount};
+    use std::ffi::{c_char, CString};
+
+    for name in ["plain", "b512"] {
+        let image = fixture(env!("CARGO_MANIFEST_DIR"), &format!("erofs-{name}.img"));
+        let report = guest_kernel_report(&image, &format!("erofs-{name}.img /link"));
+        let want = report
+            .get(&("target".to_string(), "link".to_string()))
+            .unwrap_or_else(|| panic!("erofs-{name}.img: the kernel reported no /link target"))
+            .clone();
+        assert!(
+            !want.is_empty(),
+            "erofs-{name}.img: the kernel read an empty target"
+        );
+
+        let cimage = CString::new(image.clone()).unwrap();
+        let fs = unsafe { fs_erofs_mount(cimage.as_ptr()) };
+        assert!(
+            !fs.is_null(),
+            "mount {image}: {}",
+            common::capi_last_error()
+        );
+        let mut buf: Vec<c_char> = vec![0x7F; 4096];
+        let n = unsafe {
+            fs_erofs_readlink(
+                fs,
+                CString::new("/link").unwrap().as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        unsafe { fs_erofs_umount(fs) };
+        assert_eq!(
+            n,
+            want.len() as i32,
+            "erofs-{name}.img: fs_erofs_readlink returns the kernel's target length ({}): {}",
+            want.len(),
+            common::capi_last_error()
+        );
+        assert_eq!(
+            buf[want.len()],
+            0,
+            "erofs-{name}.img: the target is NUL-terminated"
+        );
+        assert_eq!(
+            String::from_utf8(common::cchar_field_to_bytes(&buf)).unwrap(),
+            want,
+            "erofs-{name}.img: the C ABI and the kernel disagree on /link"
+        );
+    }
 }

@@ -6,6 +6,18 @@ never does.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`fs_erofs_readlink` returns the target's length, not 0 (#138).** The
+  readlink contract is now the one every driver in the family shares:
+  success returns the length in bytes, NUL not counted, as Linux
+  `readlink(2)` does, and writes the target plus a NUL. A buffer smaller
+  than length + 1 is still refused with `ERANGE` and nothing written, and
+  the error message now names the size needed; a zero-byte buffer is
+  `ERANGE` rather than `EINVAL`. NULL `fs`/`path`/`buf` is `EINVAL`.
+  Callers testing `== 0` for success must test `>= 0`. The version moves
+  to 0.2.0.
+
 ### Added
 
 - **A `mkfs.erofs` geometry matrix, as fixtures.** `chore fixtures`
