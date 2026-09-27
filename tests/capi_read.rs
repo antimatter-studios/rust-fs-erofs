@@ -228,14 +228,21 @@ fn read_file_rejects_null_arguments() {
 // fs_erofs_readlink
 // ---------------------------------------------------------------------
 
+/// The family's readlink contract, which every driver shares: success
+/// returns the target's length in bytes -- the NUL not counted, as Linux
+/// `readlink(2)` counts it -- AND writes the target plus a NUL.
 #[test]
 fn reads_a_short_symlink_target() {
     let (_img, fs) = mounted();
-    let mut buf: Vec<c_char> = vec![0; 256];
+    let mut buf: Vec<c_char> = vec![0x7F; 256];
     let n = unsafe { fs_erofs_readlink(fs, cpath("/link").as_ptr(), buf.as_mut_ptr(), buf.len()) };
-    // This ABI returns 0 on success and writes a NUL-terminated target,
-    // rather than returning the length.
-    assert_eq!(n, 0, "readlink failed: {}", capi_last_error());
+    assert_eq!(
+        n,
+        LINK_TARGET.len() as i32,
+        "readlink returns the target length: {}",
+        capi_last_error()
+    );
+    assert_eq!(buf[n as usize], 0, "the target is NUL-terminated");
     let got = common::cchar_field_to_bytes(&buf);
     assert_eq!(String::from_utf8(got).unwrap(), LINK_TARGET);
     unsafe { fs_erofs_umount(fs) };
@@ -246,27 +253,52 @@ fn reads_a_short_symlink_target() {
 #[test]
 fn reads_a_long_symlink_target() {
     let (_img, fs) = mounted();
-    let mut buf: Vec<c_char> = vec![0; 512];
+    let mut buf: Vec<c_char> = vec![0x7F; 512];
     let n =
         unsafe { fs_erofs_readlink(fs, cpath("/longlink").as_ptr(), buf.as_mut_ptr(), buf.len()) };
-    assert_eq!(n, 0, "readlink failed: {}", capi_last_error());
+    assert_eq!(
+        n,
+        LONG_LINK_TARGET_LEN as i32,
+        "readlink returns the target length: {}",
+        capi_last_error()
+    );
+    assert_eq!(buf[n as usize], 0, "the target is NUL-terminated");
     let got = common::cchar_field_to_bytes(&buf);
     assert_eq!(got.len(), LONG_LINK_TARGET_LEN);
     assert_eq!(String::from_utf8(got).unwrap(), long_link_target());
     unsafe { fs_erofs_umount(fs) };
 }
 
-/// A buffer too small for the target is REFUSED rather than truncated.
-///
-/// That is this ABI's choice and it is the safer one: a silently
-/// truncated path is a path to somewhere else, which a caller would
-/// follow without noticing. Note the sibling XFS and Btrfs drivers
-/// truncate instead — an inconsistency across the family worth
-/// reconciling, but not by changing a shipped contract here.
+/// A buffer of exactly the target plus its NUL is enough: the bound is
+/// `bufsize >= length + 1`, not one byte more.
 #[test]
-fn readlink_refuses_a_buffer_too_small_for_the_target() {
+fn readlink_fits_a_buffer_of_exactly_target_plus_nul() {
     let (_img, fs) = mounted();
-    let mut buf: Vec<c_char> = vec![0x7F; 5];
+    let mut buf: Vec<c_char> = vec![0x7F; LINK_TARGET.len() + 1];
+    let n = unsafe { fs_erofs_readlink(fs, cpath("/link").as_ptr(), buf.as_mut_ptr(), buf.len()) };
+    assert_eq!(
+        n,
+        LINK_TARGET.len() as i32,
+        "an exact fit succeeds: {}",
+        capi_last_error()
+    );
+    assert_eq!(buf[LINK_TARGET.len()], 0, "the last byte is the NUL");
+    let got = common::cchar_field_to_bytes(&buf);
+    assert_eq!(String::from_utf8(got).unwrap(), LINK_TARGET);
+    unsafe { fs_erofs_umount(fs) };
+}
+
+/// A buffer too small for the target and its NUL is REFUSED rather than
+/// truncated, and the buffer is left exactly as it was.
+///
+/// This deliberately differs from Linux `readlink(2)`, which truncates:
+/// a silently truncated path is a path to somewhere else, which a caller
+/// would follow without noticing. The whole driver family refuses.
+#[test]
+fn readlink_refuses_a_buffer_one_byte_short_and_writes_nothing() {
+    let (_img, fs) = mounted();
+    let need = LINK_TARGET.len() + 1;
+    let mut buf: Vec<c_char> = vec![0x7F; LINK_TARGET.len()];
     let n = unsafe { fs_erofs_readlink(fs, cpath("/link").as_ptr(), buf.as_mut_ptr(), buf.len()) };
     assert_eq!(n, -1, "a target that does not fit must be refused");
     assert_eq!(
@@ -275,11 +307,32 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
         "a buffer too small is ERANGE, got {}",
         fs_erofs_last_errno()
     );
+    assert!(
+        buf.iter().all(|&c| c == 0x7F),
+        "a refused readlink wrote into the buffer: {buf:?}"
+    );
+    let msg = capi_last_error();
+    assert!(
+        msg.contains(&need.to_string()),
+        "the error names the size needed ({need}): {msg:?}"
+    );
+    unsafe { fs_erofs_umount(fs) };
+}
+
+/// A zero-byte buffer cannot hold even the NUL: too small, so ERANGE.
+#[test]
+fn readlink_refuses_a_zero_byte_buffer_with_erange() {
+    let (_img, fs) = mounted();
+    let mut buf: Vec<c_char> = vec![0x7F; 1];
+    let n = unsafe { fs_erofs_readlink(fs, cpath("/link").as_ptr(), buf.as_mut_ptr(), 0) };
+    assert_eq!(n, -1);
+    assert_eq!(fs_erofs_last_errno(), ERANGE);
+    assert_eq!(buf[0], 0x7F, "nothing is written");
     unsafe { fs_erofs_umount(fs) };
 }
 
 #[test]
-fn readlink_on_a_regular_file_is_refused() {
+fn readlink_on_a_regular_file_is_refused_with_einval() {
     let (_img, fs) = mounted();
     let mut buf: Vec<c_char> = vec![0; 64];
     let n = unsafe {
@@ -291,30 +344,48 @@ fn readlink_on_a_regular_file_is_refused() {
         )
     };
     assert_eq!(n, -1, "a regular file is not a symlink");
-    assert_ne!(fs_erofs_last_errno(), 0);
+    assert_eq!(fs_erofs_last_errno(), EINVAL);
     unsafe { fs_erofs_umount(fs) };
 }
 
 #[test]
-fn readlink_rejects_null_and_empty_buffers() {
+fn readlink_on_a_missing_path_is_refused_with_enoent() {
+    let (_img, fs) = mounted();
+    let mut buf: Vec<c_char> = vec![0; 64];
+    let n = unsafe {
+        fs_erofs_readlink(
+            fs,
+            cpath("/no-such-link").as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
+    assert_eq!(n, -1, "a missing path has no target");
+    assert_eq!(fs_erofs_last_errno(), ENOENT);
+    unsafe { fs_erofs_umount(fs) };
+}
+
+#[test]
+fn readlink_rejects_null_arguments_with_einval() {
     let (_img, fs) = mounted();
     let p = cpath("/link");
-    let mut buf: Vec<c_char> = vec![0; 8];
+    let mut buf: Vec<c_char> = vec![0; 64];
     unsafe {
         assert_eq!(
-            fs_erofs_readlink(std::ptr::null_mut(), p.as_ptr(), buf.as_mut_ptr(), 8),
+            fs_erofs_readlink(std::ptr::null_mut(), p.as_ptr(), buf.as_mut_ptr(), 64),
             -1
         );
+        assert_eq!(fs_erofs_last_errno(), EINVAL, "NULL fs");
         assert_eq!(
-            fs_erofs_readlink(fs, std::ptr::null(), buf.as_mut_ptr(), 8),
+            fs_erofs_readlink(fs, std::ptr::null(), buf.as_mut_ptr(), 64),
             -1
         );
+        assert_eq!(fs_erofs_last_errno(), EINVAL, "NULL path");
         assert_eq!(
-            fs_erofs_readlink(fs, p.as_ptr(), std::ptr::null_mut(), 8),
+            fs_erofs_readlink(fs, p.as_ptr(), std::ptr::null_mut(), 64),
             -1
         );
-        // Zero bytes leaves no room even for the terminator.
-        assert!(fs_erofs_readlink(fs, p.as_ptr(), buf.as_mut_ptr(), 0) < 0);
+        assert_eq!(fs_erofs_last_errno(), EINVAL, "NULL buf");
         fs_erofs_umount(fs);
     }
 }
