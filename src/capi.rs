@@ -11,7 +11,7 @@
 //! - fs_erofs_stat(fs, path, attr) -> int
 //! - fs_erofs_dir_open(fs, path) / _dir_next(iter) / _dir_close(iter)
 //! - fs_erofs_read_file(fs, path, buf, offset, length) -> int64
-//! - fs_erofs_readlink(fs, path, buf, bufsize) -> int
+//! - fs_erofs_readlink(fs, path, buf, bufsize) -> int (target length)
 //! - fs_erofs_last_error() -> *const c_char
 //! - fs_erofs_last_errno() -> c_int
 //!
@@ -561,6 +561,17 @@ pub unsafe extern "C" fn fs_erofs_read_file(
     )
 }
 
+/// Read the target of the symlink at `path` — THE FAMILY'S READLINK
+/// CONTRACT, shared by every driver in it (see `include/fs_erofs.h`).
+///
+/// - Success: returns the target's length in bytes, the NUL not counted
+///   (as Linux `readlink(2)` counts it), and writes the target followed by
+///   a NUL into `buf`.
+/// - `bufsize < length + 1`: returns -1 with `ERANGE`, the last-error
+///   message naming the size needed, and writes NOTHING into `buf`. Never
+///   a truncation — this deliberately differs from Linux.
+/// - NULL `fs`/`path`/`buf`: -1 with `EINVAL`.
+/// - Any other failure: -1 with a non-zero errno.
 #[no_mangle]
 pub unsafe extern "C" fn fs_erofs_readlink(
     fs: *mut fs_erofs_fs_t,
@@ -572,8 +583,8 @@ pub unsafe extern "C" fn fs_erofs_readlink(
         -1,
         AssertUnwindSafe(|| {
             clear_last_error();
-            if fs.is_null() || path.is_null() || buf.is_null() || bufsize == 0 {
-                set_err_msg("null fs/path/buf or zero bufsize", EINVAL);
+            if fs.is_null() || path.is_null() || buf.is_null() {
+                set_err_msg("readlink: null fs/path/buf", EINVAL);
                 return -1;
             }
             let fs = unsafe { &(*fs).fs };
@@ -597,17 +608,35 @@ pub unsafe extern "C" fn fs_erofs_readlink(
                     return -1;
                 }
             };
-            if target.len() + 1 > bufsize {
-                set_err_msg("readlink buffer too small", ERANGE);
+            // The length is the return value, so it has to fit one. An
+            // EROFS symlink is bounded by the block size, far below this;
+            // the check keeps a hostile image from wrapping it negative.
+            let Ok(len) = c_int::try_from(target.len()) else {
+                set_err_msg(
+                    &format!("readlink {path}: target of {} bytes", target.len()),
+                    EIO,
+                );
+                return -1;
+            };
+            let need = target.len() + 1;
+            if bufsize < need {
+                set_err_msg(
+                    &format!(
+                        "readlink {path}: buffer of {bufsize} bytes is too small, \
+                         need {need} (target {} bytes + NUL)",
+                        target.len()
+                    ),
+                    ERANGE,
+                );
                 return -1;
             }
             // `.cast::<u8>()`, not `as *mut u8`: `c_char` is `i8` on x86_64
             // and Apple targets but `u8` on aarch64-linux, where the `as`
             // spelling is a same-type cast that clippy refuses (#89).
-            let dst = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), bufsize) };
+            let dst = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), need) };
             dst[..target.len()].copy_from_slice(&target);
             dst[target.len()] = 0;
-            0
+            len
         }),
     )
 }

@@ -116,6 +116,21 @@ void fs_erofs_dir_close(fs_erofs_dir_iter_t *iter);
 
 int64_t fs_erofs_read_file(fs_erofs_fs_t *fs, const char *path,
                            void *buf, uint64_t offset, uint64_t length);
+
+/* Read the target of the symlink at `path` (not followed).
+ *
+ * Success: returns the target's length in bytes, NOT counting the NUL
+ *   (as Linux readlink(2) does), and writes the target followed by a NUL
+ *   terminator into `buf`. 0 is a valid length only in principle; test
+ *   for success with `>= 0`, never `== 0`.
+ * Buffer too small (bufsize < length + 1): returns -1,
+ *   fs_erofs_last_errno() is ERANGE, fs_erofs_last_error() names the size
+ *   needed, and NOTHING is written into `buf`. The target is never
+ *   silently truncated -- deliberately unlike Linux readlink(2).
+ * NULL fs, path or buf: returns -1, errno EINVAL.
+ * Any other failure: returns -1 with a non-zero errno (ENOENT for a
+ *   missing path, EINVAL for a path that is not a symlink, EIO otherwise).
+ */
 int fs_erofs_readlink(fs_erofs_fs_t *fs, const char *path,
                       char *buf, size_t bufsize);
 
