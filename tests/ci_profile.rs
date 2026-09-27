@@ -986,7 +986,7 @@ fn runs_chore(steps: &[Yaml], task: &str) -> bool {
 ///   fs-linux-test-harness VM under KVM, on an x86_64 runner, and uploads
 ///   them. They are disk images, the same for every architecture.
 /// - `test` runs on BOTH native architectures -- aarch64 matters on its
-///   own: `c_char` is unsigned there, and it is what DiskJockey ships on
+///   own: `c_char` is unsigned there, and Apple Silicon hosts link it
 ///   -- and downloads those images rather than building them, because
 ///   GitHub's arm64 runners have no KVM. So no step of it may start a VM.
 /// - `unit` runs the tier that needs no tool and no fixture, which is
