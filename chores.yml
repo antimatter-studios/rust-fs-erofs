@@ -4,7 +4,7 @@ chore_min_version: 0.10.0
 # THE CONTRACT THIS FILE EXISTS TO OWN.
 #
 # How to build rust-fs-erofs is knowledge that belongs to rust-fs-erofs. It used to
-# live in diskjockey/scripts/build-fs-*.sh — four scripts, 757 lines between
+# live in a consumer's build scripts — four scripts, 757 lines between
 # them, byte-identical once you normalise the driver name, of which three
 # lines per script were actually about the filesystem: the cargo invocation,
 # the header name and the archive name.

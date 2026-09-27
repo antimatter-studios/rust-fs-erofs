@@ -19,7 +19,7 @@ name: CI
 #                Nothing installs erofs-utils on the runner, and the log
 #                shows `[oracle vm]` / `[kernel vm]` for each one.
 #   test-arm64   aarch64 matters on its own (c_char is unsigned there, and
-#                it is what DiskJockey ships on) but GitHub's arm64
+#                Apple Silicon hosts link it) but GitHub's arm64
 #                runners have NO KVM, so no VM can run: this job runs the
 #                tiers that need none — lint, the unit tier, and the
 #                fixture-reading tests. Before the fixtures existed, that
