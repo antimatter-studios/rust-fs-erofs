@@ -575,9 +575,22 @@ impl Filesystem {
     /// returned as-is (not followed); use [`Filesystem::resolve_path`]
     /// for following.
     pub fn lookup_path(&self, path: &str) -> Result<Inode> {
+        self.lookup_path_bytes(path.as_bytes())
+    }
+
+    /// Resolve a `/`-separated path given as bytes.
+    ///
+    /// THIS IS THE REAL ONE, and the `&str` wrapper above is the
+    /// convenience. EROFS directory entry names are raw bytes and the
+    /// format has no field that could say what encoding they are in, so
+    /// a name is not text until somebody decides what to read it as,
+    /// and this crate never decides. Components are compared byte for
+    /// byte against the on-disk entry, so a name handed out by a
+    /// listing always resolves when handed back (#148).
+    pub fn lookup_path_bytes(&self, path: &[u8]) -> Result<Inode> {
         let mut node = self.root_inode()?;
-        for component in path.split('/').filter(|c| !c.is_empty()) {
-            node = self.lookup(&node, component.as_bytes())?;
+        for component in path.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+            node = self.lookup(&node, component)?;
         }
         Ok(node)
     }
