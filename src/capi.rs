@@ -112,11 +112,54 @@ pub extern "C" fn fs_erofs_last_errno() -> c_int {
     LAST_ERRNO.with(|c| *c.borrow())
 }
 
+/// A host filesystem path as `&str`, for `fs_erofs_mount` only.
+///
+/// `fs_erofs_mount` hands its argument to the file opener, which wants a
+/// `Path`. Every path INSIDE an image goes through [`cstr_to_bytes`]
+/// instead, because those are compared against names the image holds
+/// and names are bytes (#148).
 unsafe fn cstr_to_str<'a>(p: *const c_char) -> &'a str {
     if p.is_null() {
         return "";
     }
     unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
+}
+
+/// A byte path as text, FOR A MESSAGE ONLY.
+///
+/// `from_utf8_lossy` is exactly wrong for a lookup — it maps distinct
+/// names onto one, so two files become indistinguishable — and exactly
+/// right for an error string, which a person reads and nothing compares.
+/// Never feed the result back into a lookup.
+fn shown(path: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(path)
+}
+
+/// The bytes of a NUL-terminated in-image path, not decoded.
+///
+/// THE EMPTY STRING WAS NOT A REFUSAL. This used to return `""` for a
+/// NULL pointer and for anything that did not decode as UTF-8, and `""`
+/// is not an error downstream: the resolver splits it into no
+/// components and hands back the root inode as a successful lookup. So
+/// `fs_erofs_stat` filled the attribute struct with the root's inode
+/// number, mode, size and mtime and returned 0 — indistinguishable from
+/// a real hit — and `fs_erofs_dir_open` handed back an iterator over
+/// the root listing. A caller walking a tree and composing paths from
+/// the names this driver gave it walked in a circle (#148).
+///
+/// NULL is now refused with `EINVAL`, because the argument is the
+/// problem. Everything else is passed through as BYTES and never
+/// decoded: EROFS directory entry names are raw bytes and the format
+/// has no field that could say what encoding they are in, so a name
+/// that is not valid UTF-8 is ordinary rather than hostile — any image
+/// built on a box with a non-UTF-8 locale holds them. Source-compatible
+/// for every caller passing UTF-8, because UTF-8 is a byte string too.
+unsafe fn cstr_to_bytes<'a>(p: *const c_char) -> Option<&'a [u8]> {
+    if p.is_null() {
+        set_err_msg("null path", EINVAL);
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(p) }.to_bytes())
 }
 
 // ===========================================================================
@@ -411,15 +454,17 @@ pub unsafe extern "C" fn fs_erofs_stat(
                 return -1;
             }
             let fs = unsafe { &(*fs).fs };
-            let path = unsafe { cstr_to_str(path) };
+            let Some(path) = (unsafe { cstr_to_bytes(path) }) else {
+                return -1;
+            };
             let attr = unsafe { &mut *attr };
-            match fs.lookup_path(path) {
+            match fs.lookup_path_bytes(path) {
                 Ok(inode) => {
                     fill_attr(attr, &inode);
                     0
                 }
                 Err(e) => {
-                    set_err_from(&e, &format!("stat {path}"));
+                    set_err_from(&e, &format!("stat {}", shown(path)));
                     -1
                 }
             }
@@ -441,17 +486,22 @@ pub unsafe extern "C" fn fs_erofs_dir_open(
                 return std::ptr::null_mut();
             }
             let fs = unsafe { &(*fs).fs };
-            let path = unsafe { cstr_to_str(path) };
+            let Some(path) = (unsafe { cstr_to_bytes(path) }) else {
+                return std::ptr::null_mut();
+            };
 
-            let inode = match fs.lookup_path(path) {
+            let inode = match fs.lookup_path_bytes(path) {
                 Ok(i) => i,
                 Err(e) => {
-                    set_err_from(&e, &format!("dir_open {path}"));
+                    set_err_from(&e, &format!("dir_open {}", shown(path)));
                     return std::ptr::null_mut();
                 }
             };
             if !inode.is_dir() {
-                set_err_msg(&format!("dir_open {path}: not a directory"), ENOTDIR);
+                set_err_msg(
+                    &format!("dir_open {}: not a directory", shown(path)),
+                    ENOTDIR,
+                );
                 return std::ptr::null_mut();
             }
             let entries = match fs.read_dir(&inode) {
@@ -463,7 +513,7 @@ pub unsafe extern "C" fn fs_erofs_dir_open(
                     .map(dir_entry_to_abi)
                     .collect(),
                 Err(e) => {
-                    set_err_from(&e, &format!("read directory {path}"));
+                    set_err_from(&e, &format!("read directory {}", shown(path)));
                     return std::ptr::null_mut();
                 }
             };
@@ -526,17 +576,22 @@ pub unsafe extern "C" fn fs_erofs_read_file(
                 return -1;
             }
             let fs = unsafe { &(*fs).fs };
-            let path = unsafe { cstr_to_str(path) };
+            let Some(path) = (unsafe { cstr_to_bytes(path) }) else {
+                return -1;
+            };
 
-            let inode = match fs.lookup_path(path) {
+            let inode = match fs.lookup_path_bytes(path) {
                 Ok(i) => i,
                 Err(e) => {
-                    set_err_from(&e, &format!("read_file {path}"));
+                    set_err_from(&e, &format!("read_file {}", shown(path)));
                     return -1;
                 }
             };
             if !inode.is_regular_file() {
-                set_err_msg(&format!("read_file {path}: not a regular file"), EINVAL);
+                set_err_msg(
+                    &format!("read_file {}: not a regular file", shown(path)),
+                    EINVAL,
+                );
                 return -1;
             }
             if offset >= inode.size {
@@ -553,7 +608,7 @@ pub unsafe extern "C" fn fs_erofs_read_file(
             match fs.read_file(&inode, offset, out) {
                 Ok(()) => to_read as i64,
                 Err(e) => {
-                    set_err_from(&e, &format!("read_file {path}"));
+                    set_err_from(&e, &format!("read_file {}", shown(path)));
                     -1
                 }
             }
@@ -588,23 +643,25 @@ pub unsafe extern "C" fn fs_erofs_readlink(
                 return -1;
             }
             let fs = unsafe { &(*fs).fs };
-            let path = unsafe { cstr_to_str(path) };
+            let Some(path) = (unsafe { cstr_to_bytes(path) }) else {
+                return -1;
+            };
 
-            let inode = match fs.lookup_path(path) {
+            let inode = match fs.lookup_path_bytes(path) {
                 Ok(i) => i,
                 Err(e) => {
-                    set_err_from(&e, &format!("readlink {path}"));
+                    set_err_from(&e, &format!("readlink {}", shown(path)));
                     return -1;
                 }
             };
             if !inode.is_symlink() {
-                set_err_msg(&format!("readlink {path}: not a symlink"), EINVAL);
+                set_err_msg(&format!("readlink {}: not a symlink", shown(path)), EINVAL);
                 return -1;
             }
             let target = match fs.read_symlink_target(&inode) {
                 Ok(t) => t,
                 Err(e) => {
-                    set_err_from(&e, &format!("readlink {path}"));
+                    set_err_from(&e, &format!("readlink {}", shown(path)));
                     return -1;
                 }
             };
@@ -613,7 +670,7 @@ pub unsafe extern "C" fn fs_erofs_readlink(
             // the check keeps a hostile image from wrapping it negative.
             let Ok(len) = c_int::try_from(target.len()) else {
                 set_err_msg(
-                    &format!("readlink {path}: target of {} bytes", target.len()),
+                    &format!("readlink {}: target of {} bytes", shown(path), target.len()),
                     EIO,
                 );
                 return -1;
@@ -622,8 +679,9 @@ pub unsafe extern "C" fn fs_erofs_readlink(
             if bufsize < need {
                 set_err_msg(
                     &format!(
-                        "readlink {path}: buffer of {bufsize} bytes is too small, \
+                        "readlink {}: buffer of {bufsize} bytes is too small, \
                          need {need} (target {} bytes + NUL)",
+                        shown(path),
                         target.len()
                     ),
                     ERANGE,

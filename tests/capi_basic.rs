@@ -560,3 +560,97 @@ fn big_file_attributes_match_the_bytes_written() {
     assert_eq!(stat_path(fs, "/b").unwrap().size, BIG_LEN as u64);
     unsafe { fs_erofs_umount(fs) };
 }
+
+// ---- paths are bytes (#148) --------------------------------------------
+
+/// A NULL path is refused, and `attr` is left alone.
+///
+/// THE CONTROL, NOT THE BUG. `cstr_to_str` returned `""` for a NULL
+/// pointer, and `""` resolves to the root — but every entry point
+/// already checks `path.is_null()` before it gets there, so this half
+/// was never reachable. Pinned anyway: the guard is what makes the
+/// fallback unreachable, and nothing else says so. The reachable half
+/// is the test below.
+#[test]
+fn a_null_path_is_refused_and_leaves_attr_alone() {
+    with_fixture(|fs| {
+        let root = stat_path(fs, "/").expect("the root must stat");
+        // THE DISCRIMINATOR IS `mode`, NOT `inode`. The root's inode
+        // number in this fixture is 0, which is also what a zeroed
+        // struct holds, so an inode comparison cannot tell a refusal
+        // from a root answer. Its mode cannot be 0 — it is a directory.
+        assert_ne!(root.mode, 0, "the root's mode must distinguish it");
+
+        let mut attr: fs_erofs_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_erofs_stat(fs, std::ptr::null(), &mut attr) };
+        assert_eq!(rc, -1, "a NULL path was answered as a successful stat");
+        assert_eq!(
+            attr.mode, 0,
+            "attr was written for a refused call, with the root's mode"
+        );
+    });
+}
+
+/// A path whose bytes are not valid UTF-8 names no file in this
+/// fixture, so it must be reported as missing rather than as the root.
+///
+/// THIS IS THE ONE THAT WAS BROKEN. `to_str().unwrap_or("")` turned any
+/// such path into the empty string, the resolver split that into no
+/// components, and the walk never left the root — so `stat` filled
+/// `attr` with the root directory's mode, size and mtime and returned
+/// 0, indistinguishable from a real hit (#148).
+///
+/// It is reachable rather than theoretical: EROFS names are raw bytes
+/// with no encoding rule, so any image built on a box with a non-UTF-8
+/// locale holds them, and a caller composing a path from a name this
+/// driver handed it got the root back.
+#[test]
+fn a_non_utf8_path_that_names_no_file_is_not_the_root() {
+    with_fixture(|fs| {
+        let root = stat_path(fs, "/").expect("the root must stat");
+        assert_ne!(root.mode, 0, "the root's mode must distinguish it");
+
+        // "/caf\xe9.txt" — latin-1 for "café.txt", which is what a name
+        // written on a Linux box with a non-UTF-8 locale looks like.
+        // `c_char` is `i8` on x86_64 and Apple targets and `u8` on
+        // aarch64-linux, so `from_ne_bytes` is the spelling that works
+        // on both.
+        let path: Vec<std::ffi::c_char> = b"/caf\xe9.txt\0"
+            .iter()
+            .map(|&b| std::ffi::c_char::from_ne_bytes([b]))
+            .collect();
+
+        let mut attr: fs_erofs_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_erofs_stat(fs, path.as_ptr(), &mut attr) };
+        assert_eq!(rc, -1, "a path naming no file was answered as a stat");
+        assert_eq!(
+            attr.mode, 0,
+            "attr was written for a path that names no file, with the root's mode"
+        );
+    });
+}
+
+/// The directory iterator likewise: this is the one that hurts most,
+/// because a caller walking a tree and composing paths from the names
+/// this driver handed back gets the root's entries again and walks in a
+/// circle.
+#[test]
+fn dir_open_on_a_path_that_names_nothing_is_not_the_root_listing() {
+    with_fixture(|fs| {
+        let path: Vec<std::ffi::c_char> = b"/caf\xe9.txt\0"
+            .iter()
+            .map(|&b| std::ffi::c_char::from_ne_bytes([b]))
+            .collect();
+        let iter = unsafe { fs_erofs_dir_open(fs, path.as_ptr()) };
+        assert!(
+            iter.is_null(),
+            "a path naming no directory opened an iterator over the root"
+        );
+
+        let null_iter = unsafe { fs_erofs_dir_open(fs, std::ptr::null()) };
+        assert!(
+            null_iter.is_null(),
+            "a NULL path opened a directory iterator"
+        );
+    });
+}
