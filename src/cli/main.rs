@@ -22,7 +22,7 @@ static FAMILY: common::Family = common::Family {
         "`chore cli:install` from a checkout of this repository",
         "`brew install antimatter-studios/tap/rust-fs-erofs`",
     ],
-    tools: &[erofs::mkfs::TOOL],
+    tools: &[erofs::mkfs::TOOL, erofs::fs::TOOL],
 };
 
 fn main() -> ExitCode {

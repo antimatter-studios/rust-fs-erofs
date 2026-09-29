@@ -2,7 +2,7 @@
 
 A pure-Rust, clean-room implementation of the **EROFS** (Enhanced Read-Only File System) on-disk format. Reads and writes images that the Linux kernel's EROFS driver and `erofs-utils` toolchain accept byte-for-byte.
 
-The repository ships one library crate (published on crates.io as `am-fs-erofs`, library name `fs_erofs`) plus its command-line tools: one multi-call binary, `rust-fs-erofs`, also installed as `mkfs.erofs`.
+The repository ships one library crate (published on crates.io as `am-fs-erofs`, library name `fs_erofs`) plus its command-line tools: one multi-call binary, `rust-fs-erofs`, also installed as `mkfs.erofs` and `fs.erofs`.
 
 - **Reader**: every EROFS feature emitted by `mkfs.erofs` 1.9 + AOSP build systems
 - **Writer (`mkfs.erofs`)**: produces images `fsck.erofs` accepts as valid
@@ -192,16 +192,21 @@ One binary, `rust-fs-erofs`, dispatching on the name it is started under, the wa
 | name | what |
 |---|---|
 | `mkfs.erofs OUTPUT SOURCE [-b BYTES]` | build an uncompressed image of a directory (the same argument order as erofs-utils) |
+| `fs.erofs IMAGE ls\|read\|get\|info [...]` | list a directory, read a file's bytes, or report the volume, without mounting it (every compressor the library reads) |
 | `rust-fs-erofs doctor` | is every name on `PATH` this program? If not, what wins and how to fix it |
 
 ```sh
 mkfs.erofs out.img source-tree/                 # 4 KiB blocks, no compression
 mkfs.erofs -b 16384 out.img source-tree/        # another block size
 mkfs.erofs out.img source-tree/ | jq .skipped   # what was left out, and why
+fs.erofs out.img ls /etc                        # JSON entries; a symlink's carries its target
+fs.erofs out.img read /etc/hostname > hostname  # raw bytes, or -o FILE
+fs.erofs out.img get erofs.uuid --text
+fs.erofs --offset 1048576 disk.img ls /         # a filesystem inside a larger image
 rust-fs-erofs doctor --text
 ```
 
-A result is JSON on stdout (`--text` for people); a failure is `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the command line was wrong, 3 the tool cannot do that (`mkfs.erofs --label` is refused until the builder takes a volume name). `--version` prints `<tool> (am-fs-erofs) <version>`.
+A result is JSON on stdout (`--text` for people); a failure is `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the command line was wrong, 3 the tool cannot do that (`mkfs.erofs --label` is refused until the builder takes a volume name, and `fs.erofs write`, `mkdir`, `set` and `resize` answer "EROFS is read-only"). `--version` prints `<tool> (am-fs-erofs) <version>`.
 
 erofs-utils installs a `mkfs.erofs` too. Only one can be first on `PATH`; `rust-fs-erofs doctor` says which, and how to change it.
 

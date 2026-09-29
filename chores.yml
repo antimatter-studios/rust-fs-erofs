@@ -112,14 +112,15 @@ chore_min_version: 0.10.0
 #                                                   repository does not control
 #     scripts     3 l /     77 B   30 l /  2,000 B  one shell test today, and
 #                                                   the glob picks up the next
-#     cli        12 l /    466 B   20 l /    700 B  the installed tools, no cargo
-#                66 checks                          output at all: 12 lines on a
+#     cli        16 l /    604 B   28 l /  1,000 B  the installed tools, no cargo
+#               114 checks                          output at all: 16 lines on a
 #                                                   Mac with erofs-utils linked
 #                                                   (doctor names it as not run),
 #                                                   one fewer on a runner without
 #                                                   it. Every file is three lines
 #                                                   when it passes, so a new one
-#                                                   is a visible step
+#                                                   is a visible step. Was 12 l /
+#                                                   466 B with mkfs.erofs alone
 #     gsi         NOT MEASURED     150 l / 12,000 B  #133: the pinned GSI's
 #                                                   system.img is ext4, not
 #                                                   EROFS, so this tier cannot
@@ -369,7 +370,9 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - 'scripts/tier.sh test:oracle oracle 700 55000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
-      - 'scripts/test-floor.sh oracle 80'
+      # 90: the 87 measured before the tools, plus tests/cli_mkfs_oracle.rs
+      # and tests/cli_fs_oracle.rs's eight, less a margin. Only goes up.
+      - 'scripts/test-floor.sh oracle 90'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
@@ -387,10 +390,11 @@ tasks:
     # #125 added: the deduplicated images read back through the kernel,
     # and the all-fragments,ztailpacking file it misreads being the one
     # this crate refuses. 6 with tests/cli_mkfs_kernel.rs: the kernel
-    # reading back the image the `mkfs.erofs` tool builds.
+    # reading back the image the `mkfs.erofs` tool builds; 7 with
+    # tests/cli_fs_kernel.rs: `fs.erofs` reading what the kernel reads.
     # tests/scripts/kernel-floor.sh fails if this falls below the number of
     # tests the tier holds.
-      - 'scripts/test-floor.sh kernel 6'
+      - 'scripts/test-floor.sh kernel 7'
 
   test:gsi:
     desc: 'The Android system-image suite — needs the ~2 GiB GSI fixture, which nothing else here can provide'
@@ -537,11 +541,11 @@ tasks:
     # BUDGET, measured: see the table at the top of this file.
     # FLOOR: each file prints a `test result: ok. N passed` line, which
     # test-floor.sh sums as it does cargo's. 66 checks executed when the
-    # tier was added (mkfs.erofs and the names); the floor is about 95% of
-    # that, and it only goes up.
+    # tier was added (mkfs.erofs and the names), 114 with fs.erofs; the
+    # floor is about 95% of that, and it only goes up.
     cmds:
-      - 'scripts/tier.sh test:cli cli 20 700 -- scripts/test-cli.sh'
-      - 'scripts/test-floor.sh cli 62'
+      - 'scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh'
+      - 'scripts/test-floor.sh cli 108'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
