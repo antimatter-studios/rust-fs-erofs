@@ -181,13 +181,16 @@ Two things about the local build, because they cost time otherwise: erofs-utils
 1.9.1 is built without root, and it **defaults to 16K pages** — pass `-b4096`
 where a 4 KiB block is meant. A missing tool **fails** the job; it does not skip.
 
-## The pin, and the red nightly
+## The am-fs-core pin is declared in four places
 
-This crate pins `am-fs-core` at `v0.2.10`, which predates a `CachingDevice`
-overflow fix released in `v0.2.11`. The **nightly fuzz run is red because of
-that pin**, not because of anything here — it reaches a bug this family fixed a
-fortnight ago. Tracked as rust-fs-core#147. Do not chase it as a defect in this
-crate, and do not bump the pin until #147 clears.
+`Cargo.toml`, `fuzz/Cargo.toml`, `chores.yml` (`FS_CORE_REF`) and `fuzz.yml`
+(the `git clone --branch` ref) each name the core release this crate builds
+against. A bump moves all four;
+`every_declaration_of_the_am_fs_core_pin_names_the_same_version` in
+`tests/ci_profile.rs` fails, naming the file left behind, when one is missed
+(#144). The nightly fuzz run was red from the 22nd to the 26th of September on
+a `CachingDevice` overflow core had already fixed, because its clone lagged the
+rest of the crate; it was never a defect here.
 
 `fuzz.yml` is nightly cron plus dispatch, so it never reports on a pull request
 and must never be required.
