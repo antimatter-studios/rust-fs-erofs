@@ -2,10 +2,10 @@
 
 A pure-Rust, clean-room implementation of the **EROFS** (Enhanced Read-Only File System) on-disk format. Reads and writes images that the Linux kernel's EROFS driver and `erofs-utils` toolchain accept byte-for-byte.
 
-The repository ships one library crate (published on crates.io as `am-fs-erofs`, library name `fs_erofs`) plus the `mkfs_erofs` CLI binary.
+The repository ships one library crate (published on crates.io as `am-fs-erofs`, library name `fs_erofs`) plus its command-line tools: one multi-call binary, `rust-fs-erofs`, also installed as `mkfs.erofs`.
 
 - **Reader**: every EROFS feature emitted by `mkfs.erofs` 1.9 + AOSP build systems
-- **Writer (`mkfs_erofs`)**: produces images `fsck.erofs` accepts as valid
+- **Writer (`mkfs.erofs`)**: produces images `fsck.erofs` accepts as valid
 - **Cross-platform**: builds + runs on Linux, macOS, Windows
 - **License**: MIT, fully permissive deps tree (no GPL/LGPL anywhere)
 
@@ -47,7 +47,7 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 | Hash-sorted dirent layout (kernel-mountable) | ✅ |
 | Decompressed-pcluster LRU cache (≈8.5× speedup) | ✅ |
 
-### Writer (`mkfs_erofs`)
+### Writer (`mkfs.erofs`)
 
 | Capability | Status |
 |---|---|
@@ -86,7 +86,7 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 ## Use cases
 
 - **Reading Android `system.img` / `vendor.img` on macOS, Windows, Linux** — the canonical use case. Feed an unwrapped (post-`simg2img`) image to `Filesystem::open` and read every file.
-- **Custom read-only volumes for embedded / immutable-OS distributions** — `mkfs_erofs source-tree/ out.img` produces a kernel-mountable image with strong compression.
+- **Custom read-only volumes for embedded / immutable-OS distributions** — `mkfs.erofs out.img source-tree/` produces a kernel-mountable image with strong compression.
 - **Windows users browsing Linux/Android disk images** — when paired with a Windows mount layer (e.g. WinFsp), expose EROFS images as drive letters.
 - **Differential filesystem fixtures** — deterministic image generation (reproducible builds, content-addressable storage, OCI/container layers).
 
@@ -119,7 +119,7 @@ cargo build --release
 chore test
 ```
 
-The `mkfs_erofs` binary lives at `target/release/mkfs_erofs`.
+The command-line tools are behind the `cli` feature, so the library a consumer links gains nothing from them: `chore cli:install` builds them and stages them under every name in `tmp/cli/bin` (it prints the `PATH` line to use), and `chore test:cli` tests them as installed.
 
 ## Library usage
 
@@ -185,26 +185,33 @@ for slot in fs.read_device_table()? {
 }
 ```
 
-## CLI usage — `mkfs_erofs`
+## Command-line tools
+
+One binary, `rust-fs-erofs`, dispatching on the name it is started under, the way busybox does. Each tool is a symlink to it, and `rust-fs-erofs <verb> ...` reaches the same tool under the one name nothing else on `PATH` can shadow.
+
+| name | what |
+|---|---|
+| `mkfs.erofs OUTPUT SOURCE [-b BYTES]` | build an uncompressed image of a directory (the same argument order as erofs-utils) |
+| `rust-fs-erofs doctor` | is every name on `PATH` this program? If not, what wins and how to fix it |
 
 ```sh
-# Default settings (4 KiB blocks, no compression)
-mkfs_erofs out.img source-tree/
-
-# Specific block size
-mkfs_erofs --block-size 16384 out.img source-tree/
-
-# Show help
-mkfs_erofs --help
+mkfs.erofs out.img source-tree/                 # 4 KiB blocks, no compression
+mkfs.erofs -b 16384 out.img source-tree/        # another block size
+mkfs.erofs out.img source-tree/ | jq .skipped   # what was left out, and why
+rust-fs-erofs doctor --text
 ```
 
-Symbolic links, special files, and non-UTF-8 directory entries print a stderr warning and are skipped on the CLI path. Use the library API (`mkfs::build_image_with(...)`) for full control over the on-disk shape (compression, xattrs, ACLs, prefix dictionary, COMPR_CFGS blob).
+A result is JSON on stdout (`--text` for people); a failure is `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the command line was wrong, 3 the tool cannot do that (`mkfs.erofs --label` is refused until the builder takes a volume name). `--version` prints `<tool> (am-fs-erofs) <version>`.
+
+erofs-utils installs a `mkfs.erofs` too. Only one can be first on `PATH`; `rust-fs-erofs doctor` says which, and how to change it.
+
+Symbolic links, special files, and non-UTF-8 directory entries are left out on the CLI path: each is named in the report's `skipped` list and warned about on stderr. Use the library API (`mkfs::build_image_with(...)`) for full control over the on-disk shape (compression, xattrs, ACLs, prefix dictionary, COMPR_CFGS blob).
 
 The output is byte-deterministic given the same input tree and options — useful for reproducible builds.
 
 ## Read-write semantics
 
-EROFS is **read-only by format design** — the on-disk format has no journal, no allocator, and no in-place rewrite path. This library exposes a read-only API: `Filesystem::open(...)` returns a handle whose every method reads. The `mkfs_erofs` writer creates *new* images from a source tree; it never mutates an existing one.
+EROFS is **read-only by format design** — the on-disk format has no journal, no allocator, and no in-place rewrite path. This library exposes a read-only API: `Filesystem::open(...)` returns a handle whose every method reads. The `mkfs.erofs` tool creates *new* images from a source tree; it never mutates an existing one.
 
 If your application needs writable-volume semantics (e.g. for a fuse / WinFsp adapter), the typical pattern is to overlay an in-memory or sidecar layer on top of this read engine and choose a persistence policy (discard / archive to a sidecar / re-mkfs the merged tree on flush). That layering is the consumer's responsibility — this crate provides only the read engine and the image builder.
 
@@ -274,7 +281,7 @@ SHA256 and unwraps the sparse-image format if needed (requires
 ## Performance notes
 
 - **LRU cache**: defaults to at most 256 decompressed pclusters and at most 64 MiB of decoded bytes, whichever bound is reached first. Sequential reads of compressed multi-pcluster files see roughly 8× speedup from cache hits. Disable via `Filesystem::set_pcluster_cache_capacity(0)` for memory-constrained hosts.
-- **Codec choice**: LZ4 is fastest to decompress; LZMA gives best compression ratios; DEFLATE and ZSTD are in between, and ZSTD is read-only here. Default `mkfs_erofs` compression is uncompressed (ship a baseline image first, opt into compression via `mkfs::build_image_with`).
+- **Codec choice**: LZ4 is fastest to decompress; LZMA gives best compression ratios; DEFLATE and ZSTD are in between, and ZSTD is read-only here. The `mkfs.erofs` tool writes uncompressed images (ship a baseline image first, opt into compression via `mkfs::build_image_with`).
 - **Inline tail-packing**: small files become FLAT_INLINE automatically when their tail fits in the metadata block — saves a full block of padding per file. Significant for many-small-files trees (Android `/etc`).
 
 ## Known limitations & gotchas
