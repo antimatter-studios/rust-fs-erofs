@@ -183,15 +183,35 @@ fn zstd() {
 
 #[test]
 fn a_damaged_image_is_refused_by_fsck_erofs_and_by_the_tool() {
-    let (tree, _) = source();
-    let built = build_with_mkfs_erofs(&["-b4096"], &tree);
-    let scratch = scratch("oracle-damaged");
+    // Built by this repository's `mkfs.erofs`, which sets the superblock
+    // checksum feature: erofs-utils' own images at these options do not,
+    // and fsck.erofs had nothing to check a changed byte against.
+    let src = scratch("oracle-damaged-src");
+    write_tree(
+        &src,
+        &[("big", pattern(1 << 20, 4)), ("one", pattern(1, 1))],
+    );
+    let img = image_path("oracle-damaged");
+    ok(tool("mkfs.erofs").args(["-q", &img, &src.display().to_string()]));
+    let bytes = std::fs::read(&img).unwrap();
+    let get = stdout(&ok(tool("fs.erofs").args([
+        &img,
+        "get",
+        "erofs.feature_compat",
+    ])));
+    let compat: u32 = json_field(&get, "erofs.feature_compat").parse().unwrap();
+    assert_eq!(
+        compat & 1,
+        1,
+        "the image carries no superblock checksum: {get}"
+    );
     // A byte of the superblock's UUID changed, so the CRC32C over it no
     // longer matches; and the image cut in half.
-    let mut bad_checksum = built.bytes.clone();
+    let mut bad_checksum = bytes.clone();
     bad_checksum[1024 + 0x30] ^= 0xFF;
-    let mut cut = built.bytes.clone();
-    cut.truncate(built.bytes.len() / 2);
+    let mut cut = bytes.clone();
+    cut.truncate(bytes.len() / 2);
+    let scratch = scratch("oracle-damaged");
     for (what, bytes) in [
         ("a bad superblock checksum", bad_checksum),
         ("a truncated image", cut),
