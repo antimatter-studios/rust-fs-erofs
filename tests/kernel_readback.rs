@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{dir, file};
+use common::{build_with_mkfs_erofs, dir, file, mixed_run_files};
 use fs_erofs::mkfs;
 use fs_erofs_test_support::{fixture, guest_kernel_refusal, guest_kernel_report, sha256_hex};
 
@@ -246,4 +246,91 @@ fn capi_readlink_agrees_with_the_kernel_on_mkfs_erofs_images() {
             "erofs-{name}.img: the C ABI and the kernel disagree on /link"
         );
     }
+}
+
+/// Build `mixed_run_files` with `mkfs.erofs <args>` in the guest, mount
+/// it, and return the files the kernel reads differently from the bytes
+/// they were built from, the number it read right, and the image.
+fn kernel_misreads(args: &[&str]) -> (Vec<String>, usize, Vec<u8>) {
+    let files = mixed_run_files();
+    let entries: Vec<(&str, mkfs::Node)> = files
+        .iter()
+        .map(|(name, data)| (name.as_str(), file(data)))
+        .collect();
+    let img = build_with_mkfs_erofs(args, &dir(entries));
+    let image = img.path.to_str().expect("utf-8 image path");
+    let report = guest_kernel_report(image, &format!("mkfs.erofs {}", args.join(" ")));
+    let mut wrong = Vec::new();
+    let mut read = 0;
+    for (name, data) in &files {
+        match report.get(&("sha256".to_string(), name.clone())) {
+            Some(sha) if *sha == sha256_hex(data) => read += 1,
+            Some(_) => wrong.push(name.clone()),
+            None => wrong.push(format!("{name} (not in the mounted tree)")),
+        }
+    }
+    (wrong, read, img.bytes)
+}
+
+/// The kernel reads a deduplicated image as the tree it was built from
+/// (#125).
+///
+/// This crate's side of dedupe is `oracle_dedupe_round_trip` in
+/// tests/oracle_compat.rs, against the files' own bytes. This is the
+/// other half: that the images `mkfs.erofs` writes for those shapes
+/// really hold those bytes by the in-kernel driver's reading, so a
+/// defect in the writer cannot pass for one in the reader or hide behind
+/// it.
+#[test]
+fn the_kernel_reads_a_deduplicated_image_as_its_source() {
+    for args in [
+        &["-b4096", "-zlz4hc", "-Efragments,ztailpacking,dedupe"][..],
+        // LZ4 only: the guest's kernel refuses to mount a MicroLZMA
+        // image (`Operation not supported`), so an LZMA shape here would
+        // test the kernel's configuration rather than the image.
+        &["-b4096", "-zlz4", "-C65536", "-Efragments,dedupe"][..],
+    ] {
+        let (wrong, read, _) = kernel_misreads(args);
+        assert!(
+            wrong.is_empty(),
+            "{args:?}: the kernel reads {} files differently from their source: {wrong:?}",
+            wrong.len()
+        );
+        assert_eq!(read, mixed_run_files().len(), "{args:?}: files read");
+    }
+}
+
+/// On `-Eall-fragments,ztailpacking`, the files this crate refuses are
+/// exactly the files the kernel misreads (#125).
+///
+/// erofs-utils 1.9.1 writes the file packed into that image's inline tail
+/// so that no reader following the format gets its bytes back: the Linux
+/// 6.1 driver reads `f39.bin` differently from its source, and so does
+/// `fsck.erofs --extract`. This crate refuses it. Equality both ways is
+/// the point: a file the kernel reads right that this crate refuses is a
+/// refusal too many, and one the kernel misreads that this crate hands
+/// back is a wrong answer given without an error.
+#[test]
+fn the_kernel_misreads_exactly_the_files_this_crate_refuses() {
+    let (kernel_wrong, _, image) =
+        kernel_misreads(&["-b4096", "-zlz4hc", "-Eall-fragments,ztailpacking"]);
+    let fs = common::open_image(image);
+    let mut refused = Vec::new();
+    for (name, data) in mixed_run_files() {
+        let inode = fs.lookup_path(&format!("/{name}")).expect("lookup");
+        let mut buf = vec![0u8; data.len()];
+        match fs.read_file(&inode, 0, &mut buf) {
+            Err(_) => refused.push(name),
+            Ok(()) => assert!(buf == data, "{name}: this crate read wrong bytes"),
+        }
+    }
+    assert!(
+        !kernel_wrong.is_empty(),
+        "fixture: the kernel read every file right, so there is nothing to refuse -- \
+         if mkfs.erofs now writes this shape correctly, this crate should read it"
+    );
+    assert_eq!(
+        refused, kernel_wrong,
+        "the files this crate refuses must be the files the kernel misreads"
+    );
 }

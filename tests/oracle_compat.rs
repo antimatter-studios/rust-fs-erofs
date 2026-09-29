@@ -24,7 +24,7 @@
 
 mod common;
 
-use common::{build_with_mkfs_erofs, dir, file, open_image, MemDev};
+use common::{build_with_mkfs_erofs, dir, file, mixed_run_files, open_image, MemDev};
 use fs_core::BlockRead;
 use fs_erofs::{mkfs, Filesystem};
 use fs_erofs_test_support::{assert_fsck_clean, mkfs_from_guest_tree, ScratchDir};
@@ -1354,34 +1354,6 @@ fn our_deflate_writer_sha256_round_trip_100kib() {
     );
 }
 
-/// Forty files alternating compressible and random runs of uneven
-/// lengths. `mkfs.erofs` stores the random runs as PLAIN pclusters that
-/// start partway into a block, beside compressed pclusters spanning
-/// several lclusters -- the layouts the read-path tests below need, which
-/// a hand-written tree of small files never produces.
-fn mixed_run_files() -> Vec<(String, Vec<u8>)> {
-    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-    let mut files = Vec::new();
-    for f in 0..40usize {
-        let mut data = Vec::new();
-        for s in 0..1 + f % 7 {
-            let len = 1000 + (f * 7919 + s * 104_729) % 30_000;
-            if (f + s) % 2 == 0 {
-                data.extend((0..len).map(|i| b"abcdefgh"[i % 8]));
-            } else {
-                data.extend((0..len).map(|_| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    (seed >> 24) as u8
-                }));
-            }
-        }
-        files.push((format!("f{f:02}.bin"), data));
-    }
-    files
-}
-
 /// Files alternating compressible and random runs, compressed with
 /// LZ4HC at 4 KiB blocks and no big pclusters, read back byte for byte.
 ///
@@ -1748,6 +1720,210 @@ fn oracle_fragments_with_ztailpacking_combined() {
             want_hash, got_hash,
             "{path}: SHA256 mismatch (ztailpacking+fragments)"
         );
+    }
+}
+
+/// How many extents of `inode` reuse only a PREFIX of their pcluster --
+/// the `Z_EROFS_LI_PARTIAL_REF` extents `-Ededupe` writes (#125). A read
+/// test over a deduplicated image counts them, so it cannot pass by
+/// never reaching one.
+fn partial_ref_extents(
+    dev: &Arc<dyn BlockRead>,
+    fs: &Filesystem,
+    inode: &fs_erofs::inode::Inode,
+) -> usize {
+    let Ok(zmap) = fs_erofs::zmap::ZMap::open(&**dev, fs.superblock(), inode) else {
+        return 0;
+    };
+    let (mut offset, mut found) = (0u64, 0usize);
+    while offset < inode.size {
+        let Ok(extent) = zmap.pcluster_extent(&**dev, offset) else {
+            break;
+        };
+        found += usize::from(extent.partial_ref);
+        if extent.source_end_byte <= offset {
+            break;
+        }
+        offset = extent.source_end_byte;
+    }
+    found
+}
+
+/// `mixed_run_files` as a tree, and the files beside it.
+fn mixed_run_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node) {
+    let files = mixed_run_files();
+    let entries: Vec<(&str, fs_erofs::mkfs::Node)> = files
+        .iter()
+        .map(|(name, data)| (name.as_str(), file(data)))
+        .collect();
+    let tree = dir(entries);
+    (files, tree)
+}
+
+/// What reading every file of `files` back out of `fs` came to.
+#[derive(Default)]
+struct ReadBack {
+    /// Read, and equal to its source.
+    right: usize,
+    /// Refused, with the reason.
+    refused: Vec<(String, String)>,
+    /// Read without an error, and NOT equal to its source. Never
+    /// acceptable: this is the failure the crate exists to avoid.
+    wrong: Vec<String>,
+    /// Extents that reuse a prefix of their pcluster.
+    partial: usize,
+}
+
+fn read_back(dev: &Arc<dyn BlockRead>, fs: &Filesystem, files: &[(String, Vec<u8>)]) -> ReadBack {
+    let mut out = ReadBack::default();
+    for (name, want) in files {
+        let inode = match fs.lookup_path(&format!("/{name}")) {
+            Ok(inode) => inode,
+            Err(e) => {
+                out.refused.push((name.clone(), format!("lookup: {e:?}")));
+                continue;
+            }
+        };
+        out.partial += partial_ref_extents(dev, fs, &inode);
+        let mut buf = vec![0u8; want.len()];
+        match fs.read_file(&inode, 0, &mut buf) {
+            Err(e) => out.refused.push((name.clone(), format!("{e:?}"))),
+            Ok(()) if &buf != want => out.wrong.push(name.clone()),
+            Ok(()) => out.right += 1,
+        }
+    }
+    out
+}
+
+/// Every file in a deduplicated image reads back byte for byte (#125).
+///
+/// `mkfs.erofs -Ededupe` points an extent at a pcluster an earlier extent
+/// already wrote when the start of its data matches, and marks the
+/// extent's HEAD `Z_EROFS_LI_PARTIAL_REF` when it needs fewer bytes than
+/// the pcluster decodes to. The read path decoded every pcluster to
+/// exactly its extent's length, which a reused pcluster does not have:
+/// LZ4 and LZMA refused (`LZ4 decompression failed` / `LZMA decompression
+/// failed`) 2 to 15 of these 40 files, depending on the shape.
+///
+/// Only the shapes `fsck.erofs` calls clean. The files' own bytes are the
+/// reference, so the check leans on no reader, and
+/// `the_kernel_reads_a_deduplicated_image_as_its_source` in
+/// tests/kernel_readback.rs holds the same images to the Linux driver.
+#[test]
+fn oracle_dedupe_round_trip() {
+    let (files, tree) = mixed_run_tree();
+    for args in [
+        &["-b4096", "-zlz4hc", "-Efragments,ztailpacking,dedupe"][..],
+        &["-b4096", "-zlz4hc", "-Eall-fragments,dedupe"][..],
+        &["-b4096", "-zlz4", "-C65536", "-Efragments,dedupe"][..],
+        &["-b4096", "-zlzma", "-Efragments,dedupe"][..],
+        &["-b4096", "-zdeflate", "-Efragments,ztailpacking,dedupe"][..],
+    ] {
+        let img = build_with_mkfs_erofs(args, &tree);
+        assert_fsck_clean(img.path.to_str().expect("utf-8"), &format!("{args:?}"));
+        let dev = MemDev::arc(img.bytes);
+        let fs = Filesystem::open(dev.clone()).expect("open");
+        let got = read_back(&dev, &fs, &files);
+        assert!(
+            got.wrong.is_empty() && got.refused.is_empty(),
+            "{args:?}: {} read right; wrong bytes: {:?}; refused: {:?}",
+            got.right,
+            got.wrong,
+            got.refused
+        );
+        if !args.contains(&"-zdeflate") {
+            assert!(
+                got.partial > 0,
+                "{args:?}: fixture: no extent reuses part of a pcluster, so this checks nothing"
+            );
+        }
+    }
+}
+
+/// A deduplicated image `fsck.erofs` rejects is refused, never misread
+/// (#125).
+///
+/// erofs-utils 1.9.1 writes `-Ededupe` and `-Eztailpacking,dedupe` images
+/// -- without fragments -- whose directories name inodes that are not
+/// there: `fsck.erofs` fails them, and the Linux 6.1 driver answers `stat`
+/// with `Structure needs cleaning` (`bogus i_mode (0) @ nid
+/// 18446744073709551615`). Measured in the harness VM, a 4 KiB-page
+/// guest, on 32 or 39 of these 40 files. Whatever a later mkfs writes,
+/// the rule this pins holds: a file reads as its source or not at all.
+#[test]
+fn a_deduplicated_image_mkfs_wrote_wrong_is_refused_not_misread() {
+    let (files, tree) = mixed_run_tree();
+    for args in [
+        &["-b4096", "-zlz4hc", "-Ededupe"][..],
+        &["-b4096", "-zlz4hc", "-Eztailpacking,dedupe"][..],
+        &["-b4096", "-zlzma", "-Ededupe"][..],
+    ] {
+        let img = build_with_mkfs_erofs(args, &tree);
+        let dev = MemDev::arc(img.bytes);
+        let fs = Filesystem::open(dev.clone()).expect("open");
+        let got = read_back(&dev, &fs, &files);
+        assert!(
+            got.wrong.is_empty(),
+            "{args:?}: these read back as bytes that are not theirs: {:?}",
+            got.wrong
+        );
+        assert_eq!(
+            got.right + got.refused.len(),
+            files.len(),
+            "{args:?}: every file is either read right or refused"
+        );
+    }
+}
+
+/// The file `-Eall-fragments,ztailpacking` packs into its inline tail is
+/// refused, not misread, and everything else in the image reads (#125).
+///
+/// erofs-utils 1.9.1 stores that tail's bytes from the start of the inline
+/// data but marks the pcluster interlaced, so by the format's reading --
+/// the kernel's -- they begin `start % bs` bytes further in and run past
+/// the inline data. The last file packed there (`f39.bin`, from byte
+/// 74016) read back as other bytes and zeros; the Linux 6.1 driver and
+/// `fsck.erofs --extract` read it wrong too, and
+/// `the_kernel_misreads_exactly_the_files_this_crate_refuses` in
+/// tests/kernel_readback.rs holds the two sets equal. The bytes of that
+/// file before the tail, and every other file sharing the tail's block,
+/// still read.
+#[test]
+fn oracle_all_fragments_ztailpacking_refuses_rather_than_misreads() {
+    let (files, tree) = mixed_run_tree();
+    let args = ["-b4096", "-zlz4hc", "-Eall-fragments,ztailpacking"];
+    let img = build_with_mkfs_erofs(&args, &tree);
+    assert_fsck_clean(
+        img.path.to_str().expect("utf-8"),
+        "all-fragments,ztailpacking",
+    );
+    let dev = MemDev::arc(img.bytes);
+    let fs = Filesystem::open(dev.clone()).expect("open");
+    let got = read_back(&dev, &fs, &files);
+    assert!(
+        got.wrong.is_empty(),
+        "these read back as bytes that are not theirs: {:?}",
+        got.wrong
+    );
+    assert!(
+        !got.refused.is_empty()
+            && got
+                .refused
+                .iter()
+                .all(|(_, why)| why.contains("runs past its inline data")),
+        "fixture: expected the file in the inline tail refused, and only for that reason; \
+         refused {:?}",
+        got.refused
+    );
+    assert_eq!(got.right + got.refused.len(), files.len());
+    for (name, _) in &got.refused {
+        let want = &files.iter().find(|(n, _)| n == name).expect("a file").1;
+        let inode = fs.lookup_path(&format!("/{name}")).expect("lookup");
+        let head = want.len() / 2;
+        let mut buf = vec![0u8; head];
+        fs.read_file(&inode, 0, &mut buf)
+            .unwrap_or_else(|e| panic!("{name}: the bytes before its tail: {e:?}"));
+        assert!(buf == want[..head], "{name}: the bytes before its tail");
     }
 }
 
