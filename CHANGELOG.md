@@ -8,6 +8,18 @@ never does.
 
 ### Added
 
+- **The command-line tools are one multi-call binary, `rust-fs-erofs`**,
+  behind a new `cli` feature, so the static library gains no dependency
+  from them. It dispatches on the name it is started under: `mkfs.erofs`
+  and `rust-fs-erofs mkfs` are the same program. `--version` prints
+  `<tool> (am-fs-erofs) <version>`, a result is JSON on stdout (`--text`
+  for people) and a failure is `{"error": ..., "code": N}` on stderr.
+- `rust-fs-erofs doctor` says, for every name, whether the program `PATH`
+  finds is this one, and when it is not (erofs-utils' `mkfs.erofs`, say)
+  what wins and the fix.
+- A `cli` tier (`chore cli:install`, `chore test:cli`) tests the tools as
+  installed, doctor first, and a `cli` CI job runs it on every pull request.
+
 - Releases carry a build-provenance attestation: the published `.crate` is
   attached to the GitHub release for its tag, checked first against the
   crates.io checksum, and verifiable with `gh attestation verify` (see the
@@ -28,6 +40,14 @@ never does.
   the Linux driver's reading of the same images.
 
 ### Changed
+
+- **`mkfs_erofs` is now `mkfs.erofs`**, the `mkfs` arm of the multi-call
+  binary, with the same argument order (`OUTPUT SOURCE`) and `-b` as a
+  short form of `--block-size`. It prints a JSON report read back from the
+  image it wrote, naming each source entry it left out and why. `--label`
+  is refused (exit 3) until the builder takes a volume name. The
+  `mkfs_erofs` target is gone; it was never in a release archive, so no
+  alias is kept.
 
 - **The file in an `-Eall-fragments,ztailpacking` inline tail is refused
   rather than read (#125).** erofs-utils 1.9.1 writes that tail so that

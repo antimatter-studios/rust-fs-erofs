@@ -15,9 +15,27 @@ exclude = ["fuzz"]
 name = "fs_erofs"
 crate-type = ["staticlib", "rlib"]
 
+# THE COMMAND-LINE TOOLS: one multi-call binary, named for the repository.
+# It dispatches on argv[0], the way busybox and e2fsprogs do, so the
+# release step installs it once as `rust-fs-erofs` and links `mkfs.erofs`
+# to it (cargo refuses a dot in a target name, so the dotted names are
+# never cargo's). `rust-fs-erofs <tool> ...` is the form nothing else on
+# PATH can shadow, and `cargo run --features cli -- mkfs ...` works before
+# anything is installed. It replaces the `mkfs_erofs` target.
+#
+# BEHIND THE `cli` FEATURE, so the static library a consumer links gains no
+# dependency from the tools: `required-features` keeps the target out of a
+# build that did not ask for it. scripts/test.sh and `chore lint` ask for
+# it, so the tests and clippy reach it.
 [[bin]]
-name = "mkfs_erofs"
-path = "src/bin/mkfs_erofs.rs"
+name = "rust-fs-erofs"
+path = "src/cli/main.rs"
+required-features = ["cli"]
+
+[features]
+# The command-line tools and nothing else. clap, clap_complete and
+# clap_mangen are MIT/Apache-2.0.
+cli = ["dep:clap", "dep:clap_complete", "dep:clap_mangen"]
 
 [dependencies]
 am-fs-core = { path = "../rust-fs-core", version = "0.2.13" }
@@ -37,6 +55,16 @@ ruzstd = "0.8"
 # LZ4/LZMA/DEFLATE cost on every block-level read of a multi-block
 # compressed inode. MIT licensed; pure-Rust; no proc-macro deps.
 lru = "0.12"
+# The command-line tools' argument parser, behind the `cli` feature (see
+# the `rust-fs-erofs` target above). No derive: the builder API keeps each
+# tool's command a function the man pages and completions can be made from.
+clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
+# Shell completions and man pages, generated from the same clap commands by
+# the binary itself (`rust-fs-erofs generate ...`) when a release is
+# packaged, so the documentation cannot describe a flag the program does not
+# take. Both MIT/Apache-2.0, both behind `cli`.
+clap_complete = { version = "4.5", optional = true }
+clap_mangen = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # The test suite's one way in to a fixture, to an erofs-utils tool and to
@@ -46,10 +74,6 @@ lru = "0.12"
 fs-erofs-test-support = { path = "tests/support" }
 lz4_flex = { version = "0.11", features = ["safe-encode"] }
 tempfile = "3"
-# CLI integration tests use `Command::cargo_bin("mkfs_erofs")` to spawn
-# the just-built binary. MIT/Apache-2.0; no proc-macro deps that would
-# pull GPL'd code into the test build.
-assert_cmd = "2"
 # YAML parser for tests/ci_profile.rs, which reads .github/workflows/ci.yml
 # and refuses if the debug run that lets the PR gate see an arithmetic
 # overflow has been removed or disabled. That guard hand-rolled its own
