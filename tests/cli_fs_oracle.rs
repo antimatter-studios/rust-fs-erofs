@@ -206,11 +206,12 @@ fn a_damaged_image_is_refused_by_fsck_erofs_and_by_the_tool() {
         "the image carries no superblock checksum: {get}"
     );
     // A byte of the superblock's UUID changed, so the CRC32C over it no
-    // longer matches; and the image cut in half.
+    // longer matches; and the image cut after its first block, before the
+    // inodes. (Cut inside the file data instead, fsck.erofs accepts it,
+    // with or without --extract: it never reads past what it can check.)
     let mut bad_checksum = bytes.clone();
     bad_checksum[1024 + 0x30] ^= 0xFF;
-    let mut cut = bytes.clone();
-    cut.truncate(bytes.len() / 2);
+    let cut = bytes[..4096].to_vec();
     let scratch = scratch("oracle-damaged");
     for (what, bytes) in [
         ("a bad superblock checksum", bad_checksum),
@@ -219,11 +220,18 @@ fn a_damaged_image_is_refused_by_fsck_erofs_and_by_the_tool() {
         let path = scratch.join(format!("{}.img", what.replace(' ', "-")));
         std::fs::write(&path, bytes).unwrap();
         let path = path.display().to_string();
+        // fsck.erofs's verdict is its report, not its status: for a bad
+        // superblock checksum it prints "failed to verify superblock
+        // checksum" and still exits 0 (measured with 1.9.1 in the guest
+        // and 1.9.4 on a Mac). So a refusal is either.
         let theirs = oracle("fsck.erofs").arg(&path).output();
+        let refused = !theirs.status.success()
+            || stderr(&theirs).contains("failed to verify superblock checksum");
         assert!(
-            !theirs.status.success(),
-            "fsck.erofs accepted {what}:\n{}",
-            stdout(&theirs)
+            refused,
+            "fsck.erofs accepted {what}:\n{}{}",
+            stdout(&theirs),
+            stderr(&theirs)
         );
         let ours = tool("fs.erofs")
             .args([&path, "read", "/big"])
