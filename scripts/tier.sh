@@ -62,6 +62,25 @@ mkdir -p "$REPO/tmp"
 cp "$CORE_DIR/scripts/output-budget.sh" "$BUDGET"
 trap 'rm -f "$BUDGET"' EXIT
 
+# THE CONTRACT IS `--version`, AND A WRONG ANSWER IS FATAL (#131). Existing is
+# not enough: a core too old or too new, or a half-finished edit in the
+# developer's own ../rust-fs-core, is still a file at that path, and it would
+# be trusted with deciding whether every tier passed. Asked of the COPY, so
+# what is checked is what runs. Never a fall-through to another candidate --
+# "core is broken" reported as "core is missing", or as a green tier, is the
+# quieter and more confusing failure. Deliberately not a SHA-256 pin: one
+# digest pinned across the family is the lockstep that made a comment in
+# core break every consumer.
+WANT_VERSION="rust-fs-core-output-budget 1"
+got_version="$(bash "$BUDGET" --version 2>/dev/null || true)"
+if [ "$got_version" != "$WANT_VERSION" ]; then
+    echo "tier.sh: $CORE_DIR/scripts/output-budget.sh answered --version with" >&2
+    echo "         '${got_version:-nothing}', not '$WANT_VERSION'. That is not the" >&2
+    echo "         wrapper this repository is written against; move ../rust-fs-core" >&2
+    echo "         to the ref chores.yml pins ('chore siblings')." >&2
+    exit 1
+fi
+
 [ $# -ge 5 ] || { echo "tier.sh: usage: tier.sh LABEL LOG MAX-LINES MAX-BYTES -- CMD..." >&2; exit 2; }
 LABEL="$1"; LOG_NAME="$2"; MAX_LINES="$3"; MAX_BYTES="$4"; shift 4
 [ "${1:-}" = "--" ] && shift
