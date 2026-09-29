@@ -1,0 +1,3 @@
+erofs-utils also installs mkfs.erofs. To make ours the default: brew unlink erofs-utils
+The reference stays at $(brew --prefix erofs-utils)/bin/mkfs.erofs.
+Run `rust-fs-erofs doctor` if a tool behaves unexpectedly.

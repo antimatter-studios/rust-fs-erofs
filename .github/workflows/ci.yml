@@ -31,9 +31,12 @@ name: CI
 #                tools built in release mode, staged under every name first
 #                on PATH, and tested AS INSTALLED -- `rust-fs-erofs doctor`
 #                first, then tests/cli/*.sh. A change that breaks a tool
-#                fails the pull request, not the release. No VM here: what
-#                erofs-utils and the kernel make of the tools' images is
-#                judged in the oracle and kernel tiers, in the `test` job.
+#                fails the pull request, not the release. Then the release
+#                tarball is packaged from the same build and its layout
+#                checked by scripts/package-cli.sh, so a release is not the
+#                first time it is put together. No VM here: what erofs-utils
+#                and the kernel make of the tools' images is judged in the
+#                oracle and kernel tiers, in the `test` job.
 #   ci-ok        the one required check: green only when every job above
 #                ran and succeeded (failed, cancelled OR skipped fails it).
 #
@@ -339,6 +342,16 @@ jobs:
       - name: chore test:cli
         id: tier
         run: chore test:cli
+      # The tarball release.yml attaches, from the build the tier just
+      # tested: bin/, the man pages, the completions, CAVEATS and LICENSE,
+      # each dotted name a relative symlink answering for this version.
+      - name: The release tarball, packaged and its layout checked
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          mkdir -p tmp/package
+          cd tmp/package
+          ../../scripts/package-cli.sh "$version" linux-x86_64
       - name: Keep the tier logs
         # Not before the tier ran: there is no log then, and this step's red
         # would hide the real one.

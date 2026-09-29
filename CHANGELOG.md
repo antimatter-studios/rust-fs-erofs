@@ -26,6 +26,15 @@ never does.
   what wins and the fix.
 - A `cli` tier (`chore cli:install`, `chore test:cli`) tests the tools as
   installed, doctor first, and a `cli` CI job runs it on every pull request.
+- **Release tarballs of the tools**, `am-fs-erofs-<version>-<platform>.tar.gz`
+  for `darwin-arm64` and `linux-x86_64`, attached to the GitHub release for
+  the tag with a build-provenance attestation. Each is an install prefix:
+  `bin/rust-fs-erofs` with `mkfs.erofs` and `fs.erofs` as relative symlinks
+  to it, man pages (section 8 for `mkfs.erofs`, 1 for the rest), zsh, bash
+  and fish completions, `share/rust-fs-erofs/CAVEATS` and `LICENSE`. The
+  binary writes its own man pages and completions (`rust-fs-erofs generate`),
+  so they cannot describe a flag it does not take, and the `cli` CI job
+  packages and checks the tarball on every pull request.
 
 - Releases carry a build-provenance attestation: the published `.crate` is
   attached to the GitHub release for its tag, checked first against the

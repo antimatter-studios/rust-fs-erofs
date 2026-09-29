@@ -112,15 +112,16 @@ chore_min_version: 0.10.0
 #                                                   repository does not control
 #     scripts     3 l /     77 B   30 l /  2,000 B  one shell test today, and
 #                                                   the glob picks up the next
-#     cli        16 l /    604 B   28 l /  1,000 B  the installed tools, no cargo
-#               114 checks                          output at all: 16 lines on a
+#     cli        19 l /    683 B   28 l /  1,000 B  the installed tools, no cargo
+#               137 checks                          output at all: 19 lines on a
 #                                                   Mac with erofs-utils linked
 #                                                   (doctor names it as not run),
 #                                                   one fewer on a runner without
 #                                                   it. Every file is three lines
 #                                                   when it passes, so a new one
 #                                                   is a visible step. Was 12 l /
-#                                                   466 B with mkfs.erofs alone
+#                                                   466 B with mkfs.erofs alone,
+#                                                   16 l / 604 B before the docs
 #     gsi         NOT MEASURED     150 l / 12,000 B  #133: the pinned GSI's
 #                                                   system.img is ext4, not
 #                                                   EROFS, so this tier cannot
@@ -541,11 +542,12 @@ tasks:
     # BUDGET, measured: see the table at the top of this file.
     # FLOOR: each file prints a `test result: ok. N passed` line, which
     # test-floor.sh sums as it does cargo's. 66 checks executed when the
-    # tier was added (mkfs.erofs and the names), 114 with fs.erofs; the
-    # floor is about 95% of that, and it only goes up.
+    # tier was added (mkfs.erofs and the names), 114 with fs.erofs, 137
+    # with the man pages and completions; the floor is about 95% of that,
+    # and it only goes up.
     cmds:
       - 'scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh'
-      - 'scripts/test-floor.sh cli 108'
+      - 'scripts/test-floor.sh cli 130'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
