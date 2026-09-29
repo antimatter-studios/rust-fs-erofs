@@ -311,6 +311,10 @@ tasks:
   # the numbers to raise them to are in the next run's log; raising one
   # is a deliberate change, and a floor only ever goes up.
   #
+  # THE SAME CALL IS THE SKIP GATE (#129): a tier whose log reports any
+  # test `ignored` fails, whatever it executed, naming the tests.
+  # tests/scripts/skip-gate.sh proves it refuses one.
+  #
   # `scripts` has none: it prints a PASS line per shell test rather than
   # cargo's result lines, so the counter here would read zero for a tier
   # that ran everything.

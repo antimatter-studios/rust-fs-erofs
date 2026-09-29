@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-floor.sh TIER FLOOR  — the tier ran at least FLOOR tests
+# test-floor.sh TIER FLOOR  — the tier ran at least FLOOR tests, and ignored none
 #
 # THE FAILURE A BUDGET CANNOT SEE. scripts/tier.sh fails a tier that
 # PRINTS more than it is allowed to; nothing fails a tier that prints
@@ -27,6 +27,21 @@ LOG="$REPO/tmp/logs/$TIER.log"
 
 if [ ! -f "$LOG" ]; then
     echo "test-floor.sh: $LOG is missing -- the $TIER tier did not run." >&2
+    exit 1
+fi
+
+# THE SKIP GATE (#129). A test that decided not to run is not a test that
+# passed, and nothing else in a tier says so: `#[ignore]` leaves
+# `N passed; 0 failed; 1 ignored` behind and cargo exits 0. So any ignored
+# test fails the tier, whatever the floor, naming the tests when libtest
+# printed their names. This repository has no `#[ignore]` anywhere; a test
+# that cannot run fails, naming the task that provides what it needs.
+ignored="$(awk '/^test result: / { for (i = 1; i < NF; i++) if ($(i + 1) ~ /^ignored/) sum += $i } END { print sum + 0 }' "$LOG")"
+if [ "$ignored" -gt 0 ]; then
+    echo "::error::$ignored tests ignored in the $TIER tier"
+    echo "test-floor.sh: the $TIER tier ignored $ignored tests. A skipped test reads" >&2
+    echo "               exactly like a passing one; nothing here skips." >&2
+    grep -E '^test .* \.\.\. ignored' "$LOG" | sed 's/^/                 /' >&2 || true
     exit 1
 fi
 
