@@ -6,6 +6,13 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- Releases carry a build-provenance attestation: the published `.crate` is
+  attached to the GitHub release for its tag, checked first against the
+  crates.io checksum, and verifiable with `gh attestation verify` (see the
+  README, "Verifying a release").
+
 ### Fixed
 
 - **Deduplicated images read in full (#125).** `mkfs.erofs -Ededupe`
