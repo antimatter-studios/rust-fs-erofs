@@ -44,7 +44,10 @@ fn every_image_the_tool_builds_passes_fsck_erofs_and_dump_erofs_agrees_with_its_
     write_tree(&src, &borrowed);
     let src = src.display().to_string();
 
-    for bs in ["512", "4096", "65536"] {
+    // Up to the guest's page size and no further: erofs-utils refuses a
+    // larger block ("blksize 65536 isn't supported on this platform") on
+    // the x86_64 guest, whatever wrote the image.
+    for bs in ["512", "1024", "4096"] {
         let img = image_path(&format!("oracle-b{bs}"));
         let report = stdout(&ok(tool("mkfs.erofs").args(["-q", "-b", bs, &img, &src])));
         assert_fsck_clean(&img, &format!("mkfs.erofs -b {bs}"));
