@@ -4,6 +4,34 @@ Notable changes to `am-fs-erofs`, newest first. This is a `0.x` crate, so the
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
 
+## [Unreleased]
+
+### Fixed
+
+- **Deduplicated images read in full (#125).** `mkfs.erofs -Ededupe`
+  reuses the start of a pcluster another extent already wrote, and marks
+  the extent's head `Z_EROFS_LI_PARTIAL_REF` when it needs fewer bytes
+  than the pcluster decodes to. Every pcluster was decoded to exactly its
+  extent's length, which a reused one does not have, so LZ4 and LZMA
+  refused between 2 and 15 of 40 files in `-Efragments,dedupe`,
+  `-Efragments,ztailpacking,dedupe` and `-Eall-fragments,dedupe` images.
+  Such an extent is now decoded as a prefix, as the kernel does, and only
+  such an extent: anywhere else a frame longer than its extent is still
+  refused. Checked against the files' own bytes and, for LZ4, against
+  the Linux driver's reading of the same images.
+
+### Changed
+
+- **The file in an `-Eall-fragments,ztailpacking` inline tail is refused
+  rather than read (#125).** erofs-utils 1.9.1 writes that tail so that
+  no reader following the format gets the file back: the Linux 6.1
+  driver, `fsck.erofs --extract` and this crate all read it differently
+  from its source, this crate by returning zeros for its missing end.
+  Reading those bytes now fails with an error naming the shape. Bytes of
+  the same file before the tail, and every other file in the image,
+  still read. The README's support table says so, as does the crate
+  description.
+
 ## [0.2.0] — 2026-09-27
 
 ### Breaking

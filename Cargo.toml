@@ -3,7 +3,7 @@ name = "am-fs-erofs"
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "Pure-Rust EROFS (Enhanced Read-Only File System) reader and writer. Clean-room implementation; reads everything mkfs.erofs 1.9 emits (LZ4/LZMA/DEFLATE/ZSTD, compacted-2B, ztailpacking, fragments, big_pcluster) and produces fsck.erofs-clean output."
+description = "Pure-Rust EROFS (Enhanced Read-Only File System) reader and writer. Clean-room implementation; reads mkfs.erofs 1.9 images (LZ4/LZMA/DEFLATE/ZSTD, compacted-2B, ztailpacking, fragments, dedupe, big_pcluster), and refuses rather than misreads the shapes it cannot vouch for and produces fsck.erofs-clean output."
 repository = "https://github.com/antimatter-studios/rust-fs-erofs"
 
 # The fuzz crate is its own package, on its own toolchain, and is not

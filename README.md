@@ -32,7 +32,8 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 | `BIG_PCLUSTER_1` / `BIG_PCLUSTER_2` (multi-block pclusters) | ✅ |
 | `FRAGMENT_PCLUSTER` (cross-file packed-tail dedup) | ✅ |
 | `INTERLACED_PCLUSTER` (rotate-and-paste PLAIN) | ✅ |
-| `INLINE_PCLUSTER` (ztailpacking — last pcluster in metadata) | ✅ |
+| `INLINE_PCLUSTER` (ztailpacking — last pcluster in metadata) | ✅ (except the `-Eall-fragments,ztailpacking` tail below) |
+| `DEDUPE` (`-Ededupe`, partial-reference extents) | ✅ where `fsck.erofs` accepts the image; see below |
 | `HEAD2` separate-algorithm dispatch | ✅ |
 | `COMPR_CFGS` blob (LZMA dict_size etc.) | ✅ |
 | Multi-lcluster pcluster spans | ✅ |
@@ -78,6 +79,8 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 | Any other unknown `feature_incompat` bit | Refused at open (`EROFS_FEATURE_INCOMPAT_SUPPORTED`) | n/a |
 | **Mutate an existing EROFS image in place** | EROFS is read-only by spec — no journal, no allocator, no rewrite path | See "Read-write semantics" below |
 | **Verified boot / dm-verity hash trees** | Layer above EROFS, out of scope | Use `verity` tools alongside |
+| **The file in an `-Eall-fragments,ztailpacking` inline tail** | erofs-utils 1.9.1 stores that tail's bytes unrotated but marks it interlaced, so by the format's reading they run past the inline data; the Linux 6.1 driver and `fsck.erofs --extract` read the file wrong too. Reading it is **refused** with an error; the rest of the image reads | Build with `-Efragments,ztailpacking` or `-Eall-fragments` |
+| **`-Ededupe` / `-Eztailpacking,dedupe` without fragments, from erofs-utils 1.9.1** | That mkfs writes directory entries naming inodes that do not exist: `fsck.erofs` rejects the image and the kernel answers `Structure needs cleaning`. The affected lookups **fail**; nothing reads as another file's bytes | Add `-Efragments` (`-Efragments,dedupe` images are clean and read in full) |
 | **ZSTD WRITER** | Reading `-zzstd` images works; our writer emits LZ4 / LZMA / DEFLATE only | Use `mkfs.erofs -zzstd` to produce one |
 
 ## Use cases
