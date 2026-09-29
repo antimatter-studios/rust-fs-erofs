@@ -1280,6 +1280,431 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
     );
 }
 
+// --- THE CROSS-VALIDATION GATE (#124) --------------------------------
+//
+// The only check here that is not this crate marking its own homework is
+// the one where an independent tool reads what the writer wrote. It used
+// to be a job of its own, `validate mkfs_erofs (fsck.erofs strict)`; the
+// harness migration (#134) folded it into the `oracle` tier, which `jobs.
+// test` reaches through `chore test`. Nothing asserted that it still does.
+// A job given an `if:`, a step given `continue-on-error:`, a tier command
+// given `ignore_error:` or a `--skip`, a harness that stopped provisioning
+// the tool: each leaves a green check whose name still reads like
+// cross-validation while nothing is cross-validated. An executed-test
+// floor cannot see that when the tier still runs its other tests, and a
+// required check cannot see it at all.
+//
+// So the three facts are asserted separately, because they fail
+// separately: the path GATES a merge, the job PROVIDES the tool, and what
+// runs HANDS THE WRITER'S OUTPUT TO fsck.erofs.
+
+/// The chore tasks one `run:` or `cmd:` hands to chore: `chore <task>`,
+/// and the `"{{.CHORE_EXE}}" <task>` spelling one task uses to run
+/// another, which is how `test` reaches `test:native`.
+fn chore_tasks_in(script: &str) -> Vec<String> {
+    let mut found = chore_invocations(script);
+    for line in script.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((_, rest)) = line.split_once("{{.CHORE_EXE}}") else {
+            continue;
+        };
+        let rest = rest.trim_start_matches(['"', '\'']);
+        if let Some(task) = rest.split_whitespace().find(|w| !w.starts_with('-')) {
+            found.push(task.trim_matches(['"', '\'']).to_string());
+        }
+    }
+    found
+}
+
+/// Every shell command chore runs, and can neither skip nor discard, when
+/// asked for `task` -- following `task:` items and nested chore calls.
+/// A task that does not exist contributes nothing: `chore` fails on it,
+/// so nothing runs, and the guards below then report the path missing.
+fn gating_chore_commands(
+    tasks: &std::collections::BTreeMap<String, ChoreTask>,
+    task: &str,
+    path: &mut Vec<String>,
+) -> Vec<String> {
+    if path.iter().any(|on_path| on_path == task) {
+        return Vec::new();
+    }
+    let Some(body) = tasks.get(task) else {
+        return Vec::new();
+    };
+    if carries_any(&body.keys, &NON_GATING_TASK_KEYS) {
+        return Vec::new();
+    }
+    path.push(task.to_string());
+    let mut out = Vec::new();
+    for cmd in &body.cmds {
+        match cmd {
+            ChoreCmd::Shell { keys, command } if !carries_any(keys, &NON_GATING_CMD_KEYS) => {
+                out.push(command.clone());
+                for next in chore_tasks_in(command) {
+                    out.extend(gating_chore_commands(tasks, &next, path));
+                }
+            }
+            ChoreCmd::Task { keys, name } if !carries_any(keys, &NON_GATING_CMD_KEYS) => {
+                out.extend(gating_chore_commands(tasks, name, path));
+            }
+            _ => {}
+        }
+    }
+    path.pop();
+    out
+}
+
+/// The `scripts/test-targets.sh` selection a command runs the suite
+/// over, if it runs one in full. A `--skip` narrows the run to less than
+/// the selection, so a command carrying one does not count: `--skip
+/// fsck` would keep every file selected and every writer check gone.
+fn full_suite_selection(command: &str) -> Option<String> {
+    if !(command.contains("scripts/test.sh") || command.contains("cargo test")) {
+        return None;
+    }
+    if command.contains("--skip") {
+        return None;
+    }
+    let (_, rest) = command.split_once("test-targets.sh ")?;
+    let selection: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    (!selection.is_empty()).then_some(selection)
+}
+
+/// One way a pull request reaches the writer's cross-validation: the job,
+/// the index of the step, and the command at the end of the path.
+#[derive(Debug)]
+struct CrossValidationPath {
+    job: String,
+    step: usize,
+    command: String,
+}
+
+/// Every path by which `workflow`, on a pull request, runs a selection
+/// that `selects_writer` says holds the writer's cross-validation --
+/// through jobs and steps that carry no `if:` or `continue-on-error:`,
+/// and chore tasks and commands that carry no key letting them be skipped
+/// or fail quietly.
+fn cross_validation_paths(
+    workflow: &str,
+    chores: &str,
+    selects_writer: &dyn Fn(&str) -> bool,
+) -> Vec<CrossValidationPath> {
+    if !runs_on_pull_request(&parse_workflow(workflow)) {
+        return Vec::new();
+    }
+    let tasks = parse_chores(chores);
+    let documents = Yaml::load_from_str(workflow).expect("workflow is valid YAML");
+    let Some(jobs) = documents
+        .first()
+        .and_then(|document| field(document, "jobs"))
+        .and_then(Yaml::as_mapping)
+    else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for (name, body) in jobs.iter() {
+        let Some(name) = name.as_str() else { continue };
+        if carries_a_non_gating_key(&keys_of(body)) {
+            continue;
+        }
+        let steps = field(body, "steps")
+            .and_then(Yaml::as_sequence)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for (at, step) in steps.iter().enumerate() {
+            if carries_a_non_gating_key(&keys_of(step)) {
+                continue;
+            }
+            for task in chore_invocations(run_of(step)) {
+                for command in gating_chore_commands(&tasks, &task, &mut Vec::new()) {
+                    if full_suite_selection(&command).is_some_and(|s| selects_writer(&s)) {
+                        paths.push(CrossValidationPath {
+                            job: name.to_string(),
+                            step: at,
+                            command,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// The test file whose tests build an image with this crate's writer and
+/// hand it to `fsck.erofs`.
+const WRITER_CROSS_VALIDATION: &str = "oracle_writer";
+
+/// Whether `scripts/test-targets.sh <selection>` selects
+/// [`WRITER_CROSS_VALIDATION`], asked of the real script: the selection
+/// is derived from the tests by grep, so only running it answers.
+fn real_selection_holds_writer(selection: &str) -> bool {
+    let out = std::process::Command::new("bash")
+        .arg(manifest_dir().join("scripts/test-targets.sh"))
+        .arg(selection)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run scripts/test-targets.sh {selection}: {e}"));
+    assert!(
+        out.status.success(),
+        "scripts/test-targets.sh {selection} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.trim() == WRITER_CROSS_VALIDATION)
+}
+
+fn real_cross_validation_paths() -> Vec<CrossValidationPath> {
+    let workflow = read_or_panic(&workflow_path("ci.yml"));
+    let chores = read_or_panic(&manifest_dir().join("chores.yml"));
+    cross_validation_paths(&workflow, &chores, &real_selection_holds_writer)
+}
+
+/// FACT ONE: what runs hands the writer's output to `fsck.erofs`.
+///
+/// The pull-request gate reaches, unconditionally, a full run of a
+/// selection holding `tests/oracle_writer.rs`; that file still builds
+/// images with `mkfs::build_image` and runs `fsck.erofs` over them; and
+/// the `oracle` tier, the one that exists to run it, still has a floor.
+#[test]
+fn the_pr_gate_still_hands_the_writers_images_to_fsck_erofs() {
+    let paths = real_cross_validation_paths();
+    assert!(
+        !paths.is_empty(),
+        "no step of ci.yml that gates a pull request reaches a full run of a \
+         scripts/test-targets.sh selection holding tests/{WRITER_CROSS_VALIDATION}.rs. \
+         Something on the path from a job to `chore test:oracle` became conditional \
+         (`if:`), allowed to fail (`continue-on-error:`, `ignore_error:`), skippable as \
+         up to date (`sources:`), or narrowed with `--skip`; or the selection stopped \
+         holding that file."
+    );
+
+    let writer = read_or_panic(
+        &manifest_dir()
+            .join("tests")
+            .join(format!("{WRITER_CROSS_VALIDATION}.rs")),
+    );
+    let invokes_fsck = ["oracle", "(\"fsck.erofs\")"].concat();
+    assert!(
+        writer.contains("mkfs::build_image(") && writer.contains(&invokes_fsck),
+        "tests/{WRITER_CROSS_VALIDATION}.rs must build images with this crate's writer \
+         (mkfs::build_image) and run fsck.erofs over them through the oracle helper"
+    );
+    assert!(
+        writer.matches("#[test]").count() >= 5,
+        "tests/{WRITER_CROSS_VALIDATION}.rs has almost no tests left"
+    );
+
+    let chores = parse_chores(&read_or_panic(&manifest_dir().join("chores.yml")));
+    let floor = gating_chore_commands(&chores, "test:oracle", &mut Vec::new())
+        .iter()
+        .find_map(|c| {
+            c.trim()
+                .strip_prefix("scripts/test-floor.sh oracle ")
+                .and_then(|n| n.trim().parse::<u32>().ok())
+        });
+    assert!(
+        floor.is_some_and(|n| n > 0),
+        "chores.yml `test:oracle` must end in `scripts/test-floor.sh oracle N` with N > 0, \
+         so the tier cannot go green having run nothing; found {floor:?}"
+    );
+}
+
+/// FACT TWO: the job that runs it gates the merge.
+///
+/// A path above is only a gate if its job is one the required check
+/// waits for: `ci-ok` must need it and run `if: always()`, and
+/// `.github-guard` must require `ci-ok`.
+#[test]
+fn the_job_that_cross_validates_against_fsck_erofs_gates_the_merge() {
+    let paths = real_cross_validation_paths();
+    let path = workflow_path("ci.yml");
+    let text = read_or_panic(&path);
+    let document = load_document(&text, &path);
+    let ci_ok = job(&document, "ci-ok", &path);
+    let needed = needs_of(ci_ok);
+    assert!(
+        paths.iter().any(|p| needed.contains(&p.job)),
+        "no job that cross-validates against fsck.erofs is in ci-ok's needs: \
+         paths {:?}, ci-ok needs {needed:?}",
+        paths
+            .iter()
+            .map(|p| format!("jobs.{} step {} runs {}", p.job, p.step, p.command))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field(ci_ok, "if").and_then(Yaml::as_str),
+        Some("always()"),
+        "jobs.ci-ok must run `if: always()`: a failed cross-validation job would \
+         otherwise skip it, and a skipped required check never reports"
+    );
+    let guard = read_or_panic(&manifest_dir().join(".github-guard"));
+    let required: Vec<&str> = guard
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("required"))
+        .filter_map(|l| l.trim_start().strip_prefix('='))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        required,
+        vec!["ci-ok"],
+        ".github-guard must require ci-ok, the check that stands for the \
+         cross-validation job"
+    );
+}
+
+/// FACT THREE: the job provides the tool.
+///
+/// `fsck.erofs` lives in the fs-linux-test-harness VM and nowhere else.
+/// So the job must set the VM host up before the step that runs the
+/// tier; the harness must be told to provision the guest with
+/// `scripts/vm-setup.sh`; and that script must build a `fsck.erofs`
+/// that accepts what `mkfs.erofs` wrote, and say which version it is.
+#[test]
+fn the_job_that_cross_validates_against_fsck_erofs_provides_the_tool() {
+    let paths = real_cross_validation_paths();
+    let path = workflow_path("ci.yml");
+    let text = read_or_panic(&path);
+    let document = load_document(&text, &path);
+    let provided = paths.iter().any(|p| {
+        let steps = steps_of(job(&document, &p.job, &path), &p.job);
+        steps[..p.step].iter().any(|step| {
+            !carries_a_non_gating_key(&keys_of(step)) && run_of(step).contains("ci-setup-linux.sh")
+        })
+    });
+    assert!(
+        provided,
+        "no job that cross-validates against fsck.erofs sets up the VM host \
+         (the harness's ci-setup-linux.sh) before the step that runs the tier: \
+         {paths:?}"
+    );
+
+    let harness = read_or_panic(&manifest_dir().join("fs-linux-test-harness.toml"));
+    let mut section = "";
+    let mut setup = None;
+    for line in harness.lines().map(str::trim) {
+        if line.starts_with('[') {
+            section = line;
+        } else if section == "[setup]" {
+            if let Some(v) = line.strip_prefix("script") {
+                setup = v
+                    .trim_start()
+                    .strip_prefix('=')
+                    .map(|v| v.trim().trim_matches('"'));
+            }
+        }
+    }
+    assert_eq!(
+        setup,
+        Some("scripts/vm-setup.sh"),
+        "fs-linux-test-harness.toml [setup] script must be scripts/vm-setup.sh, which \
+         builds the oracle tools in the guest"
+    );
+    let vm_setup = read_or_panic(&manifest_dir().join("scripts/vm-setup.sh"));
+    let checker = ["fsck", ".erofs"].concat();
+    assert!(
+        vm_setup.contains(&format!("{checker} \"$probe/out.img\""))
+            && vm_setup.contains(&format!("{checker} --version")),
+        "scripts/vm-setup.sh must run {checker} over an image mkfs.erofs just wrote, \
+         and print its version, so a guest without a working checker fails provisioning"
+    );
+}
+
+mod cross_validation_paths_rules {
+    use super::cross_validation_paths;
+
+    const CHORES: &str = "version: '3'\ntasks:\n  test:\n    cmds:\n      - task: test:oracle\n  \
+                          test:oracle:\n    cmds:\n      - 'scripts/tier.sh test:oracle oracle 1 1 -- \
+                          scripts/test.sh --locked --release $(scripts/test-targets.sh oracle)'\n      \
+                          - 'scripts/test-floor.sh oracle 80'\n";
+
+    fn workflow(job_keys: &str, step_keys: &str) -> String {
+        format!(
+            "on:\n  pull_request:\njobs:\n  test:\n{job_keys}    runs-on: ubuntu-24.04\n    \
+             steps:\n      - run: chore test\n{step_keys}"
+        )
+    }
+
+    fn found(workflow: &str, chores: &str) -> usize {
+        cross_validation_paths(workflow, chores, &|s| s == "oracle").len()
+    }
+
+    #[test]
+    fn the_plain_path_is_found() {
+        assert_eq!(found(&workflow("", ""), CHORES), 1);
+    }
+
+    #[test]
+    fn a_conditional_job_is_not_a_gate() {
+        assert_eq!(found(&workflow("    if: false\n", ""), CHORES), 0);
+    }
+
+    #[test]
+    fn a_step_allowed_to_fail_is_not_a_gate() {
+        assert_eq!(
+            found(&workflow("", "        continue-on-error: true\n"), CHORES),
+            0
+        );
+    }
+
+    #[test]
+    fn a_workflow_that_does_not_run_on_pull_requests_is_not_a_gate() {
+        let wf = workflow("", "").replace("pull_request:", "push:");
+        assert_eq!(found(&wf, CHORES), 0);
+    }
+
+    #[test]
+    fn an_ignored_tier_command_is_not_a_gate() {
+        let chores = CHORES.replace(
+            "      - 'scripts/tier.sh",
+            "      - ignore_error: true\n        cmd: 'scripts/tier.sh",
+        );
+        assert_eq!(found(&workflow("", ""), &chores), 0);
+    }
+
+    #[test]
+    fn a_task_that_can_be_up_to_date_is_not_a_gate() {
+        let chores = CHORES.replace(
+            "  test:oracle:\n",
+            "  test:oracle:\n    sources: ['Cargo.toml']\n",
+        );
+        assert_eq!(found(&workflow("", ""), &chores), 0);
+    }
+
+    #[test]
+    fn a_run_narrowed_with_skip_is_not_a_gate() {
+        let chores = CHORES.replace(
+            "test-targets.sh oracle)'",
+            "test-targets.sh oracle) -- --skip fsck'",
+        );
+        assert_eq!(found(&workflow("", ""), &chores), 0);
+    }
+
+    #[test]
+    fn a_selection_without_the_writer_is_not_a_gate() {
+        let chores = CHORES.replace("test-targets.sh oracle)", "test-targets.sh images)");
+        assert_eq!(found(&workflow("", ""), &chores), 0);
+    }
+
+    /// `test` reaches `test:native` through `"{{.CHORE_EXE}}"`, not a
+    /// `task:` item, and the path must still be followed.
+    #[test]
+    fn a_nested_chore_call_is_followed() {
+        let chores = CHORES.replace(
+            "      - task: test:oracle\n",
+            "      - |\n        \"{{.CHORE_EXE}}\" test:oracle\n",
+        );
+        assert_eq!(found(&workflow("", ""), &chores), 1);
+    }
+}
+
 /// THE SHIPPING GATE runs the same chore tasks as the pull-request gate,
 /// in one job: `ubuntu-latest` is x86_64 with KVM, so it builds the
 /// fixtures itself through the harness VM -- `ci-setup-linux.sh`, then
