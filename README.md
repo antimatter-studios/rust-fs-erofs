@@ -318,6 +318,17 @@ The workflow refuses to attest a `.crate` whose sha256 differs from the
 checksum crates.io records for that version, so the file on the release
 page and the crates.io download are the same bytes.
 
+The command-line tools ride the same release, at the same version:
+`am-fs-erofs-X.Y.Z-darwin-arm64.tar.gz` and `-linux-x86_64.tar.gz`, each an
+install prefix (`bin/`, `share/man/`, the shell completions,
+`share/rust-fs-erofs/CAVEATS`, `LICENSE`) and each attested the same way:
+
+```sh
+gh attestation verify am-fs-erofs-X.Y.Z-darwin-arm64.tar.gz \
+  --repo antimatter-studios/rust-fs-erofs \
+  --signer-workflow antimatter-studios/rust-fs-erofs/.github/workflows/release.yml
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

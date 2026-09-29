@@ -70,6 +70,138 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  # THE COMMAND-LINE TOOLS, as a downloadable install prefix, riding the
+  # library's release at the same version: one tag, one version, one
+  # CHANGELOG, and nothing to say a binary wraps another library than the
+  # crate it names.
+  #
+  # scripts/package-cli.sh stages bin/rust-fs-erofs with each dotted name a
+  # relative symlink to it (cargo refuses a dot in a target name, so the
+  # dotted names are made here and no build-system name reaches the
+  # artifact), the man pages and completions the binary writes itself,
+  # share/rust-fs-erofs/CAVEATS and LICENSE -- and then checks it: the
+  # layout exactly, every name a symlink that answers --help and reports
+  # `<tool> (am-fs-erofs) <tag's version>`. A tarball whose tools will not
+  # run is worse than no tarball. The `cli` job in ci.yml runs the same
+  # script on every pull request, so a release is not the first time it is
+  # put together.
+  #
+  # Native builds, one runner per platform, and READ-ONLY: a leg uploads its
+  # tarball as a workflow artifact, and `release-cli` publishes them
+  # together once every leg has passed.
+  package-cli:
+    name: package the tools (${{ matrix.label }})
+    needs: [test]
+    strategy:
+      # One platform failing should not hide whether the other built.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            label: darwin-arm64
+          - runner: ubuntu-latest
+            label: linux-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # The path dependency, at the ref chores.yml pins, read from there
+      # rather than restated.
+      - name: clone the am-fs-core sibling
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin() { sed -n "s/^  $1: *//p" chores.yml | tr -d '\r'; }
+          git clone --depth 1 --branch "$(pin FS_CORE_REF)" "$(pin FS_CORE_URL)" ../rust-fs-core
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: build the multi-call binary
+        shell: bash
+        run: cargo build --release --locked --features cli --bin rust-fs-erofs
+
+      - name: package and check the tools
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$(scripts/package-cli.sh "${GITHUB_REF_NAME#v}" "${{ matrix.label }}")"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          # The formula needs this to verify the download.
+          {
+            echo "### $tarball"
+            echo ""
+            echo '```'
+            echo "sha256 $(shasum -a 256 "$tarball" | cut -d' ' -f1)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # AN ARTIFACT, NOT THE RELEASE: a leg that published its own asset
+      # would do so whether or not the other leg later failed, leaving a
+      # release with one platform on it.
+      - name: keep the tarball for the release job
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.label }}
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # The tarballs' one privileged job, run once every package-cli leg and the
+  # crates.io publish have passed: after `publish`, so the GitHub release
+  # that job creates for the tag exists and the two never race to create
+  # it. It checks nothing out. It downloads the legs' tarballs, attests
+  # their build provenance, and attaches them. An installer checks a
+  # download with
+  #
+  #   gh attestation verify <tarball> --repo antimatter-studios/rust-fs-erofs \
+  #     --signer-workflow antimatter-studios/rust-fs-erofs/.github/workflows/release.yml
+  release-cli:
+    name: attach the tools to the GitHub release
+    needs: [test, package-cli, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: collect every leg's tarball
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+
+      - name: exactly one tarball per platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(dist/*.tar.gz)
+          if [ "${#tarballs[@]}" -ne 2 ]; then
+            echo "::error::expected 2 tarballs (one per package-cli leg), found ${#tarballs[@]}: ${tarballs[*]}"
+            exit 1
+          fi
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: attach the tarballs to the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --verify-tag --title "$GITHUB_REF_NAME" --notes "See CHANGELOG.md."
+          fi
+
   publish:
     name: publish to crates.io
     needs: test

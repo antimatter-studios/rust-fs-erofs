@@ -1779,17 +1779,17 @@ fn the_release_gate_builds_fixtures_in_the_harness_vm_and_runs_chore_test() {
         }
     }
 
-    // One shipping job today -- the crates.io upload. It is written as a
-    // list because a release workflow grows them (a packaged binary, a
-    // container image) and the rule is the same for each: nothing ships
-    // unless `test` passed.
-    let shipping = "publish";
-    assert!(
-        needs_of(job(&document, shipping, &path))
-            .iter()
-            .any(|n| n == "test"),
-        "release jobs.{shipping} must need jobs.test: nothing ships untested"
-    );
+    // Every shipping job -- the crates.io upload, the command-line
+    // tarballs each platform packages, and the job that attaches them to
+    // the release -- follows one rule: nothing ships unless `test` passed.
+    for shipping in ["publish", "package-cli", "release-cli"] {
+        assert!(
+            needs_of(job(&document, shipping, &path))
+                .iter()
+                .any(|n| n == "test"),
+            "release jobs.{shipping} must need jobs.test: nothing ships untested"
+        );
+    }
 }
 
 /// THE DISTINCTION THIS REPOSITORY NEEDS THAT A PORTED COPY WOULD MISS.
