@@ -95,19 +95,58 @@ pub fn decompress_with_config_and_padding(
     input: &[u8],
     output: &mut [u8],
 ) -> Result<()> {
+    decode(algo, config, zero_padding, false, input, output)
+}
+
+/// Like [`decompress_with_config_and_padding`], but `output` holds only
+/// a PREFIX of what the frame decodes to: decoding stops once `output`
+/// is full, and a frame with more left in it is not an error.
+///
+/// This is the kernel's "partial decoding", and a deduplicated image
+/// needs it. `mkfs.erofs -Ededupe` points an extent at a pcluster some
+/// earlier extent already wrote when the start of that pcluster's data
+/// matches, and marks the extent's HEAD with `Z_EROFS_LI_PARTIAL_REF`
+/// when it uses fewer bytes than the pcluster holds. The extent map says
+/// how many bytes the extent covers; nothing says how many the pcluster
+/// decodes to. A frame that ends BEFORE `output` is full is still
+/// refused: that extent claims bytes the pcluster does not have.
+///
+/// Only an extent that carries the bit may be read this way. Anywhere
+/// else a frame longer than its extent means the extent map and the
+/// data disagree, which the exact-length decoders refuse.
+pub fn decompress_prefix_with_config_and_padding(
+    algo: Algorithm,
+    config: Option<&LzmaCfg>,
+    zero_padding: bool,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
+    decode(algo, config, zero_padding, true, input, output)
+}
+
+fn decode(
+    algo: Algorithm,
+    config: Option<&LzmaCfg>,
+    zero_padding: bool,
+    prefix: bool,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
     match algo {
-        Algorithm::Lz4 => decompress_lz4(input, output, zero_padding),
+        Algorithm::Lz4 => decompress_lz4(input, output, zero_padding, prefix),
         Algorithm::Lzma => {
             let default = LzmaCfg::default();
             let cfg = config.unwrap_or(&default);
-            decompress_lzma(input, output, cfg, zero_padding)
+            decompress_lzma(input, output, cfg, zero_padding, prefix)
         }
+        // DEFLATE already stops when its output is full, and checks only
+        // that it filled it.
         Algorithm::Deflate => decompress_deflate(input, output, zero_padding),
-        Algorithm::Zstd => decompress_zstd(input, output, zero_padding),
+        Algorithm::Zstd => decompress_zstd(input, output, zero_padding, prefix),
     }
 }
 
-fn decompress_lz4(input: &[u8], output: &mut [u8], zero_padding: bool) -> Result<()> {
+fn decompress_lz4(input: &[u8], output: &mut [u8], zero_padding: bool, prefix: bool) -> Result<()> {
     // Empty cluster: nothing to decode. EROFS never emits a zero-byte
     // compressed cluster against a non-empty output, so treat input
     // and output both being empty as a no-op.
@@ -119,12 +158,90 @@ fn decompress_lz4(input: &[u8], output: &mut [u8], zero_padding: bool) -> Result
     } else {
         input
     };
+    if prefix {
+        return lz4_decode_prefix(real_input, output);
+    }
     let written = lz4_flex::block::decompress_into(real_input, output)
         .map_err(|_| Error::BadInode("LZ4 decompression failed"))?;
     // Caller sized `output` to the exact decompressed length; a short
     // write means the compressed payload didn't expand to fill it.
     if written != output.len() {
         return Err(Error::BadInode("LZ4 decompressed size mismatch"));
+    }
+    Ok(())
+}
+
+/// Decode an LZ4 block until `output` is full, and stop there.
+///
+/// `lz4_flex` has no partial mode: it refuses a block that decodes to
+/// more than the buffer it is given, which is exactly the shape a
+/// deduplicated extent has (see
+/// [`decompress_prefix_with_config_and_padding`]). The block format is
+/// small enough to walk here: a token whose high nibble is a literal
+/// length and low nibble a match length less four, each extended by
+/// bytes of 255 while they last, the literals, then a two-byte
+/// little-endian offset back into what has been decoded.
+///
+/// Every length and offset is checked against what exists: a literal
+/// run past the end of the input, an offset of zero or behind the start
+/// of the output, and an input that runs out before `output` is full are
+/// all refused, as `lz4_flex` would refuse them.
+fn lz4_decode_prefix(input: &[u8], output: &mut [u8]) -> Result<()> {
+    const FAILED: Error = Error::BadInode("LZ4 decompression failed");
+    fn length(input: &[u8], ip: &mut usize, mut len: usize) -> Result<usize> {
+        if len != 15 {
+            return Ok(len);
+        }
+        loop {
+            let b = *input.get(*ip).ok_or(FAILED)?;
+            *ip += 1;
+            len = len.checked_add(b as usize).ok_or(FAILED)?;
+            if b != 255 {
+                return Ok(len);
+            }
+        }
+    }
+    let end = output.len();
+    let (mut ip, mut op) = (0usize, 0usize);
+    while op < end {
+        let token = *input.get(ip).ok_or(FAILED)?;
+        ip += 1;
+        let literals = length(input, &mut ip, (token >> 4) as usize)?;
+        let literal_end = ip.checked_add(literals).ok_or(FAILED)?;
+        if literal_end > input.len() {
+            return Err(FAILED);
+        }
+        let take = literals.min(end - op);
+        output[op..op + take].copy_from_slice(&input[ip..ip + take]);
+        op += take;
+        ip = literal_end;
+        if op == end {
+            break;
+        }
+        // Only the last sequence may end after its literals, and this
+        // one has not filled `output`: the extent is longer than the
+        // pcluster's data.
+        let offset = input
+            .get(ip..ip + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+            .ok_or(FAILED)?;
+        ip += 2;
+        if offset == 0 || offset > op {
+            return Err(FAILED);
+        }
+        let matched = length(input, &mut ip, (token & 0x0F) as usize)?
+            .checked_add(4)
+            .ok_or(FAILED)?;
+        let take = matched.min(end - op);
+        if offset >= take {
+            output.copy_within(op - offset..op - offset + take, op);
+        } else {
+            // Overlapping: each byte may be one this match just wrote.
+            for k in op..op + take {
+                output[k] = output[k - offset];
+            }
+        }
+        op += take;
     }
     Ok(())
 }
@@ -301,7 +418,12 @@ fn zstd_window_size(frame: &[u8]) -> Result<u64> {
 /// different length than the extent map says it should is a
 /// disagreement between two parts of the image, and the honest thing to
 /// do with a disagreement is refuse it.
-fn decompress_zstd(input: &[u8], output: &mut [u8], zero_padding: bool) -> Result<()> {
+fn decompress_zstd(
+    input: &[u8],
+    output: &mut [u8],
+    zero_padding: bool,
+    prefix: bool,
+) -> Result<()> {
     if input.is_empty() && output.is_empty() {
         return Ok(());
     }
@@ -341,6 +463,11 @@ fn decompress_zstd(input: &[u8], output: &mut [u8], zero_padding: bool) -> Resul
         }
         filled += n;
     }
+    // A prefix read stops here: the rest of the frame belongs to the
+    // extent that wrote it, not to this one.
+    if prefix {
+        return Ok(());
+    }
     // And the frame must be spent. One more byte read is enough to tell:
     // a frame with anything left over decoded to more than the extent it
     // is supposed to cover.
@@ -357,6 +484,7 @@ fn decompress_lzma(
     output: &mut [u8],
     cfg: &LzmaCfg,
     zero_padding: bool,
+    prefix: bool,
 ) -> Result<()> {
     if input.is_empty() && output.is_empty() {
         return Ok(());
@@ -390,8 +518,11 @@ fn decompress_lzma(
     if try_decompress_lzma_with_header(real_input, output).is_ok() {
         return Ok(());
     }
-    decompress_lzma_no_header(real_input, output, cfg)
+    decompress_lzma_no_header(real_input, output, cfg, prefix)
 }
+
+/// The longest match an LZMA stream can emit, `MATCH_LEN_MAX`.
+const LZMA_MATCH_LEN_MAX: usize = 273;
 
 /// A `Write` sink that refuses to grow past a ceiling.
 ///
@@ -444,8 +575,15 @@ fn try_decompress_lzma_with_header(input: &[u8], output: &mut [u8]) -> Result<()
     Ok(())
 }
 
-fn decompress_lzma_no_header(input: &[u8], output: &mut [u8], cfg: &LzmaCfg) -> Result<()> {
-    let mut framed: Vec<u8> = Vec::with_capacity(13 + input.len());
+fn decompress_lzma_no_header(
+    input: &[u8],
+    output: &mut [u8],
+    cfg: &LzmaCfg,
+    prefix: bool,
+) -> Result<()> {
+    // The properties byte and dictionary size; the unpacked size and the
+    // stream follow, per decode, in `lzma_decode_to`.
+    let mut framed: Vec<u8> = Vec::with_capacity(5);
     // Properties byte = (pb * 5 + lp) * 9 + lc. LZMA1 imposes
     // 0 <= lc <= 8, 0 <= lp <= 4, 0 <= pb <= 4 (so the byte is
     // bounded by 0xE0). Reject out-of-range configs up front so
@@ -456,27 +594,79 @@ fn decompress_lzma_no_header(input: &[u8], output: &mut [u8], cfg: &LzmaCfg) -> 
     let props = (cfg.pb as u16 * 5 + cfg.lp as u16) * 9 + cfg.lc as u16;
     framed.push(props as u8);
     framed.extend_from_slice(&cfg.dict_size.to_le_bytes());
-    // Unpacked size: u64 LE. Provide exact expected length so the
-    // decoder stops without an end-marker.
-    framed.extend_from_slice(&(output.len() as u64).to_le_bytes());
-    framed.extend_from_slice(input);
+    if !prefix {
+        let decoded = lzma_decode_exactly(&framed, input, output.len())?;
+        output.copy_from_slice(&decoded);
+        return Ok(());
+    }
 
-    let mut decoded: Vec<u8> = Vec::with_capacity(output.len());
-    let mut reader = Cursor::new(framed);
+    // A PREFIX may end inside a match. The decoder runs until an
+    // operation reaches the size it was told, and a match straddling the
+    // end of the prefix carries it past -- which, told the prefix's own
+    // size, it reports as a size mismatch and keeps nothing. So the size
+    // it is told has to be where that match ends, somewhere in the next
+    // `LZMA_MATCH_LEN_MAX` bytes. lzma-rs names it in the mismatch
+    // ("... but decompressed to N"), which usually settles it in one
+    // retry; when the message does not parse, every candidate is tried
+    // in turn. Either way what is kept is the prefix of a decode that
+    // succeeded, never of one that failed.
+    let len = output.len();
+    let hint = match lzma_decode_to(&framed, input, len) {
+        Ok(decoded) if decoded.len() == len => {
+            output.copy_from_slice(&decoded);
+            return Ok(());
+        }
+        Ok(_) => return Err(Error::BadInode("LZMA decompressed size mismatch")),
+        Err(message) => message
+            .rsplit("decompressed to ")
+            .next()
+            .and_then(|n| n.trim().parse::<usize>().ok())
+            .filter(|&n| n > len && n <= len + LZMA_MATCH_LEN_MAX),
+    };
+    for size in hint.into_iter().chain(len + 1..=len + LZMA_MATCH_LEN_MAX) {
+        if let Ok(decoded) = lzma_decode_to(&framed, input, size) {
+            if decoded.len() == size {
+                output.copy_from_slice(&decoded[..len]);
+                return Ok(());
+            }
+        }
+    }
+    Err(Error::BadInode("LZMA decompression failed"))
+}
+
+/// Decode a headerless stream framed by [`decompress_lzma_no_header`] to
+/// exactly `size` bytes, or fail.
+fn lzma_decode_exactly(framed: &[u8], input: &[u8], size: usize) -> Result<Vec<u8>> {
+    let decoded = lzma_decode_to(framed, input, size)
+        .map_err(|_| Error::BadInode("LZMA decompression failed"))?;
+    if decoded.len() != size {
+        return Err(Error::BadInode("LZMA decompressed size mismatch"));
+    }
+    Ok(decoded)
+}
+
+/// One decode of `framed`'s 5-byte properties and `input`, told the
+/// unpacked size is `size`; the error is lzma-rs's own message.
+fn lzma_decode_to(
+    framed: &[u8],
+    input: &[u8],
+    size: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut stream: Vec<u8> = Vec::with_capacity(13 + input.len());
+    stream.extend_from_slice(&framed[..5]);
+    stream.extend_from_slice(&(size as u64).to_le_bytes());
+    stream.extend_from_slice(input);
+    let mut decoded: Vec<u8> = Vec::with_capacity(size);
     let opts = lzma_rs::decompress::Options {
         unpacked_size: lzma_rs::decompress::UnpackedSize::ReadHeaderButUseProvided(Some(
-            output.len() as u64,
+            size as u64,
         )),
         memlimit: None,
         allow_incomplete: true,
     };
-    lzma_rs::lzma_decompress_with_options(&mut reader, &mut decoded, &opts)
-        .map_err(|_| Error::BadInode("LZMA decompression failed"))?;
-    if decoded.len() != output.len() {
-        return Err(Error::BadInode("LZMA decompressed size mismatch"));
-    }
-    output.copy_from_slice(&decoded);
-    Ok(())
+    lzma_rs::lzma_decompress_with_options(&mut Cursor::new(stream), &mut decoded, &opts)
+        .map_err(|e| e.to_string())?;
+    Ok(decoded)
 }
 
 fn decompress_deflate(input: &[u8], output: &mut [u8], zero_padding: bool) -> Result<()> {
@@ -1100,5 +1290,90 @@ mod tests {
         let mut output = vec![0u8; original.len()];
         decompress(Algorithm::Deflate, &padded, &mut output).unwrap();
         assert_eq!(&output[..], &original[..]);
+    }
+
+    /// A deduplicated extent's data is the first N bytes of a pcluster
+    /// that decodes to more (#125). Every prefix of an LZ4 block decodes,
+    /// through literals and through matches, overlapping ones included,
+    /// to the same bytes as the prefix of the whole.
+    #[test]
+    fn every_prefix_of_an_lz4_block_decodes_to_the_prefix_of_its_data() {
+        let mut original = Vec::new();
+        for i in 0..3000u32 {
+            original.extend_from_slice(if i % 7 == 0 { b"xyz" } else { b"a" });
+            original.push((i % 251) as u8);
+        }
+        original.extend(std::iter::repeat_n(b'q', 700));
+        let compressed = lz4_flex::block::compress(&original);
+        for len in (0..original.len()).step_by(97).chain([original.len()]) {
+            let mut out = vec![0u8; len];
+            decompress_prefix_with_config_and_padding(
+                Algorithm::Lz4,
+                None,
+                false,
+                &compressed,
+                &mut out,
+            )
+            .unwrap_or_else(|e| panic!("prefix {len}: {e:?}"));
+            assert_eq!(out, original[..len], "prefix {len}");
+        }
+    }
+
+    /// The exact-length decode still refuses a block that decodes to more
+    /// than its extent: only an extent marked as a partial reference may
+    /// stop early.
+    #[test]
+    fn only_a_prefix_read_may_stop_before_the_block_ends() {
+        let original = vec![7u8; 5000];
+        let compressed = lz4_flex::block::compress(&original);
+        let mut out = vec![0u8; 4000];
+        assert!(decompress(Algorithm::Lz4, &compressed, &mut out).is_err());
+        decompress_prefix_with_config_and_padding(
+            Algorithm::Lz4,
+            None,
+            false,
+            &compressed,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, original[..4000]);
+    }
+
+    /// An extent that claims more than its pcluster holds is refused, and
+    /// so is a match reaching before the start of the output.
+    #[test]
+    fn a_prefix_read_refuses_what_the_block_does_not_hold() {
+        let original = b"hello, hello, hello, world".to_vec();
+        let compressed = lz4_flex::block::compress(&original);
+        let mut long = vec![0u8; original.len() + 1];
+        assert!(decompress_prefix_with_config_and_padding(
+            Algorithm::Lz4,
+            None,
+            false,
+            &compressed,
+            &mut long,
+        )
+        .is_err());
+        // Token: 1 literal, then a match at offset 5 with 1 byte decoded.
+        let crafted = [0x10, b'a', 0x05, 0x00];
+        let mut out = vec![0u8; 8];
+        assert!(decompress_prefix_with_config_and_padding(
+            Algorithm::Lz4,
+            None,
+            false,
+            &crafted,
+            &mut out,
+        )
+        .is_err());
+        // A literal run longer than the input.
+        let crafted = [0xF0, 0x10, b'a'];
+        assert!(decompress_prefix_with_config_and_padding(
+            Algorithm::Lz4,
+            None,
+            false,
+            &crafted,
+            &mut out,
+        )
+        .is_err());
     }
 }

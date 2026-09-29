@@ -460,3 +460,32 @@ pub fn reseal_superblock(img: &mut [u8]) {
     let crc = crc32c::crc32c(&span) ^ 0xFFFF_FFFF;
     img[SB + 0x04..SB + 0x08].copy_from_slice(&crc.to_le_bytes());
 }
+
+/// Forty files alternating compressible and random runs of uneven
+/// lengths. `mkfs.erofs` stores the random runs as PLAIN pclusters that
+/// start partway into a block, beside compressed pclusters spanning
+/// several lclusters -- the layouts the read-path tests need, which
+/// a hand-written tree of small files never produces -- and, several of
+/// them sharing their opening bytes, the extents `-Ededupe` reuses.
+pub fn mixed_run_files() -> Vec<(String, Vec<u8>)> {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut files = Vec::new();
+    for f in 0..40usize {
+        let mut data = Vec::new();
+        for s in 0..1 + f % 7 {
+            let len = 1000 + (f * 7919 + s * 104_729) % 30_000;
+            if (f + s) % 2 == 0 {
+                data.extend((0..len).map(|i| b"abcdefgh"[i % 8]));
+            } else {
+                data.extend((0..len).map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 24) as u8
+                }));
+            }
+        }
+        files.push((format!("f{f:02}.bin"), data));
+    }
+    files
+}

@@ -242,6 +242,14 @@ pub const Z_EROFS_FRAGMENT_INODE_BIT: u8 = 0x80;
 /// (<https://erofs.docs.kernel.org/en/latest/design.html#compressed-data>).
 const Z_EROFS_LI_D0_CBLKCNT: u32 = 1 << 11;
 
+/// `Z_EROFS_LI_PARTIAL_REF = 1 << 15` -- bit 15 of a full (8-byte)
+/// index entry's `di_advise`: the HEAD's extent uses only a PREFIX of
+/// what its pcluster decodes to. `mkfs.erofs -Ededupe` sets it when an
+/// extent reuses a pcluster an earlier extent wrote and needs fewer of
+/// its bytes. The compacted forms have no room for it, so mkfs.erofs
+/// writes full indexes for an inode that needs it.
+pub const Z_EROFS_LI_PARTIAL_REF: u16 = 1 << 15;
+
 /// Mask of the value bits that ride alongside the `Z_EROFS_LI_D0_CBLKCNT`
 /// flag in a CBLKCNT-marker entry's `lo` (compact) or `delta[0]`
 /// (legacy) field. `lobits` is at least 12 (per the kernel's
@@ -423,6 +431,10 @@ pub struct PclusterExtent {
     /// shape uniform with chunked inodes (which DO carry per-entry
     /// device_id).
     pub device_id: u16,
+    /// The head carries [`Z_EROFS_LI_PARTIAL_REF`]: the pcluster may
+    /// decode to more than `source_end_byte - source_start_byte`, and
+    /// this extent is the first that many bytes of it.
+    pub partial_ref: bool,
 }
 
 /// On-disk index encoding format. Selected by the inode's datalayout.
@@ -1449,6 +1461,7 @@ impl<'a> ZMap<'a> {
             // with `chunked::lookup_chunk_blkaddr`'s multi-device
             // routing.
             device_id: 0,
+            partial_ref: head_entry.advise_raw & Z_EROFS_LI_PARTIAL_REF != 0,
         })
     }
 

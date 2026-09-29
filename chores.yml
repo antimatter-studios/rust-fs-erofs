@@ -374,12 +374,13 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - 'scripts/tier.sh test:kernel kernel 130 9000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
-    # 3: measured on main at ca0c577 (CI run 36351672753), `kernel: 3
-    # tests executed (floor 2)`. The third is the readlink kernel oracle
-    # #139 added; at 2 a run that lost it still passed.
-    # tests/scripts/kernel-floor.sh fails if this falls below the number
-    # of tests the tier holds.
-      - 'scripts/test-floor.sh kernel 3'
+    # 5: the 3 measured on main at ca0c577 (CI run 36351672753) -- the
+    # third being the readlink kernel oracle #139 added -- plus the two
+    # #125 added: the deduplicated images read back through the kernel,
+    # and the all-fragments,ztailpacking file it misreads being the one
+    # this crate refuses. tests/scripts/kernel-floor.sh fails if this
+    # falls below the number of tests the tier holds.
+      - 'scripts/test-floor.sh kernel 5'
 
   test:gsi:
     desc: 'The Android system-image suite — needs the ~2 GiB GSI fixture, which nothing else here can provide'

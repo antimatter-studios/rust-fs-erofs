@@ -734,7 +734,14 @@ impl Filesystem {
             let take = (valid_in_block - in_block_off).min(buf.len() - written);
 
             let mut block = vec![0u8; valid_in_block];
-            self.read_data_block(inode, block_idx, total_blocks, zmap.as_ref(), &mut block)?;
+            self.read_data_block_for(
+                inode,
+                block_idx,
+                total_blocks,
+                zmap.as_ref(),
+                &mut block,
+                in_block_off..in_block_off + take,
+            )?;
             buf[written..written + take].copy_from_slice(&block[in_block_off..in_block_off + take]);
 
             written += take;
@@ -770,6 +777,23 @@ impl Filesystem {
         total_blocks: u64,
         zmap: Option<&zmap::ZMap<'_>>,
         out: &mut [u8],
+    ) -> Result<()> {
+        let whole = 0..out.len();
+        self.read_data_block_for(inode, block_idx, total_blocks, zmap, out, whole)
+    }
+
+    /// [`Self::read_data_block`] for a caller that needs only `wanted`
+    /// of the block. The rest is still filled, but a byte this crate
+    /// cannot vouch for fails the read only when it is one the caller
+    /// asked for; see [`Self::fill_from_one_pcluster_for`].
+    fn read_data_block_for(
+        &self,
+        inode: &Inode,
+        block_idx: u64,
+        total_blocks: u64,
+        zmap: Option<&zmap::ZMap<'_>>,
+        out: &mut [u8],
+        wanted: std::ops::Range<usize>,
     ) -> Result<()> {
         let bs = self.sb.block_size();
         // Directory and symlink blocks are re-read by every path resolved
@@ -819,10 +843,10 @@ impl Filesystem {
                 read(device_id, off, out)
             }
             DataLayout::Compression | DataLayout::CompressionLegacy => match zmap {
-                Some(zmap) => self.read_compressed_block(inode, block_idx, zmap, out),
+                Some(zmap) => self.read_compressed_block(inode, block_idx, zmap, out, wanted),
                 None => {
                     let zmap = zmap::ZMap::open(&*self.primary, &self.sb, inode)?;
-                    self.read_compressed_block(inode, block_idx, &zmap, out)
+                    self.read_compressed_block(inode, block_idx, &zmap, out, wanted)
                 }
             },
         }
@@ -851,6 +875,7 @@ impl Filesystem {
         block_idx: u64,
         zmap: &zmap::ZMap<'_>,
         out: &mut [u8],
+        wanted: std::ops::Range<usize>,
     ) -> Result<()> {
         let bs = self.sb.block_size();
         let block_start = block_idx * bs;
@@ -861,12 +886,13 @@ impl Filesystem {
         let mut written: usize = 0;
         while written < out.len() {
             let cursor = block_start + written as u64;
-            let n = self.fill_from_one_pcluster_as(
+            let n = self.fill_from_one_pcluster_for(
                 inode.nid,
                 inode.is_dir() || inode.is_symlink(),
                 zmap,
                 cursor,
                 &mut out[written..],
+                wanted.start.saturating_sub(written)..wanted.end.saturating_sub(written),
             )?;
             if n == 0 {
                 // No bytes came back for `cursor`, so the cursor cannot
@@ -930,6 +956,7 @@ impl Filesystem {
     /// [`Self::fill_from_one_pcluster`] for an inode whose source is
     /// `metadata` (a directory or symlink) or file contents; see
     /// [`Self::read_source`].
+    #[cfg(test)]
     fn fill_from_one_pcluster_as(
         &self,
         inode_nid: u64,
@@ -937,6 +964,24 @@ impl Filesystem {
         zmap: &zmap::ZMap<'_>,
         file_offset: u64,
         out: &mut [u8],
+    ) -> Result<usize> {
+        let whole = 0..out.len();
+        self.fill_from_one_pcluster_for(inode_nid, metadata, zmap, file_offset, out, whole)
+    }
+
+    /// [`Self::fill_from_one_pcluster_as`], told which of `out`'s bytes
+    /// the caller actually asked for. Every byte is still filled; one
+    /// that cannot be read truthfully fails the call only if it is in
+    /// `wanted`, and is zero otherwise -- so a block read that reaches an
+    /// unreadable extent on behalf of bytes beside it still succeeds.
+    fn fill_from_one_pcluster_for(
+        &self,
+        inode_nid: u64,
+        metadata: bool,
+        zmap: &zmap::ZMap<'_>,
+        file_offset: u64,
+        out: &mut [u8],
+        wanted: std::ops::Range<usize>,
     ) -> Result<usize> {
         let bs = self.sb.block_size();
         if file_offset >= zmap.inode_size() {
@@ -1025,35 +1070,48 @@ impl Filesystem {
                 // Interlaced, the inline data is laid out from the start
                 // of the tail's lcluster, as one block would be: byte `k`
                 // of the extent is inline byte `(start % bs + k) % bs`.
-                // Measured on `mkfs.erofs -b4096 -zlz4hc
-                // -Eall-fragments,ztailpacking`, whose packed inode ends
-                // in such a tail.
-                //
-                // That tail's inline data stops `start % bs` bytes short
-                // of the extent's end: mkfs sizes the packed inode as if
-                // the data began at the extent start rather than at the
-                // lcluster start. The kernel copies whatever follows on
-                // disk for those bytes. No fragment refers to them, but a
-                // whole-block read reaches them, so they read as zeros
-                // here rather than failing the read of every file packed
-                // before them. A byte the rotation puts BEFORE the inline
-                // data's end must exist, and is still refused if not.
+                // That is how the kernel copies it, and how erofs-utils'
+                // own reader does.
                 let head_in_block = (extent.source_start_byte % bs) as usize;
-                let mut inline = vec![0u8; inline_len as usize];
-                self.read_source(metadata, 0, inline_off, &mut inline)?;
+                let span = pcluster_span(extent.source_start_byte, extent.source_end_byte)?;
                 let inline_len = inline_len as usize;
+                // AN EXTENT WHOSE ROTATION RUNS PAST ITS INLINE DATA IS
+                // REFUSED (#125). `mkfs.erofs -b4096 -zlz4hc
+                // -Eall-fragments,ztailpacking` writes one: its packed
+                // inode ends in an interlaced inline tail whose bytes
+                // mkfs stored from the start of the inline data, sized as
+                // if they began at the extent start rather than
+                // `start % bs` into the lcluster. Read as the format says
+                // -- the kernel's reading -- every byte of it is wrong:
+                // in erofs-utils 1.9.1 the file packed there reads back
+                // different from its source through the Linux 6.1 driver,
+                // through `fsck.erofs --extract`, and through this crate,
+                // which filled the missing tail with zeros. Read as mkfs
+                // wrote it, it disagrees with the kernel. Neither is a
+                // reading anything can vouch for, so a caller that asks
+                // for these bytes gets an error. One that does not -- a
+                // file packed before it, whose last block this extent
+                // shares -- gets zeros for them and its own bytes intact.
+                if head_in_block + span > inline_len && head_in_block + span <= bs as usize {
+                    let asked = wanted.start < take && wanted.start < wanted.end;
+                    if asked {
+                        return Err(Error::BadInode(
+                            "interlaced inline PLAIN tail runs past its inline data \
+                             (mkfs.erofs -Eall-fragments,ztailpacking); its bytes cannot \
+                             be read truthfully",
+                        ));
+                    }
+                    out[..take].fill(0);
+                    return Ok(take);
+                }
+                let mut inline = vec![0u8; inline_len];
+                self.read_source(metadata, 0, inline_off, &mut inline)?;
                 for (k, byte) in out[..take].iter_mut().enumerate() {
                     let off = off_in_pcluster + k;
                     let at = interlaced_index(bs as usize, bs as usize, head_in_block, off);
-                    *byte = match inline.get(at) {
-                        Some(b) => *b,
-                        None if at >= inline_len && off < bs as usize - head_in_block => 0,
-                        None => {
-                            return Err(Error::BadInode(
-                                "interlaced inline PLAIN tail shorter than its extent",
-                            ))
-                        }
-                    };
+                    *byte = *inline.get(at).ok_or(Error::BadInode(
+                        "interlaced inline PLAIN tail shorter than its extent",
+                    ))?;
                 }
                 return Ok(take);
             }
@@ -1193,13 +1251,16 @@ impl Filesystem {
         // images that strip the LZMA1 header but pre-date COMPR_CFGS).
         let lzma_cfg = self.compr_cfgs.as_ref().and_then(|c| c.lzma.as_ref());
         let zero_padding = self.sb.feature_incompat & EROFS_FEATURE_INCOMPAT_ZERO_PADDING != 0;
-        decompress::decompress_with_config_and_padding(
-            algo,
-            lzma_cfg,
-            zero_padding,
-            &compressed,
-            &mut decompressed,
-        )?;
+        // A deduplicated extent reuses the start of a pcluster another
+        // extent wrote, and its head says so: decode only as much as this
+        // extent covers. Every other extent must decode to exactly its
+        // span, or the index and the data disagree.
+        let decode = if extent.partial_ref {
+            decompress::decompress_prefix_with_config_and_padding
+        } else {
+            decompress::decompress_with_config_and_padding
+        };
+        decode(algo, lzma_cfg, zero_padding, &compressed, &mut decompressed)?;
         out[..take].copy_from_slice(&decompressed[off_in_pcluster..off_in_pcluster + take]);
         // Insert into cache AFTER the copy: the buffer is shared via
         // `Arc` so concurrent readers don't pay extra allocation, and
