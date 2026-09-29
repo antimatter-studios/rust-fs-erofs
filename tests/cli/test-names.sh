@@ -5,7 +5,7 @@ source "$(dirname "$0")/lib.sh"
 
 # The names are written here, not read from the binary: a binary that
 # forgot one would otherwise agree with itself.
-EXPECTED="mkfs.erofs"
+EXPECTED="mkfs.erofs fs.erofs"
 
 version="$(rust-fs-erofs --version | sed -n "s/^rust-fs-erofs ($CRATE) //p")"
 check "rust-fs-erofs --version names a version" test -n "$version"

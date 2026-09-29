@@ -14,6 +14,13 @@ never does.
   and `rust-fs-erofs mkfs` are the same program. `--version` prints
   `<tool> (am-fs-erofs) <version>`, a result is JSON on stdout (`--text`
   for people) and a failure is `{"error": ..., "code": N}` on stderr.
+- **`fs.erofs <image> ls|read|get|info`** reads an image directly, every
+  layout and compressor the library reads: JSON entries (a symlink's with
+  its `target`), raw bytes for `read` (`-o FILE` too), and the shared
+  envelope (`fs`, `label`, `total_bytes`, `free_bytes`, `block_size`,
+  `dirty`, with `erofs.*` nested). `--offset` reaches a filesystem inside a
+  larger image. `write`, `mkdir`, `set` and `resize` answer "EROFS is
+  read-only" with status 3.
 - `rust-fs-erofs doctor` says, for every name, whether the program `PATH`
   finds is this one, and when it is not (erofs-utils' `mkfs.erofs`, say)
   what wins and the fix.

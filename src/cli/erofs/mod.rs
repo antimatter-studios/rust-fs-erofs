@@ -2,6 +2,7 @@
 //! with. Everything filesystem-specific lives here, and nothing here is
 //! plumbing (that is `common`).
 
+pub mod fs;
 pub mod mkfs;
 
 /// A UUID in its standard 8-4-4-4-12 form.
