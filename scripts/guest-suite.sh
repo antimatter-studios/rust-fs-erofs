@@ -54,13 +54,14 @@ command -v cargo >/dev/null ||
 # THE SAME SELECTION THE NATIVE PATH USES, which means `all` and NOT
 # "every test there is".
 #
-# `test-targets.sh all` deliberately leaves out the GSI suite, because
-# that one needs a ~2 GiB Android system image which is not
-# redistributable, is gitignored, and is fetched by hand for `chore
-# test:gsi`. Running bare `cargo test` in here instead picks oracle_gsi
-# up, and since tests never skip on a missing fixture it FAILS -- so the
-# `suite in the guest` CI job could only ever be red, on a machine that
-# by design cannot have the fixture. Measured before this line existed:
+# `test-targets.sh all` deliberately leaves out the Android suite,
+# because that one needs a real Android image which is not ours to
+# redistribute, is gitignored, and is fetched for `chore test:android`.
+# Running bare `cargo test` in here instead picks oracle_android up, and
+# since tests never skip on a missing fixture it FAILS -- so the `suite in
+# the guest` CI job could only ever be red, on a machine that by design
+# does not have the fixture. Measured before this line existed, when the
+# suite was the GSI one it replaced:
 #
 #   test open_and_walk_gsi ... FAILED
 #   tests/fixtures/system.img is missing. Fetch it with

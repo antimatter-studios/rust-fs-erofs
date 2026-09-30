@@ -1,62 +1,69 @@
 # Test fixtures
 
-This directory holds end-to-end test fixtures that are too large or
-license-encumbered to commit into the repo. Everything matching
-`*.img`, `*.zip`, or `*.tar*` here is `.gitignore`d.
+This directory holds end-to-end test fixtures that are not ours to
+commit. Everything matching `*.img`, `*.zip`, or `*.tar*` here is
+`.gitignore`d.
 
-## `system.img` -- Android GSI
+## `android-system_dlkm.img` -- a real Android EROFS image
 
 ### Purpose
 
-A real Android Generic System Image (GSI), used by `tests/oracle_gsi.rs`
-to prove our reader handles a non-toy EROFS image (multi-GB, real
-directory layout, real compressed content). The synthetic images we
-build with `mkfs::Node` cover the spec; this fixture covers
-"production reality."
+An EROFS image that neither this repository nor `mkfs.erofs` in a temp
+directory produced: the `system_dlkm` partition of Google's Android 16
+(API 36) `aosp_atd` arm64 emulator system image, as Google's build wrote
+it. 7,397,376 bytes, 108 inodes, 98 of them LZ4-compressed, big
+pclusters, `0padding`, and a `security.selinux` label on every inode.
+`tests/oracle_android.rs` reads every inode and compares it against
+`android-system_dlkm.manifest`, which is committed.
+
+### Where the expectation comes from
+
+`android-system_dlkm.manifest` is what two readers that are not this
+crate saw in the same bytes: the Linux 6.1 kernel's EROFS driver, the
+image loop-mounted read-only, and `fsck.erofs --extract`, which agreed
+on every path, type, size and content hash. So a failure is this crate
+misreading a real image, not two of our readers disagreeing.
 
 ### Download
 
 ```sh
-tests/fixtures/download-gsi.sh
+tests/fixtures/download-android-erofs.sh
 ```
 
-By default this fetches a SHA256-pinned ARM64 GSI from
-`dl.google.com`, verifies the hash, and (if needed) runs `simg2img`
-to unwrap an Android-sparse image into a raw EROFS `system.img`.
+Downloads the 712 MB emulator zip from `dl.google.com`, checks its SHA-1
+against Google's own repository manifest, cuts the partition out of
+`arm64-v8a/system.img` at a pinned offset, and refuses the result unless
+it carries the EROFS magic -- naming the filesystem it found instead --
+and matches a pinned SHA-256. Needs `curl`, `unzip` and `sha1sum` /
+`sha256sum` (or `shasum`). `ANDROID_EROFS_ZIP=<path>` uses a zip you
+already have.
 
-The pinned URL + hash live at the top of `download-gsi.sh`. To
-override (e.g. a newer Android release):
+### Why not a GSI
 
-```sh
-GSI_URL=https://... GSI_EXPECTED_SHA=... tests/fixtures/download-gsi.sh
-```
-
-If the image inside the zip is sparse-wrapped, `simg2img` is required.
-On macOS:
-
-```sh
-brew install android-platform-tools
-```
+This used to fetch an Android Generic System Image. Every GSI on
+developer.android.com -- Android 16 and 17, aosp and gms -- ships an
+**ext4** `system.img`, checked at each one's superblock on 2026-09-30,
+so that suite could never pass (#133). The emulator image's
+`system_dlkm` is the one EROFS partition in either image family.
 
 ### Run the test
 
 ```sh
-chore test:gsi
+chore test:android
 ```
 
-`test:gsi` is its own tier and nothing else runs it: the image is ~2 GiB
-and not ours to redistribute, so it cannot be a CI artefact. Inside that
-tier a missing fixture **fails**, naming this script. It used to be
-`#[ignore]`-gated and to print "skipping" and return, which is how the
-suite reported ok on every run without ever opening an image (#54).
+`test:android` is its own tier: `chore test` does not run it, because a
+pull request cannot be made to depend on a 712 MB download. The nightly
+`.github/workflows/android.yml` does, with the fixture cached on its
+SHA-256. Inside that tier a missing fixture **fails**, naming the
+script. The suite it replaced used to be `#[ignore]`-gated and to print
+"skipping" and return, which is how it reported ok on every run without
+ever opening an image (#54).
 
 ## License posture
 
-The Android GSI is an Apache-2.0 userspace + GPL-2 kernel image
-distributed publicly by Google at
-<https://developer.android.com/topic/generic-system-image/releases>.
-
-This repo does NOT redistribute the image -- the download script just
-references the public URL. The `.gitignore` ensures the binary never
-lands in the tree. We treat the image as an opaque black-box test
-input; no AOSP source is copied into this codebase.
+The emulator image is distributed by Google under the Android SDK
+license, and `system_dlkm` holds kernel modules. This repository does
+NOT redistribute it: the download script references the public URL, and
+`.gitignore` keeps the binary out of the tree. The manifest -- paths,
+sizes, hashes and labels -- is ours.

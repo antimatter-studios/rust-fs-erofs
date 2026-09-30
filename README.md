@@ -268,20 +268,30 @@ cargo llvm-cov --html --workspace
 open target/llvm-cov/html/index.html
 ```
 
-## Real-world fixture (Android GSI)
+## Real-world fixture (Android)
 
 ```sh
-./tests/fixtures/download-gsi.sh
-chore test:gsi
+./tests/fixtures/download-android-erofs.sh
+chore test:android
 ```
 
-The GSI is large (~2 GB), not ours to redistribute, and gitignored, so
-`test:gsi` is its own tier: `chore test` does not run it and CI cannot.
-Inside the tier a missing fixture **fails**, naming the script — it used
-to print "skipping" and return, which is how the suite reported ok on
-every run without ever opening an image. The script verifies a pinned
-SHA256 and unwraps the sparse-image format if needed (requires
-`simg2img` from `android-platform-tools`).
+The one image in the suite that neither this repository nor `mkfs.erofs`
+made: the `system_dlkm` partition of Google's Android 16 emulator image,
+as Google's build wrote it — LZ4-compressed, big pclusters, SELinux
+labels on every inode. `tests/oracle_android.rs` reads all 108 inodes and
+compares path, type, mode, owner, size, content hash and xattrs with what
+the Linux kernel's EROFS driver and `fsck.erofs` read in the same bytes
+(`tests/fixtures/android-system_dlkm.manifest`).
+
+It is Google's to distribute, so the script downloads it (712 MB, of which
+7 MB is kept), checks the zip against Google's published SHA-1 and the
+partition against a pinned SHA-256, and refuses anything that is not
+EROFS, naming what it found. `test:android` is its own tier: `chore test`
+does not run it, the nightly `android.yml` workflow does. Inside the tier
+a missing fixture **fails**, naming the script.
+
+Every Android GSI Google publishes ships an ext4 `system.img`, so the GSI
+this used to fetch could never have passed (#133).
 
 ## Performance notes
 

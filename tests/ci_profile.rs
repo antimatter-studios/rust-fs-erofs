@@ -1254,8 +1254,8 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
         );
     }
     // THE WHOLE SUITE, AND `all` IS WHAT MAKES IT WHOLE. A bare
-    // `cargo test` would also select the GSI suite, whose ~2 GiB fixture
-    // no machine here can be expected to have, so the selection is
+    // `cargo test` would also select the Android suite, whose downloaded
+    // fixture no machine here can be expected to have, so the selection is
     // `scripts/test-targets.sh all` -- every target the tiers cover, in
     // one release run. Any OTHER test-targets.sh selection is a tier
     // repeated, not the suite, and does not satisfy this.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# test-targets.sh unit|images|oracle|kernel|gsi|all — print the `cargo test`
+# test-targets.sh unit|images|oracle|kernel|android|all — print the `cargo test`
 # target arguments for one tier of the suite.
 #
 #   unit    the library, the binaries, and every tests/*.rs that reaches
@@ -13,12 +13,13 @@
 #   all     every target the four tiers above cover, in one selection:
 #           what `chore test:native` runs once as the whole suite. NOT
 #           `cargo test` with no arguments, which would also pick up
-#           `gsi` and fail on a fixture that machine cannot have
-#   gsi     the Android system image suite, which needs a ~2 GiB fixture
-#           that is not ours to redistribute. ITS OWN TIER AND IN NO
-#           OTHER: `chore test` does not run it and CI cannot. Inside it
-#           a missing fixture fails (#54); what it must never be again is
-#           a test that reports ok having opened nothing.
+#           `android` and fail on a fixture that machine cannot have
+#   android the real Android EROFS image suite, whose fixture is Google's
+#           to distribute and so is downloaded, never committed. ITS OWN
+#           TIER AND IN NO OTHER: `chore test` does not run it; the
+#           nightly android.yml workflow does. Inside it a missing
+#           fixture fails (#54); what it must never be again is a test
+#           that reports ok having opened nothing.
 #
 # DERIVED FROM THE TESTS THEMSELVES, not from a list someone has to keep:
 # a test names a fixture by its test-disks/ path or through
@@ -47,14 +48,14 @@ TOOL='oracle\(|assert_fsck_clean\(|mkfs_from_guest_tree\(|_mkfs_erofs\('
 KERNEL='guest_kernel_'
 # Named, not derived: it is the one suite defined by a fixture nobody can
 # ship rather than by what it calls.
-GSI=oracle_gsi
+ANDROID=oracle_android
 
 tier="${1:-}"
 args=()
 for f in "$REPO"/tests/*.rs; do
     name="$(basename "$f" .rs)"
-    if [ "$name" = "$GSI" ]; then
-        [ "$tier" = gsi ] && args+=(--test "$name")
+    if [ "$name" = "$ANDROID" ]; then
+        [ "$tier" = android ] && args+=(--test "$name")
         continue
     fi
     case "$tier" in
@@ -71,8 +72,8 @@ for f in "$REPO"/tests/*.rs; do
             fi
             ;;
         kernel) grep -qE "$KERNEL" "$f" && args+=(--test "$name") ;;
-        gsi) ;;
-        *) echo "usage: test-targets.sh unit|images|oracle|kernel|gsi|all" >&2; exit 2 ;;
+        android) ;;
+        *) echo "usage: test-targets.sh unit|images|oracle|kernel|android|all" >&2; exit 2 ;;
     esac
 done
 case "$tier" in

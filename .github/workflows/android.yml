@@ -1,0 +1,81 @@
+name: android
+
+# `chore test:android`: this crate reading a real Android EROFS image that
+# nobody here produced, against what the kernel and fsck.erofs read in it
+# (tests/oracle_android.rs, #54).
+#
+# NOT IN ci.yml, AND SO NOT BEHIND ci-ok. The fixture is Google's to
+# distribute, so it is downloaded rather than committed, and the download
+# is a 712 MB zip from dl.google.com. A pull request whose verdict depends
+# on a third-party server is a pull request that goes red for reasons it
+# did not cause. So this runs nightly and on demand, and a red here is a
+# finding to act on, not a gate.
+#
+# THE FIXTURE IS CACHED ON ITS OWN SHA-256, which is pinned in the download
+# script and is the only thing the cache key names. A hit skips the
+# download entirely; a miss downloads and verifies. A nightly run keeps the
+# cache warm, so in practice the zip is fetched about once.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 3 * * *"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CHORE_VERSION: "0.11.0"
+
+jobs:
+  android:
+    name: a real Android EROFS image, read against the kernel and fsck.erofs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-android-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Name the fixture the cache is keyed on
+        id: fixture
+        run: |
+          set -euo pipefail
+          sha="$(sed -n 's/^SHA256="\([0-9a-f]*\)"$/\1/p' tests/fixtures/download-android-erofs.sh)"
+          [ "${#sha}" = 64 ] || { echo "::error::no SHA256= pin found in download-android-erofs.sh"; exit 1; }
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+      - name: Cache the fixture
+        id: cache-fixture
+        uses: actions/cache@v4
+        with:
+          path: tests/fixtures/android-system_dlkm.img
+          key: android-system_dlkm-${{ steps.fixture.outputs.sha256 }}
+      - name: Fetch the fixture
+        if: steps.cache-fixture.outputs.cache-hit != 'true'
+        run: tests/fixtures/download-android-erofs.sh
+      - name: The cached fixture is the pinned one
+        # A cache entry is only as good as what was saved under the key.
+        # The script checks the hash on a download; this checks it on a hit.
+        run: |
+          set -euo pipefail
+          echo "${{ steps.fixture.outputs.sha256 }}  tests/fixtures/android-system_dlkm.img" | sha256sum -c -
+      - name: chore test:android
+        run: chore test:android
+      - name: Keep the tier log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-android
+          path: tmp/logs/*.log
+          if-no-files-found: error
