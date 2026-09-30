@@ -6,6 +6,26 @@ never does.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-30
+
+### Breaking
+
+- **In-image paths cross the C ABI as bytes, not UTF-8 (#148).**
+  `fs_erofs_stat`, `_dir_open`, `_read_file` and `_readlink` read their
+  `const char *` as the bytes up to the NUL and compare them byte for byte
+  against the names in the image; they no longer decode it. A path that
+  did not decode used to become `""`, which resolved to the root, so
+  `fs_erofs_stat` reported the root directory's attributes and
+  `fs_erofs_dir_open` listed the root for a name that was merely not
+  UTF-8. Such a name is now looked up, and a path naming nothing is
+  `ENOENT`, never the root.
+
+  **Source-compatible for every caller passing UTF-8**, because UTF-8 is a
+  byte string too. `Filesystem::lookup_path_bytes` is the resolution and
+  `lookup_path(&str)` wraps it, so the Rust API is unchanged.
+  `fs_erofs_mount` keeps its UTF-8 decode: its argument is a path on the
+  host filesystem, not an in-image name.
+
 ### Added
 
 - **The command-line tools are one multi-call binary, `rust-fs-erofs`**,
@@ -301,6 +321,7 @@ never does.
 
 - Package renamed to `am-fs-erofs`; the lib name stays `fs_erofs`.
 
+[0.3.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.1.3...v0.1.4
