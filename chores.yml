@@ -409,8 +409,18 @@ tasks:
     # the fixture cached. What it is not any more is a suite that reports
     # ok having opened no image: inside the tier a missing fixture fails,
     # naming the script (#54).
+    #
+    # THE BUDGET IS THE RUNNER'S COLD BUILD, measured there: 88 lines,
+    # 4,005 bytes (android.yml run 36686318558) -- a Downloading line, 8
+    # Downloaded, 71 Compiling, then the test. Colour is ~1,070 of those
+    # bytes: android.yml sets CARGO_TERM_COLOR=always. The row it replaces
+    # was measured cold on a host with the crates already fetched and no
+    # colour, 80 lines / 2,676 bytes, and failed that first run (#166).
+    # Cold is the case to budget for: actions/cache saves only after a
+    # passing job, so a failing tier never warms its own cache. Warm, the
+    # tier prints 8 lines.
     cmds:
-      - 'scripts/tier.sh test:android android 100 3500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh android)'
+      - 'scripts/tier.sh test:android android 115 5200 -- scripts/test.sh --locked --release $(scripts/test-targets.sh android)'
     # One test, so one is the honest floor; it exists to catch the
     # selection going empty, not to measure the suite's size.
       - 'scripts/test-floor.sh android 1'
