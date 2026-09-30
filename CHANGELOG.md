@@ -19,7 +19,10 @@ never does.
   xattrs — with what the Linux kernel's EROFS driver and `fsck.erofs`
   read, instead of probing for a few well-known paths and skipping what
   it could not read. `.github/workflows/android.yml` runs the tier
-  nightly with the fixture cached on its SHA-256.
+  nightly with the fixture cached on its SHA-256. Its output budget is
+  the runner's cold build, 4,005 bytes measured there; the first nightly
+  run exceeded a budget measured on a host with no crates to download and
+  no colour (#166).
 
 ## [0.3.0] — 2026-09-30
 
