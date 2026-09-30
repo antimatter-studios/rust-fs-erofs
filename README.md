@@ -96,7 +96,7 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 
 ```toml
 [dependencies]
-am-fs-erofs = "0.2"
+am-fs-erofs = "0.3"
 ```
 
 ### From source (workspace path-dep)
