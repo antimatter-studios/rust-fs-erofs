@@ -16,7 +16,12 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "am-fs-core"
-version = "0.2.13"
+version = "0.2.14"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+]
 
 [[package]]
 name = "am-fs-erofs"
@@ -24,8 +29,6 @@ version = "0.3.0"
 dependencies = [
  "am-fs-core",
  "clap",
- "clap_complete",
- "clap_mangen",
  "crc32c",
  "flate2",
  "fs-erofs-test-support",
