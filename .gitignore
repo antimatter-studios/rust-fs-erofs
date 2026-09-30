@@ -18,10 +18,10 @@ target/
 *audit*
 .history
 
-# GSI test fixture (downloaded by tests/fixtures/download-gsi.sh).
-# AOSP-licensed; not redistributed by this repo. The *.img rule above
-# already covers system.img, but be explicit for the .tar / .zip
-# intermediate forms as well.
+# The Android EROFS fixture (tests/fixtures/download-android-erofs.sh)
+# and the zip it is cut from. Google's to distribute, not this
+# repository's. The *.img rule above already covers the image, but be
+# explicit for the .zip it keeps with ANDROID_EROFS_KEEP_ZIP=1 as well.
 tests/fixtures/*.img
 tests/fixtures/*.tar*
 tests/fixtures/*.zip

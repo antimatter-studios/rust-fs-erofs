@@ -86,6 +86,10 @@ tempfile = "3"
 # deprecated and wraps unsafe-libyaml. Dev-only: it never reaches a
 # consumer of this crate.
 saphyr = "0.0.12"
+# SHA-256 for tests/oracle_android.rs, which compares every file of a real
+# Android image against hashes the kernel's EROFS driver and fsck.erofs
+# produced. MIT/Apache-2.0, pure Rust. Dev-only.
+sha2 = "0.10"
 
 [profile.release]
 lto = true

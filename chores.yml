@@ -40,10 +40,12 @@ chore_min_version: 0.10.0
 #                      damaged image it has to refuse
 #   chore test:vm      the whole suite compiled and run INSIDE the guest
 #   chore test         everything, exactly as CI runs it
-#   chore test:gsi     the Android system-image suite. ITS OWN TIER AND IN
-#                      NOTHING ELSE: the fixture is ~2 GiB and not ours to
-#                      redistribute, so it cannot be a CI artefact. Inside
-#                      the tier a missing fixture FAILS (#54)
+#   chore test:android a real Android EROFS image, Google-built, read
+#                      against what the kernel and fsck.erofs read in it.
+#                      ITS OWN TIER AND IN NOTHING ELSE: the fixture is not
+#                      ours to redistribute, so it is downloaded, and only
+#                      the nightly android.yml workflow runs it. Inside the
+#                      tier a missing fixture FAILS (#54)
 #
 # WHERE THINGS RUN, and why.
 #
@@ -122,15 +124,16 @@ chore_min_version: 0.10.0
 #                                                   is a visible step. Was 12 l /
 #                                                   466 B with mkfs.erofs alone,
 #                                                   16 l / 604 B before the docs
-#     gsi         NOT MEASURED     150 l / 12,000 B  #133: the pinned GSI's
-#                                                   system.img is ext4, not
-#                                                   EROFS, so this tier cannot
-#                                                   be made to PASS here and a
-#                                                   budget has to be measured
-#                                                   from a passing run. Sized
-#                                                   from the failing run's 22 l
-#                                                   plus a cold build. Re-measure
-#                                                   it with a real EROFS fixture
+#     android    80 l /  2,676 B  100 l /  3,500 B  measured COLD: the only tier
+#                 1 test                            in its nightly job, so it
+#                                                   always pays the build (68
+#                                                   `Compiling` lines with the
+#                                                   cli feature, 4 more for the
+#                                                   crates it downloads). 8 l /
+#                                                   332 B warm. ~25%. Replaced
+#                                                   gsi, which could never pass
+#                                                   (#133) and so was never
+#                                                   measured
 #
 #   A COLD BUILD ADDS 63 `Compiling` LINES, measured on this crate's graph
 #   (74 packages in Cargo.lock) by `cargo clean` then the suite tier: 709
@@ -397,26 +400,20 @@ tasks:
     # tests the tier holds.
       - 'scripts/test-floor.sh kernel 7'
 
-  test:gsi:
-    desc: 'The Android system-image suite — needs the ~2 GiB GSI fixture, which nothing else here can provide'
-    # NOT PART OF `chore test`, AND NOT IN CI. The image is not ours to
-    # redistribute and is far too large to be a CI artefact, so this tier
-    # is one somebody asks for. What it is not any more is a suite that
-    # reports ok having opened no image: inside the tier a missing
-    # fixture fails, naming tests/fixtures/download-gsi.sh (#54).
+  test:android:
+    desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
+    # NOT PART OF `chore test`. The image is Google's to distribute, so it
+    # is fetched (tests/fixtures/download-android-erofs.sh), never
+    # committed, and a pull request cannot be made to depend on a 712 MB
+    # download. .github/workflows/android.yml runs this tier nightly with
+    # the fixture cached. What it is not any more is a suite that reports
+    # ok having opened no image: inside the tier a missing fixture fails,
+    # naming the script (#54).
     cmds:
-    # THE ONE PROVISIONAL BUDGET IN THE TABLE, and #133 is why. The
-    # fixture the pinned URL hands over is ext4, not EROFS -- checked at
-    # the superblock and confirmed by dump.erofs -- so this tier cannot
-    # be made to PASS here, and a passing run is what a budget has to be
-    # measured from. 150/12000 is sized from the failing run's 22 lines
-    # plus the 63 `Compiling` lines a cold build adds plus room for the
-    # walk the test prints; re-measure it with the first fixture that is
-    # actually EROFS and drop this comment.
-      - 'scripts/tier.sh test:gsi gsi 150 12000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh gsi)'
+      - 'scripts/tier.sh test:android android 100 3500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh android)'
     # One test, so one is the honest floor; it exists to catch the
     # selection going empty, not to measure the suite's size.
-      - 'scripts/test-floor.sh gsi 1'
+      - 'scripts/test-floor.sh android 1'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -497,8 +494,9 @@ tasks:
     # those tests again: the price of their evidence being in every log,
     # and of `test` staying plainly "everything".
     #
-    # NOT test:gsi. That tier needs a fixture nothing here can provide,
-    # and `test` must mean the same thing on every machine.
+    # NOT test:android. That tier needs a downloaded fixture no pull
+    # request fetches, and `test` must mean the same thing on every
+    # machine.
     cmds:
       - task: test:unit
       - scripts/tools.sh --check
@@ -506,8 +504,9 @@ tasks:
       - task: test:images
       - task: test:oracle
       - task: test:kernel
-      # `all`, not a bare `cargo test`: that would also select the GSI
-      # suite, whose fixture no machine here can be expected to have.
+      # `all`, not a bare `cargo test`: that would also select the
+      # Android suite, whose fixture no machine here can be expected to
+      # have.
       - 'scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all)'
       - 'scripts/test-floor.sh suite 520'
       - task: test:scripts

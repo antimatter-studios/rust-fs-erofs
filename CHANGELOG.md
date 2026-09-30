@@ -6,6 +6,21 @@ never does.
 
 ## [Unreleased]
 
+### Changed
+
+- **The real-world Android suite reads an EROFS image, and CI runs it
+  nightly** (#54). It was `chore test:gsi` over an Android GSI whose
+  `system.img` is ext4 — true of every GSI Google publishes, Android 16
+  and 17 — so it could never pass (#133). It is now `chore test:android`
+  over the `system_dlkm` partition of Google's Android 16 emulator image,
+  fetched by `tests/fixtures/download-android-erofs.sh`, which refuses a
+  cut that is not EROFS and names what it found. `tests/oracle_android.rs`
+  compares all 108 inodes — type, mode, owner, size, content hash and
+  xattrs — with what the Linux kernel's EROFS driver and `fsck.erofs`
+  read, instead of probing for a few well-known paths and skipping what
+  it could not read. `.github/workflows/android.yml` runs the tier
+  nightly with the fixture cached on its SHA-256.
+
 ## [0.3.0] — 2026-09-30
 
 ### Breaking
