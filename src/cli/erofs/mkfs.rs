@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
-use crate::common::{CliError, Json, Outcome, Tool};
+use fs_core::cli::{CliError, Json, Outcome, Tool};
 use fs_erofs::mkfs::{build_image, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE};
 use fs_erofs::superblock::{
     is_valid_blkszbits, EROFS_SUPER_BLOCK_SIZE, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE,
@@ -33,7 +33,7 @@ pub const TOOL: Tool = Tool {
     name: "mkfs.erofs",
     verb: "mkfs",
     section: 8,
-    usage_exit: crate::common::output::EXIT_USAGE,
+    usage_exit: fs_core::cli::output::EXIT_USAGE,
     about: "Build an EROFS image from a directory",
     command,
     run,
@@ -94,7 +94,7 @@ fn command() -> Cmd {
                 .help("No progress or warnings on stderr")
                 .action(ArgAction::SetTrue),
         )
-        .args(crate::common::format_args())
+        .args(fs_core::cli::format_args())
         .after_help(
             "Examples:\n  \
              mkfs.erofs out.img ./rootfs\n  \

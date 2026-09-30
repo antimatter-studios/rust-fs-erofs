@@ -1,19 +1,15 @@
 //! `rust-fs-erofs`: the command-line tools for EROFS, one multi-call binary.
 //!
-//! Installed as `rust-fs-erofs` and linked as each dotted name; see
-//! `common` for the dispatch and the output contract every tool shares,
-//! and `erofs` for the tools themselves.
+//! Installed as `rust-fs-erofs` and linked as each dotted name. The
+//! dispatch and the output contract every tool shares are `fs_core::cli`
+//! (am-fs-core's `cli` feature); `erofs` is the tools themselves.
 
-// The shared plumbing is a library in waiting (see its module docs): its
-// API is whole, and a piece EROFS does not call yet is not dead, it is the
-// part another driver's tools will.
-#[allow(dead_code)]
-mod common;
 mod erofs;
 
+use fs_core::cli;
 use std::process::ExitCode;
 
-static FAMILY: common::Family = common::Family {
+static FAMILY: cli::Family = cli::Family {
     repo: "rust-fs-erofs",
     crate_name: env!("CARGO_PKG_NAME"),
     version: env!("CARGO_PKG_VERSION"),
@@ -26,5 +22,5 @@ static FAMILY: common::Family = common::Family {
 };
 
 fn main() -> ExitCode {
-    common::main(&FAMILY)
+    cli::main(&FAMILY)
 }
