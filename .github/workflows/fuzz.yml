@@ -31,6 +31,13 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# Read-only unless a job asks for more. This repository's default token
+# is read-write, and a workflow that declares nothing inherits it, so every
+# job here would otherwise hold a write token beside actions it does not
+# pin.
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     name: fuzz every parser a hostile image reaches
