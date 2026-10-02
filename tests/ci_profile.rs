@@ -1508,12 +1508,13 @@ fn the_pr_gate_still_hands_the_writers_images_to_fsck_erofs() {
         .iter()
         .find_map(|c| {
             c.trim()
-                .strip_prefix("scripts/test-floor.sh oracle ")
+                .strip_prefix("bash scripts/core.sh test-floor --refuse-ignored oracle ")
                 .and_then(|n| n.trim().parse::<u32>().ok())
         });
     assert!(
         floor.is_some_and(|n| n > 0),
-        "chores.yml `test:oracle` must end in `scripts/test-floor.sh oracle N` with N > 0, \
+        "chores.yml `test:oracle` must end in `bash scripts/core.sh test-floor --refuse-ignored oracle N` \
+         with N > 0, \
          so the tier cannot go green having run nothing; found {floor:?}"
     );
 }
@@ -1625,7 +1626,7 @@ mod cross_validation_paths_rules {
     const CHORES: &str = "version: '3'\ntasks:\n  test:\n    cmds:\n      - task: test:oracle\n  \
                           test:oracle:\n    cmds:\n      - 'scripts/tier.sh test:oracle oracle 1 1 -- \
                           scripts/test.sh --locked --release $(scripts/test-targets.sh oracle)'\n      \
-                          - 'scripts/test-floor.sh oracle 80'\n";
+                          - 'bash scripts/core.sh test-floor --refuse-ignored oracle 80'\n";
 
     fn workflow(job_keys: &str, step_keys: &str) -> String {
         format!(

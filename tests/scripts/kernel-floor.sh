@@ -8,10 +8,11 @@
 # executed (floor 2)`, and a run that lost that test would still have passed.
 #
 # So this counts the `#[test]` functions in the files scripts/test-targets.sh
-# selects for the tier, feeds scripts/test-floor.sh a kernel log that executed
-# ONE FEWER than that, against the floor chores.yml declares, and requires it
-# to refuse. A floor at or above the count passes; a test added without
-# raising the floor fails here, naming both numbers.
+# selects for the tier and requires the floor chores.yml declares to EQUAL
+# that count: a floor below it lets a run one test short pass, and a floor
+# above it refuses a run that executed every test. The floor itself is
+# rust-fs-core's (scripts/core.sh test-floor), tested there; what is this
+# repository's is the number, so the number is what is checked here.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -23,7 +24,7 @@ bad()  { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
 
 printf 'kernel-floor\n'
 
-floors="$(grep -oE 'scripts/test-floor\.sh kernel [0-9]+' chores.yml | awk '{ print $3 }')"
+floors="$(grep -oE 'core\.sh test-floor (--refuse-ignored )?kernel [0-9]+' chores.yml | awk '{ print $NF }')"
 if [ "$(printf '%s\n' "$floors" | grep -c .)" -ne 1 ]; then
     bad "chores.yml must declare exactly one kernel floor (found: ${floors:-none})"
     floors=0
@@ -41,24 +42,12 @@ if [ "$files" -gt 0 ] && [ "$declared" -gt 0 ]; then ok; else
     bad "scripts/test-targets.sh kernel selected $files files holding $declared tests"
 fi
 
-sandbox="$(mktemp -d)"
-trap 'rm -rf "$sandbox"' EXIT
-mkdir -p "$sandbox/scripts" "$sandbox/tmp/logs"
-cp scripts/test-floor.sh "$sandbox/scripts/"
 short=$((declared - 1))
-printf 'test result: ok. %d passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n' \
-    "$short" > "$sandbox/tmp/logs/kernel.log"
-if bash "$sandbox/scripts/test-floor.sh" kernel "$floor" > /dev/null 2>&1; then
+if [ "$floor" -gt "$short" ]; then ok; else
     bad "the kernel tier holds $declared tests but its floor is $floor: a run that executed $short still passes"
-else
-    ok
 fi
-
-printf 'test result: ok. %d passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n' \
-    "$declared" > "$sandbox/tmp/logs/kernel.log"
-if bash "$sandbox/scripts/test-floor.sh" kernel "$floor" > /dev/null 2>&1; then ok; else
+if [ "$floor" -le "$declared" ]; then ok; else
     bad "a kernel run that executed all $declared tests is refused by floor $floor"
 fi
-
 printf '  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
