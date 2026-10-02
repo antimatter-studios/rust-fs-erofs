@@ -34,18 +34,18 @@
 #   erofs.ko     the real in-kernel EROFS driver, which is the only
 #                second implementation of the MOUNT path that exists
 #
-# AND A RUST TOOLCHAIN, for `chore test:vm` — the whole suite compiled
-# and run in here, which is how a macOS host runs a Linux test suite at
-# all. It is pinned to the repository's rust-toolchain.toml, installed
-# under /var/lib (the VM's own disk, which outlives a `vm:down`), and the
-# build directory lives there too so the second run is incremental.
+# AND WHAT A RUST BUILD NEEDS FROM THE DISTRIBUTION (curl, gcc, libc6-dev,
+# pkg-config), for `chore test:vm`: the whole suite compiled and run in
+# here, which is how a macOS host runs a Linux test suite at all. NOT THE
+# TOOLCHAIN ITSELF: scripts/guest-suite.sh installs that through
+# `scripts/core.sh guest-rust-toolchain`, rust-fs-core's one copy of the
+# install, which every driver runs and which recovers from an install a
+# reaper or a deadline interrupted. It cannot run from here: the harness
+# ships this one file into the guest, before `test:vm` has staged the core
+# sibling on the share (rust-fs-core#190).
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-REPO=/repo
-RUST_ROOT=/var/lib/fs-erofs-rust
-export RUSTUP_HOME="$RUST_ROOT/rustup"
-export CARGO_HOME="$RUST_ROOT/cargo"
 
 # THE erofs-utils PIN. A tag, not a branch or a snapshot URL: the family
 # pins every sibling, every box and every toolchain, and an oracle that
@@ -204,20 +204,4 @@ echo "vm-setup: $version writes lz4, lzma, deflate and zstd"
 fsck.erofs --version 2>&1 | sed -n 1p
 dump.erofs --version 2>&1 | sed -n 1p
 
-# The toolchain the repository pins, and only that one: a guest that
-# silently built with a different compiler than CI is a guest whose
-# result means nothing.
-toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$REPO/rust-toolchain.toml" | head -1)"
-[ -n "$toolchain" ] || { echo "vm-setup: no channel in $REPO/rust-toolchain.toml" >&2; exit 1; }
-
-mkdir -p "$RUST_ROOT"
-if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-        sh -s -- -y --no-modify-path --default-toolchain none >/dev/null
-fi
-"$CARGO_HOME/bin/rustup" toolchain install "$toolchain" \
-    --component rustfmt --component clippy --profile minimal >/dev/null
-"$CARGO_HOME/bin/rustup" default "$toolchain" >/dev/null
-"$CARGO_HOME/bin/cargo" --version
-
-echo "vm-setup: the oracle tools, the EROFS driver and the pinned toolchain are in the guest"
+echo "vm-setup: the oracle tools and the EROFS driver are in the guest"

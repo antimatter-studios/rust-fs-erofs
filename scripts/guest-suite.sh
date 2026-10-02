@@ -48,8 +48,16 @@ for sibling in $SIBLINGS; do
 done
 
 cd /repo
+# THE PINNED TOOLCHAIN, installed -- or repaired, when an earlier install
+# was interrupted and left its wreckage on the VM's own disk. It is
+# rust-fs-core's family script, the one copy every driver runs, reached
+# through the sibling linked just above: this is the first point at which
+# core is in the guest, which is why vm-setup.sh cannot do it. It reads
+# rust-toolchain.toml and installs into RUSTUP_HOME and CARGO_HOME, and
+# over a whole toolchain it costs one manifest check (rust-fs-core#190).
+scripts/core.sh guest-rust-toolchain
 command -v cargo >/dev/null ||
-    { echo "guest-suite.sh: no cargo in the guest — 'chore vm:provision' installs it." >&2; exit 1; }
+    { echo "guest-suite.sh: no cargo in the guest after the toolchain install." >&2; exit 1; }
 
 # THE SAME SELECTION THE NATIVE PATH USES, which means `all` and NOT
 # "every test there is".

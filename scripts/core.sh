@@ -5,6 +5,7 @@
 #   scripts/core.sh test-floor TIER FLOOR      the tier ran at least FLOOR tests
 #   scripts/core.sh semver-check               no undeclared public-API break
 #   scripts/core.sh family-check               this repository keeps no copy of these
+#   scripts/core.sh guest-rust-toolchain       in a test VM: the pinned toolchain, installed
 #
 # THIS FILE IS THE SAME IN EVERY REPOSITORY, byte for byte, and its canonical
 # copy is rust-fs-core's scripts/core.sh. It is the one piece a repository has
@@ -35,14 +36,14 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
-    echo "usage: scripts/core.sh test-floor|semver-check|family-check [ARG...]" >&2
+    echo "usage: scripts/core.sh test-floor|semver-check|family-check|guest-rust-toolchain [ARG...]" >&2
     exit 2
 }
 [ $# -ge 1 ] || usage
 NAME="$1"
 shift
 case "$NAME" in
-    test-floor|semver-check|family-check) ;;
+    test-floor|semver-check|family-check|guest-rust-toolchain) ;;
     *) echo "core.sh: rust-fs-core has no family script named '$NAME'." >&2; usage ;;
 esac
 SCRIPT_REL="scripts/$NAME.sh"

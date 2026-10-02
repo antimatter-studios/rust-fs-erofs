@@ -190,7 +190,7 @@ vars:
   # failure path, where nobody looks until it is too late. The rest of the
   # family (ext4, xfs, btrfs, ntfs, the four image crates, go-networkfs)
   # pins v0.2.13 for the same reason.
-  FS_CORE_REF: v0.2.16
+  FS_CORE_REF: v0.2.17
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.2.0
 
