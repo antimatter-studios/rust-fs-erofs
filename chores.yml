@@ -190,7 +190,7 @@ vars:
   # failure path, where nobody looks until it is too late. The rest of the
   # family (ext4, xfs, btrfs, ntfs, the four image crates, go-networkfs)
   # pins v0.2.13 for the same reason.
-  FS_CORE_REF: v0.2.14
+  FS_CORE_REF: v0.2.16
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.2.0
 
@@ -351,7 +351,7 @@ tasks:
     # which is what proves the split.
     cmds:
       - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 740 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
-      - 'scripts/test-floor.sh unit 420'
+      - 'bash scripts/core.sh test-floor --refuse-ignored unit 420'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -361,7 +361,7 @@ tasks:
     # crate actually ships on.
     cmds:
       - 'scripts/tier.sh test:images images 120 8000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
-      - 'scripts/test-floor.sh images 3'
+      - 'bash scripts/core.sh test-floor --refuse-ignored images 3'
 
   test:oracle:
     desc: 'erofs-utils and this crate read each other — every tool call made inside the harness VM'
@@ -383,7 +383,7 @@ tasks:
       - 'scripts/tier.sh test:oracle oracle 700 55000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
       # 90: the 87 measured before the tools, plus tests/cli_mkfs_oracle.rs
       # and tests/cli_fs_oracle.rs's eight, less a margin. Only goes up.
-      - 'scripts/test-floor.sh oracle 90'
+      - 'bash scripts/core.sh test-floor --refuse-ignored oracle 90'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
@@ -405,7 +405,7 @@ tasks:
     # tests/cli_fs_kernel.rs: `fs.erofs` reading what the kernel reads.
     # tests/scripts/kernel-floor.sh fails if this falls below the number of
     # tests the tier holds.
-      - 'scripts/test-floor.sh kernel 7'
+      - 'bash scripts/core.sh test-floor --refuse-ignored kernel 7'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
@@ -430,7 +430,7 @@ tasks:
       - 'scripts/tier.sh test:android android 115 5200 -- scripts/test.sh --locked --release $(scripts/test-targets.sh android)'
     # One test, so one is the honest floor; it exists to catch the
     # selection going empty, not to measure the suite's size.
-      - 'scripts/test-floor.sh android 1'
+      - 'bash scripts/core.sh test-floor --refuse-ignored android 1'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -476,7 +476,7 @@ tasks:
         # shellcheck disable=SC2086  # the words are the point
         scripts/tier.sh test:vm vm 1150 60000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
-        scripts/test-floor.sh vm 520
+        bash scripts/core.sh test-floor --refuse-ignored vm 520
 
   test:
     desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
@@ -525,7 +525,7 @@ tasks:
       # Android suite, whose fixture no machine here can be expected to
       # have.
       - 'scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all)'
-      - 'scripts/test-floor.sh suite 520'
+      - 'bash scripts/core.sh test-floor --refuse-ignored suite 520'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
@@ -563,7 +563,7 @@ tasks:
     # and it only goes up.
     cmds:
       - 'scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh'
-      - 'scripts/test-floor.sh cli 130'
+      - 'bash scripts/core.sh test-floor --refuse-ignored cli 130'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
@@ -653,6 +653,9 @@ tasks:
       - scripts/ci-gate.sh
       - cargo fmt --check
       - scripts/agents-core-check.sh
+      # The family scripts are rust-fs-core's alone: fails on a committed copy,
+      # a scripts/core.sh that differs from core's, or a call to a local copy.
+      - bash scripts/core.sh family-check
       # `--features cli`: the command-line tools' target requires it, and
       # clippy silently leaves out a target whose features are off.
       - cargo clippy --locked --all-targets --features cli -- -D warnings
@@ -704,7 +707,7 @@ tasks:
     # room for a warning block without hiding a flood. No floor: it is one
     # check, not a suite.
     cmds:
-      - 'scripts/tier.sh semver semver 40 4000 -- scripts/semver-check.sh'
+      - 'scripts/tier.sh semver semver 40 4000 -- bash scripts/core.sh semver-check'
 
   check:ci-gate:
     desc: The one required check stands for every job in ci.yml
