@@ -373,10 +373,43 @@ jobs:
   # job that passed, and an aggregate that only runs when its needs
   # succeeded would be skipped itself — and a skipped required check
   # never reports at all.
+  semver:
+    # `chore check:semver`: this tree's public API against the newest
+    # version on crates.io, refusing a break the version in Cargo.toml does
+    # not declare. Why, and what it cannot see, is at the top of
+    # scripts/semver-check.sh.
+    name: semver (public API against crates.io)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The version scripts/semver-check.sh expects. A prebuilt binary,
+      # checksum-verified by the action, rather than a ten-minute build.
+      CARGO_SEMVER_CHECKS_VERSION: "0.50.0"
+      # A failing tier prints only its verdict by default. Here the tail IS
+      # the answer -- which items broke -- so it is printed in full.
+      OUTPUT_BUDGET_FAIL_TAIL: "200"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core, the path dependency the current tree builds against.
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@${{ env.CARGO_SEMVER_CHECKS_VERSION }}
+      - name: chore check:semver
+        shell: bash
+        run: chore check:semver
+
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [unit, fixtures, test, test-arm64, suite-in-vm, cli]
+    needs: [unit, fixtures, test, test-arm64, suite-in-vm, cli, semver]
     runs-on: ubuntu-latest
     steps:
       - name: Every job ran and succeeded
