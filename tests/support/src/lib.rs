@@ -6,7 +6,7 @@
 mod kernel;
 mod oracle;
 
-pub use kernel::{guest_kernel_refusal, guest_kernel_report, sha256_hex};
+pub use kernel::{guest_kernel_acl_report, guest_kernel_refusal, guest_kernel_report, sha256_hex};
 pub use oracle::{guest_base64, guest_quote, mkfs_from_guest_tree, oracle, Oracle};
 
 use std::ffi::OsStr;
