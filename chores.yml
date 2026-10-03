@@ -402,10 +402,11 @@ tasks:
     # and the all-fragments,ztailpacking file it misreads being the one
     # this crate refuses. 6 with tests/cli_mkfs_kernel.rs: the kernel
     # reading back the image the `mkfs.erofs` tool builds; 7 with
-    # tests/cli_fs_kernel.rs: `fs.erofs` reading what the kernel reads.
+    # tests/cli_fs_kernel.rs: `fs.erofs` reading what the kernel reads;
+    # 8 with tests/acl_oracle.rs: POSIX ACLs agreeing with the kernel's.
     # tests/scripts/kernel-floor.sh fails if this falls below the number of
     # tests the tier holds.
-      - 'bash scripts/core.sh test-floor --refuse-ignored kernel 7'
+      - 'bash scripts/core.sh test-floor --refuse-ignored kernel 8'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'

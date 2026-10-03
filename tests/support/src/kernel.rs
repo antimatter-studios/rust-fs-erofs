@@ -375,6 +375,60 @@ done
 printf 'kernel\t\t%s\n' "$(uname -r)"
 "#;
 
+/// The guest script for the POSIX ACL oracle: for every path, the two ACL
+/// attributes as the kernel returns them, and `getfacl`'s reading of them.
+///
+/// `access` and `default` are the values of `system.posix_acl_access` and
+/// `system.posix_acl_default` in hex, exactly as `getfattr -e hex` prints
+/// them, or `-` when the kernel says the attribute does not exist. Any
+/// other refusal fails the script naming it: an `Operation not supported`
+/// from a kernel built without EROFS ACL support must not read as "this
+/// file has no ACL".
+///
+/// `getfacl` is `getfacl -n` with the header and the effective-rights
+/// comments left off, its lines joined by commas. For a path with no
+/// access ACL it is the three entries `getfacl` derives from the mode.
+///
+/// The value is assigned before it is printed, so a failing `getfattr`
+/// stops the script under `set -e` rather than printing an empty field.
+const ACL_REPORT: &str = r#"
+cd "$MNT"
+acl() {
+    local out value
+    if out="$(getfattr -h --absolute-names -e hex -n "$1" "$2" 2>&1)"; then
+        value="$(printf '%s\n' "$out" | sed -n "s/^$1=0x//p")"
+        if [ -z "$value" ]; then
+            echo "getfattr -n $1 $2 succeeded and printed no value: $out" >&2
+            return 1
+        fi
+        printf '%s' "$value"
+    else
+        case "$out" in
+            *"No such attribute"*) printf -- '-' ;;
+            *) echo "getfattr -n $1 $2: $out" >&2; return 1 ;;
+        esac
+    fi
+}
+find . -mindepth 1 -printf '%P\n' | sort | while read -r path; do
+    access="$(acl system.posix_acl_access "$path")"
+    default="$(acl system.posix_acl_default "$path")"
+    facl="$(getfacl -cEnp "$path" | sed '/^$/d' | paste -sd, -)"
+    printf 'access\t%s\t%s\n' "$path" "$access"
+    printf 'default\t%s\t%s\n' "$path" "$default"
+    printf 'getfacl\t%s\t%s\n' "$path" "$facl"
+done
+"#;
+
+/// Mount `image` read-only in the guest and report every path's POSIX
+/// ACLs as the kernel reads them, keyed by `(kind, path)` with kinds
+/// `access`, `default` and `getfacl` (see [`ACL_REPORT`]).
+///
+/// ONE GUEST CALL, like [`guest_kernel_report`].
+#[track_caller]
+pub fn guest_kernel_acl_report(image: &str, what: &str) -> BTreeMap<(String, String), String> {
+    parse(&guest_kernel_read_ok(image, what, ACL_REPORT))
+}
+
 /// Mount `image` read-only in the guest and report everything in it:
 /// for every path, its type, mode, owner, size, SHA-256, symlink target,
 /// device number and extended attributes, keyed by `(kind, path)`.
