@@ -1781,10 +1781,11 @@ fn the_release_gate_builds_fixtures_in_the_harness_vm_and_runs_chore_test() {
         }
     }
 
-    // Every shipping job -- the crates.io upload, the command-line
-    // tarballs each platform packages, and the job that attaches them to
-    // the release -- follows one rule: nothing ships unless `test` passed.
-    for shipping in ["publish", "package-cli", "release-cli"] {
+    // Every shipping job -- the crates.io upload, and the call to core's
+    // release-cli workflow that packages the command-line tarballs and
+    // attaches them to the release -- follows one rule: nothing ships
+    // unless `test` passed.
+    for shipping in ["publish", "cli"] {
         assert!(
             needs_of(job(&document, shipping, &path))
                 .iter()

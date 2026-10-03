@@ -190,7 +190,11 @@ vars:
   # failure path, where nobody looks until it is too late. The rest of the
   # family (ext4, xfs, btrfs, ntfs, the four image crates, go-networkfs)
   # pins v0.2.13 for the same reason.
-  FS_CORE_REF: v0.2.18
+  #
+  # v0.2.23 is the first release with scripts/package-cli.sh and the
+  # release-cli workflow release.yml calls (#181): the tarball's packaging
+  # is core's now, and the path sibling must carry it.
+  FS_CORE_REF: v0.2.23
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back

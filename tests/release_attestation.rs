@@ -131,6 +131,16 @@ fn attestation_gaps(yaml: &str) -> Vec<String> {
                 .is_some_and(|u| u.starts_with(ATTEST))
         });
         let Some(at) = attest_at else {
+            // Core's release-cli workflow attests the tarballs inside the
+            // job it runs, so the calling job holds the grants it passes
+            // on; release_cli_gaps holds that call to its own rules.
+            if job
+                .as_mapping_get("uses")
+                .and_then(Yaml::as_str)
+                .is_some_and(|u| u.starts_with(CORE_RELEASE_CLI))
+            {
+                continue;
+            }
             for grant in granted {
                 gaps.push(format!(
                     "job {name} attests nothing but holds {grant}: write"
@@ -155,10 +165,6 @@ fn attestation_gaps(yaml: &str) -> Vec<String> {
             .and_then(|w| w.as_mapping_get("subject-path"))
             .and_then(Yaml::as_str)
             .unwrap_or("");
-        if subject.contains(".tar.gz") {
-            gaps.extend(tarball_gaps(name, job, &steps, at, &granted, jobs));
-            continue;
-        }
         if !subject.contains(".crate") {
             gaps.push(format!(
                 "job {name} attests {subject:?}, not the packaged .crate"
@@ -194,119 +200,6 @@ fn attestation_gaps(yaml: &str) -> Vec<String> {
     gaps
 }
 
-/// What is wrong with how one job attests the command-line tarballs:
-/// empty when nothing is.
-///
-/// The tarballs are built by read-only matrix legs, each on its own
-/// platform, and handed over as workflow artifacts; the attesting job
-/// checks nothing out. So what it signs must be what it DOWNLOADED from
-/// the legs that ran `scripts/package-cli.sh` -- needed by name, so it
-/// cannot run before them -- and what it attaches to the release after
-/// signing must be those same files.
-fn tarball_gaps(
-    name: &str,
-    job: &Yaml,
-    steps: &[&Yaml],
-    at: usize,
-    granted: &[String],
-    jobs: &saphyr::Mapping,
-) -> Vec<String> {
-    let mut gaps = Vec::new();
-    let needs: Vec<String> = match job.as_mapping_get("needs") {
-        Some(n) if n.as_str().is_some() => vec![n.as_str().unwrap().to_owned()],
-        Some(n) => n
-            .as_sequence()
-            .map(|v| {
-                v.iter()
-                    .filter_map(|x| x.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    let packagers: Vec<String> = jobs
-        .iter()
-        .filter(|(_, body)| {
-            body.as_mapping_get("steps")
-                .and_then(Yaml::as_sequence)
-                .is_some_and(|st| {
-                    st.iter().any(|s| {
-                        commands(s)
-                            .iter()
-                            .any(|c| c.contains("scripts/package-cli.sh"))
-                    })
-                })
-        })
-        .filter_map(|(k, _)| k.as_str().map(str::to_owned))
-        .collect();
-    if packagers.is_empty() {
-        gaps.push(format!(
-            "job {name} attests tarballs, but no job packages them with scripts/package-cli.sh"
-        ));
-    }
-    for packager in &packagers {
-        if !needs.contains(packager) {
-            gaps.push(format!(
-                "job {name} attests tarballs without needing job {packager}, which packages them"
-            ));
-        }
-    }
-    let downloads = steps[..at].iter().any(|s| {
-        s.as_mapping_get("uses")
-            .and_then(Yaml::as_str)
-            .is_some_and(|u| u.starts_with("actions/download-artifact@"))
-    });
-    if !downloads {
-        gaps.push(format!(
-            "job {name} attests tarballs it did not download from the legs that packaged them"
-        ));
-    }
-    if !steps[at + 1..].iter().any(|s| {
-        ["gh release upload", "gh release create"]
-            .iter()
-            .flat_map(|p| invocations(s, p))
-            .any(|c| c.contains(".tar.gz"))
-    }) {
-        gaps.push(format!(
-            "job {name} does not attach the attested tarballs to the GitHub release"
-        ));
-    }
-    for grant in GRANTS {
-        if !granted.iter().any(|g| g == grant) {
-            gaps.push(format!("job {name} attests without {grant}: write"));
-        }
-    }
-    gaps
-}
-
-/// The jobs that attest a `.tar.gz`, by name.
-fn tarball_attesters(yaml: &str) -> Vec<String> {
-    let doc = load(yaml);
-    doc.as_mapping_get("jobs")
-        .and_then(Yaml::as_mapping)
-        .map(|jobs| {
-            jobs.iter()
-                .filter(|(_, job)| {
-                    job.as_mapping_get("steps")
-                        .and_then(Yaml::as_sequence)
-                        .is_some_and(|steps| {
-                            steps.iter().any(|s| {
-                                s.as_mapping_get("uses")
-                                    .and_then(Yaml::as_str)
-                                    .is_some_and(|u| u.starts_with(ATTEST))
-                                    && s.as_mapping_get("with")
-                                        .and_then(|w| w.as_mapping_get("subject-path"))
-                                        .and_then(Yaml::as_str)
-                                        .is_some_and(|p| p.contains(".tar.gz"))
-                            })
-                        })
-                })
-                .filter_map(|(k, _)| k.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[test]
 fn the_release_workflow_attests_the_crate_it_publishes() {
     let gaps = attestation_gaps(&workflow());
@@ -314,82 +207,6 @@ fn the_release_workflow_attests_the_crate_it_publishes() {
         gaps.is_empty(),
         "{WORKFLOW} must attest the .crate it publishes, from the one job that \
          publishes it, with only that job privileged: {gaps:#?}"
-    );
-}
-
-/// The command-line tarballs the release attaches are attested too, by
-/// the rules [`tarball_gaps`] holds: a download, the packaging legs
-/// needed, the attaching after the signing, and the three grants.
-#[test]
-fn the_release_workflow_attests_the_tool_tarballs_it_attaches() {
-    let yaml = workflow();
-    assert_eq!(
-        tarball_attesters(&yaml).len(),
-        1,
-        "{WORKFLOW} must attest the command-line tarballs in exactly one job"
-    );
-    assert_eq!(attestation_gaps(&yaml), Vec::<String>::new());
-}
-
-#[test]
-fn the_tarball_reader_discriminates() {
-    let sha = "0123456789abcdef0123456789abcdef01234567";
-    let good = format!(
-        "permissions:\n  contents: read\n\
-         jobs:\n  package-cli:\n    steps:\n      - run: scripts/package-cli.sh 1.0.0 x\n\
-         \x20 publish:\n    permissions:\n      id-token: write\n      attestations: write\n      contents: write\n\
-         \x20   steps:\n      - run: cargo package --no-verify\n      - run: cargo publish\n\
-         \x20     - uses: {ATTEST}{sha}\n        with:\n          subject-path: target/package/*.crate\n\
-         \x20     - run: gh release upload \"$GITHUB_REF_NAME\" target/package/*.crate --clobber\n\
-         \x20 release-cli:\n    needs: [package-cli, publish]\n\
-         \x20   permissions:\n      id-token: write\n      attestations: write\n      contents: write\n\
-         \x20   steps:\n      - uses: actions/download-artifact@v4\n\
-         \x20     - uses: {ATTEST}{sha}\n        with:\n          subject-path: dist/*.tar.gz\n\
-         \x20     - run: gh release upload \"$GITHUB_REF_NAME\" dist/*.tar.gz --clobber\n"
-    );
-    assert_eq!(attestation_gaps(&good), Vec::<String>::new(), "{good}");
-    assert_eq!(tarball_attesters(&good), ["release-cli"]);
-    let expect = |yaml: String, want: &str| {
-        let gaps = attestation_gaps(&yaml);
-        assert!(
-            gaps.iter().any(|g| g.contains(want)),
-            "expected a gap mentioning {want:?}, got {gaps:#?} for\n{yaml}"
-        );
-    };
-    expect(
-        good.replace("needs: [package-cli, publish]", "needs: [publish]"),
-        "without needing job package-cli",
-    );
-    expect(
-        good.replace("      - uses: actions/download-artifact@v4\n", ""),
-        "did not download",
-    );
-    expect(
-        good.replace("dist/*.tar.gz --clobber", "--clobber"),
-        "does not attach the attested tarballs",
-    );
-    expect(
-        good.replace("scripts/package-cli.sh 1.0.0 x", "echo packaged"),
-        "no job packages them",
-    );
-    // One grant dropped from the tarball job alone.
-    let at = good.find("  release-cli:").unwrap();
-    let (head, tail) = good.split_at(at);
-    for grant in GRANTS {
-        expect(
-            format!(
-                "{head}{}",
-                tail.replacen(&format!("      {grant}: write\n"), "", 1)
-            ),
-            &format!("job release-cli attests without {grant}: write"),
-        );
-    }
-    expect(
-        good.replace(
-            &format!("{ATTEST}{sha}\n        with:\n          subject-path: dist"),
-            &format!("{ATTEST}v4\n        with:\n          subject-path: dist"),
-        ),
-        "pin a full commit SHA",
     );
 }
 
@@ -441,6 +258,18 @@ fn the_reader_discriminates() {
             "permissions: write-all\n",
         ),
         "workflow-level permissions grant attestations",
+    );
+    // The call to core's release-cli holds the grants it passes on; any
+    // other called workflow holding one is still refused.
+    let cli = format!(
+        "{good}\x20 cli:\n    needs: [test, publish]\n\
+         \x20   permissions:\n      id-token: write\n\
+         \x20   uses: {CORE_RELEASE_CLI}{sha}\n"
+    );
+    assert_eq!(attestation_gaps(&cli), Vec::<String>::new(), "{cli}");
+    expect(
+        cli.replace(CORE_RELEASE_CLI, "someone/else/.github/workflows/x.yml@"),
+        "job cli attests nothing but holds id-token: write",
     );
     // A job that attests nothing, holding a grant.
     expect(

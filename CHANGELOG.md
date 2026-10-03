@@ -8,6 +8,18 @@ never does.
 
 ### Changed
 
+- **The release tarballs are packaged, attested and attached by
+  rust-fs-core's `release-cli` workflow, not by a copy here** (#181).
+  `release.yml`'s `package-cli` and `release-cli` jobs become one `cli` job
+  calling `antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml`
+  at v0.2.23, pinned by commit SHA; `scripts/package-cli.sh` and its test
+  are gone, and `ci.yml` packages through `scripts/core.sh package-cli`.
+  What ships is declared in `Cargo.toml`'s `[package.metadata.package-cli]`
+  and the tarball's layout is unchanged. The attestations now name the
+  shared workflow, so a tarball is verified with `--signer-workflow
+  antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml`.
+  am-fs-core moves to v0.2.23, the first release that carries it.
+
 - **A test run gives the harness VM and its machine-wide slot back when it
   ends, however it was started.** The oracle and kernel tests boot the VM
   from their own process, and stopping it was left to chore's `after_all`

@@ -33,8 +33,10 @@ name: CI
 #                first, then tests/cli/*.sh. A change that breaks a tool
 #                fails the pull request, not the release. Then the release
 #                tarball is packaged from the same build and its layout
-#                checked by scripts/package-cli.sh, so a release is not the
-#                first time it is put together. No VM here: what erofs-utils
+#                checked by rust-fs-core's package-cli (scripts/core.sh
+#                package-cli), the same packaging release.yml reaches
+#                through core's release-cli workflow, so a release is not
+#                the first time it is put together. No VM here: what erofs-utils
 #                and the kernel make of the tools' images is judged in the
 #                oracle and kernel tiers, in the `test` job.
 #   ci-ok        the one required check: green only when every job above
@@ -351,7 +353,7 @@ jobs:
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           mkdir -p tmp/package
           cd tmp/package
-          ../../scripts/package-cli.sh "$version" linux-x86_64
+          bash ../../scripts/core.sh package-cli "$version" linux-x86_64
       - name: Keep the tier logs
         # Not before the tier ran: there is no log then, and this step's red
         # would hide the real one.

@@ -331,13 +331,19 @@ page and the crates.io download are the same bytes.
 The command-line tools ride the same release, at the same version:
 `am-fs-erofs-X.Y.Z-darwin-arm64.tar.gz` and `-linux-x86_64.tar.gz`, each an
 install prefix (`bin/`, `share/man/`, the shell completions,
-`share/rust-fs-erofs/CAVEATS`, `LICENSE`) and each attested the same way:
+`share/rust-fs-erofs/CAVEATS`, `LICENSE`). They are packaged and attested
+by rust-fs-core's shared `release-cli.yml` workflow, which this
+repository's `release.yml` calls, so that is the workflow their
+attestations name:
 
 ```sh
 gh attestation verify am-fs-erofs-X.Y.Z-darwin-arm64.tar.gz \
   --repo antimatter-studios/rust-fs-erofs \
-  --signer-workflow antimatter-studios/rust-fs-erofs/.github/workflows/release.yml
+  --signer-workflow antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml
 ```
+
+Tarballs from releases up to 0.3.0 were packaged here, and their
+attestations name `antimatter-studios/rust-fs-erofs/.github/workflows/release.yml`.
 
 ## License
 
