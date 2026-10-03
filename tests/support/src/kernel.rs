@@ -429,6 +429,29 @@ pub fn guest_kernel_acl_report(image: &str, what: &str) -> BTreeMap<(String, Str
     parse(&guest_kernel_read_ok(image, what, ACL_REPORT))
 }
 
+/// The guest script for the link-count oracle: every path's link count
+/// and inode number as `stat` reports them, the root as `.`.
+const LINK_REPORT: &str = r#"
+cd "$MNT"
+find . -printf '%P\n' | sort | while read -r path; do
+    path="${path:-.}"
+    links="$(stat -c '%h' "$path")"
+    ino="$(stat -c '%i' "$path")"
+    printf 'links\t%s\t%s\n' "$path" "$links"
+    printf 'ino\t%s\t%s\n' "$path" "$ino"
+done
+"#;
+
+/// Mount `image` read-only in the guest and report, for every path, its
+/// link count (`links`) and its inode number (`ino`), keyed by
+/// `(kind, path)`.
+///
+/// ONE GUEST CALL, like [`guest_kernel_report`].
+#[track_caller]
+pub fn guest_kernel_link_report(image: &str, what: &str) -> BTreeMap<(String, String), String> {
+    parse(&guest_kernel_read_ok(image, what, LINK_REPORT))
+}
+
 /// Mount `image` read-only in the guest and report everything in it:
 /// for every path, its type, mode, owner, size, SHA-256, symlink target,
 /// device number and extended attributes, keyed by `(kind, path)`.
