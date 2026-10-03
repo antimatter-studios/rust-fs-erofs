@@ -20,7 +20,7 @@
 #   python3      scripts/tier.sh asks `cargo metadata` where rust-fs-core
 #                is through it. A guard written around a missing
 #                interpreter is a guard that never runs
-#   PyYAML       scripts/ci-gate.sh PARSES ci.yml rather than scanning it:
+#   PyYAML       scripts/core.sh ci-gate PARSES ci.yml rather than scanning it:
 #                a quoted key, a flow mapping and a `run: |` block whose
 #                contents look like a job key are all ordinary YAML that a
 #                line scan reads wrongly. The module is not a binary, so

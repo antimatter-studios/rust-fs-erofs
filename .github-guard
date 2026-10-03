@@ -24,7 +24,7 @@
 # release.yml is deliberately absent: it triggers on a version tag, so
 # requiring any check of its would block every pull request forever.
 #
-# scripts/ci-gate.sh checks both halves — that ci-ok needs every job in
+# scripts/core.sh ci-gate checks both halves — that ci-ok needs every job in
 # ci.yml, and that this file requires ci-ok and nothing else — and `chore
 # lint` runs it.
 [checks]

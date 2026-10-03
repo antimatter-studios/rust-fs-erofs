@@ -190,7 +190,7 @@ vars:
   # failure path, where nobody looks until it is too late. The rest of the
   # family (ext4, xfs, btrfs, ntfs, the four image crates, go-networkfs)
   # pins v0.2.13 for the same reason.
-  FS_CORE_REF: v0.2.17
+  FS_CORE_REF: v0.2.18
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.2.0
 
@@ -650,7 +650,7 @@ tasks:
     # line. ci.yml runs the same script as its own step, because CI does
     # not call chore.
     cmds:
-      - scripts/ci-gate.sh
+      - bash scripts/core.sh ci-gate
       - cargo fmt --check
       - scripts/agents-core-check.sh
       # The family scripts are rust-fs-core's alone: fails on a committed copy,
@@ -720,4 +720,4 @@ tasks:
     # floor the gate itself enforces -- so the suite could satisfy its floor
     # partly by checking its own CI config.
     cmds:
-      - scripts/ci-gate.sh
+      - bash scripts/core.sh ci-gate
