@@ -131,6 +131,16 @@ fn attestation_gaps(yaml: &str) -> Vec<String> {
                 .is_some_and(|u| u.starts_with(ATTEST))
         });
         let Some(at) = attest_at else {
+            // Core's release-cli workflow attests the tarballs inside the
+            // job it runs, so the calling job holds the grants it passes
+            // on; release_cli_gaps holds that call to its own rules.
+            if job
+                .as_mapping_get("uses")
+                .and_then(Yaml::as_str)
+                .is_some_and(|u| u.starts_with(CORE_RELEASE_CLI))
+            {
+                continue;
+            }
             for grant in granted {
                 gaps.push(format!(
                     "job {name} attests nothing but holds {grant}: write"
@@ -155,10 +165,6 @@ fn attestation_gaps(yaml: &str) -> Vec<String> {
             .and_then(|w| w.as_mapping_get("subject-path"))
             .and_then(Yaml::as_str)
             .unwrap_or("");
-        if subject.contains(".tar.gz") {
-            gaps.extend(tarball_gaps(name, job, &steps, at, &granted, jobs));
-            continue;
-        }
         if !subject.contains(".crate") {
             gaps.push(format!(
                 "job {name} attests {subject:?}, not the packaged .crate"
@@ -194,119 +200,6 @@ fn attestation_gaps(yaml: &str) -> Vec<String> {
     gaps
 }
 
-/// What is wrong with how one job attests the command-line tarballs:
-/// empty when nothing is.
-///
-/// The tarballs are built by read-only matrix legs, each on its own
-/// platform, and handed over as workflow artifacts; the attesting job
-/// checks nothing out. So what it signs must be what it DOWNLOADED from
-/// the legs that ran `scripts/package-cli.sh` -- needed by name, so it
-/// cannot run before them -- and what it attaches to the release after
-/// signing must be those same files.
-fn tarball_gaps(
-    name: &str,
-    job: &Yaml,
-    steps: &[&Yaml],
-    at: usize,
-    granted: &[String],
-    jobs: &saphyr::Mapping,
-) -> Vec<String> {
-    let mut gaps = Vec::new();
-    let needs: Vec<String> = match job.as_mapping_get("needs") {
-        Some(n) if n.as_str().is_some() => vec![n.as_str().unwrap().to_owned()],
-        Some(n) => n
-            .as_sequence()
-            .map(|v| {
-                v.iter()
-                    .filter_map(|x| x.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    let packagers: Vec<String> = jobs
-        .iter()
-        .filter(|(_, body)| {
-            body.as_mapping_get("steps")
-                .and_then(Yaml::as_sequence)
-                .is_some_and(|st| {
-                    st.iter().any(|s| {
-                        commands(s)
-                            .iter()
-                            .any(|c| c.contains("scripts/package-cli.sh"))
-                    })
-                })
-        })
-        .filter_map(|(k, _)| k.as_str().map(str::to_owned))
-        .collect();
-    if packagers.is_empty() {
-        gaps.push(format!(
-            "job {name} attests tarballs, but no job packages them with scripts/package-cli.sh"
-        ));
-    }
-    for packager in &packagers {
-        if !needs.contains(packager) {
-            gaps.push(format!(
-                "job {name} attests tarballs without needing job {packager}, which packages them"
-            ));
-        }
-    }
-    let downloads = steps[..at].iter().any(|s| {
-        s.as_mapping_get("uses")
-            .and_then(Yaml::as_str)
-            .is_some_and(|u| u.starts_with("actions/download-artifact@"))
-    });
-    if !downloads {
-        gaps.push(format!(
-            "job {name} attests tarballs it did not download from the legs that packaged them"
-        ));
-    }
-    if !steps[at + 1..].iter().any(|s| {
-        ["gh release upload", "gh release create"]
-            .iter()
-            .flat_map(|p| invocations(s, p))
-            .any(|c| c.contains(".tar.gz"))
-    }) {
-        gaps.push(format!(
-            "job {name} does not attach the attested tarballs to the GitHub release"
-        ));
-    }
-    for grant in GRANTS {
-        if !granted.iter().any(|g| g == grant) {
-            gaps.push(format!("job {name} attests without {grant}: write"));
-        }
-    }
-    gaps
-}
-
-/// The jobs that attest a `.tar.gz`, by name.
-fn tarball_attesters(yaml: &str) -> Vec<String> {
-    let doc = load(yaml);
-    doc.as_mapping_get("jobs")
-        .and_then(Yaml::as_mapping)
-        .map(|jobs| {
-            jobs.iter()
-                .filter(|(_, job)| {
-                    job.as_mapping_get("steps")
-                        .and_then(Yaml::as_sequence)
-                        .is_some_and(|steps| {
-                            steps.iter().any(|s| {
-                                s.as_mapping_get("uses")
-                                    .and_then(Yaml::as_str)
-                                    .is_some_and(|u| u.starts_with(ATTEST))
-                                    && s.as_mapping_get("with")
-                                        .and_then(|w| w.as_mapping_get("subject-path"))
-                                        .and_then(Yaml::as_str)
-                                        .is_some_and(|p| p.contains(".tar.gz"))
-                            })
-                        })
-                })
-                .filter_map(|(k, _)| k.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[test]
 fn the_release_workflow_attests_the_crate_it_publishes() {
     let gaps = attestation_gaps(&workflow());
@@ -314,82 +207,6 @@ fn the_release_workflow_attests_the_crate_it_publishes() {
         gaps.is_empty(),
         "{WORKFLOW} must attest the .crate it publishes, from the one job that \
          publishes it, with only that job privileged: {gaps:#?}"
-    );
-}
-
-/// The command-line tarballs the release attaches are attested too, by
-/// the rules [`tarball_gaps`] holds: a download, the packaging legs
-/// needed, the attaching after the signing, and the three grants.
-#[test]
-fn the_release_workflow_attests_the_tool_tarballs_it_attaches() {
-    let yaml = workflow();
-    assert_eq!(
-        tarball_attesters(&yaml).len(),
-        1,
-        "{WORKFLOW} must attest the command-line tarballs in exactly one job"
-    );
-    assert_eq!(attestation_gaps(&yaml), Vec::<String>::new());
-}
-
-#[test]
-fn the_tarball_reader_discriminates() {
-    let sha = "0123456789abcdef0123456789abcdef01234567";
-    let good = format!(
-        "permissions:\n  contents: read\n\
-         jobs:\n  package-cli:\n    steps:\n      - run: scripts/package-cli.sh 1.0.0 x\n\
-         \x20 publish:\n    permissions:\n      id-token: write\n      attestations: write\n      contents: write\n\
-         \x20   steps:\n      - run: cargo package --no-verify\n      - run: cargo publish\n\
-         \x20     - uses: {ATTEST}{sha}\n        with:\n          subject-path: target/package/*.crate\n\
-         \x20     - run: gh release upload \"$GITHUB_REF_NAME\" target/package/*.crate --clobber\n\
-         \x20 release-cli:\n    needs: [package-cli, publish]\n\
-         \x20   permissions:\n      id-token: write\n      attestations: write\n      contents: write\n\
-         \x20   steps:\n      - uses: actions/download-artifact@v4\n\
-         \x20     - uses: {ATTEST}{sha}\n        with:\n          subject-path: dist/*.tar.gz\n\
-         \x20     - run: gh release upload \"$GITHUB_REF_NAME\" dist/*.tar.gz --clobber\n"
-    );
-    assert_eq!(attestation_gaps(&good), Vec::<String>::new(), "{good}");
-    assert_eq!(tarball_attesters(&good), ["release-cli"]);
-    let expect = |yaml: String, want: &str| {
-        let gaps = attestation_gaps(&yaml);
-        assert!(
-            gaps.iter().any(|g| g.contains(want)),
-            "expected a gap mentioning {want:?}, got {gaps:#?} for\n{yaml}"
-        );
-    };
-    expect(
-        good.replace("needs: [package-cli, publish]", "needs: [publish]"),
-        "without needing job package-cli",
-    );
-    expect(
-        good.replace("      - uses: actions/download-artifact@v4\n", ""),
-        "did not download",
-    );
-    expect(
-        good.replace("dist/*.tar.gz --clobber", "--clobber"),
-        "does not attach the attested tarballs",
-    );
-    expect(
-        good.replace("scripts/package-cli.sh 1.0.0 x", "echo packaged"),
-        "no job packages them",
-    );
-    // One grant dropped from the tarball job alone.
-    let at = good.find("  release-cli:").unwrap();
-    let (head, tail) = good.split_at(at);
-    for grant in GRANTS {
-        expect(
-            format!(
-                "{head}{}",
-                tail.replacen(&format!("      {grant}: write\n"), "", 1)
-            ),
-            &format!("job release-cli attests without {grant}: write"),
-        );
-    }
-    expect(
-        good.replace(
-            &format!("{ATTEST}{sha}\n        with:\n          subject-path: dist"),
-            &format!("{ATTEST}v4\n        with:\n          subject-path: dist"),
-        ),
-        "pin a full commit SHA",
     );
 }
 
@@ -442,6 +259,18 @@ fn the_reader_discriminates() {
         ),
         "workflow-level permissions grant attestations",
     );
+    // The call to core's release-cli holds the grants it passes on; any
+    // other called workflow holding one is still refused.
+    let cli = format!(
+        "{good}\x20 cli:\n    needs: [test, publish]\n\
+         \x20   permissions:\n      id-token: write\n\
+         \x20   uses: {CORE_RELEASE_CLI}{sha}\n"
+    );
+    assert_eq!(attestation_gaps(&cli), Vec::<String>::new(), "{cli}");
+    expect(
+        cli.replace(CORE_RELEASE_CLI, "someone/else/.github/workflows/x.yml@"),
+        "job cli attests nothing but holds id-token: write",
+    );
     // A job that attests nothing, holding a grant.
     expect(
         good.replace(
@@ -474,5 +303,230 @@ fn the_reader_discriminates() {
     expect(
         good.replace("gh release upload", "echo gh-release-upload"),
         "does not attach the attested .crate",
+    );
+}
+
+/// The reusable workflow that packages, attests and attaches the
+/// command-line tarballs, up to its `@`. rust-fs-core holds the one copy
+/// (#181); this repository only calls it.
+const CORE_RELEASE_CLI: &str = "antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@";
+
+/// A file of this repository, read whole.
+fn read(rel: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+}
+
+/// The value of `key:` in chores.yml's `vars:`, unquoted.
+fn chores_var(key: &str) -> String {
+    let chores = read("chores.yml");
+    chores
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("  {key}:")))
+        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_owned())
+        .unwrap_or_else(|| panic!("chores.yml has no {key}"))
+}
+
+/// The toolchain rust-toolchain.toml pins.
+fn pinned_toolchain() -> String {
+    read("rust-toolchain.toml")
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("channel"))
+        .map(|v| {
+            v.trim_start_matches([' ', '='])
+                .trim()
+                .trim_matches('"')
+                .to_owned()
+        })
+        .expect("rust-toolchain.toml pins a channel")
+}
+
+/// Everything wrong with how `yaml` hands the tarballs to core's
+/// release-cli workflow; empty when nothing is.
+fn release_cli_gaps(yaml: &str, core_ref: &str, toolchain: &str) -> Vec<String> {
+    let doc = load(yaml);
+    let jobs = doc
+        .as_mapping_get("jobs")
+        .and_then(Yaml::as_mapping)
+        .expect("the workflow has jobs");
+    let mut gaps = Vec::new();
+    let callers: Vec<(&str, &Yaml)> = jobs
+        .iter()
+        .filter(|(_, job)| {
+            job.as_mapping_get("uses")
+                .and_then(Yaml::as_str)
+                .is_some_and(|u| u.starts_with(CORE_RELEASE_CLI))
+        })
+        .map(|(k, job)| (k.as_str().unwrap_or("?"), job))
+        .collect();
+    if callers.len() != 1 {
+        gaps.push(format!(
+            "{} jobs call {CORE_RELEASE_CLI}<sha>, not exactly one",
+            callers.len()
+        ));
+    }
+    for (name, job) in callers {
+        let uses = job
+            .as_mapping_get("uses")
+            .and_then(Yaml::as_str)
+            .unwrap_or("");
+        if !is_full_sha(&uses[CORE_RELEASE_CLI.len()..]) {
+            gaps.push(format!(
+                "job {name} uses {uses}, which a moved tag can redirect; pin a full commit SHA"
+            ));
+        }
+        let needs: Vec<String> = match job.as_mapping_get("needs") {
+            Some(n) if n.as_str().is_some() => vec![n.as_str().unwrap().to_owned()],
+            Some(n) => n
+                .as_sequence()
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|x| x.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        for need in ["test", "publish"] {
+            if !needs.iter().any(|n| n == need) {
+                gaps.push(format!("job {name} does not need job {need}"));
+            }
+        }
+        let granted = write_grants(job.as_mapping_get("permissions"));
+        for grant in GRANTS {
+            if !granted.iter().any(|g| g == grant) {
+                gaps.push(format!(
+                    "job {name} calls release-cli without {grant}: write"
+                ));
+            }
+        }
+        let with = |key: &str| {
+            job.as_mapping_get("with")
+                .and_then(|w| w.as_mapping_get(key))
+                .and_then(Yaml::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        if with("core-ref") != core_ref {
+            gaps.push(format!(
+                "job {name} passes core-ref {:?}, not chores.yml's FS_CORE_REF {core_ref:?}",
+                with("core-ref")
+            ));
+        }
+        if with("toolchain") != toolchain {
+            gaps.push(format!(
+                "job {name} passes toolchain {:?}, not rust-toolchain.toml's {toolchain:?}",
+                with("toolchain")
+            ));
+        }
+    }
+    for (name, job) in jobs {
+        let packages_locally = job
+            .as_mapping_get("steps")
+            .and_then(Yaml::as_sequence)
+            .is_some_and(|st| {
+                st.iter().any(|s| {
+                    commands(s)
+                        .iter()
+                        .any(|c| c.contains("scripts/package-cli.sh"))
+                        || s.as_mapping_get("with")
+                            .and_then(|w| w.as_mapping_get("subject-path"))
+                            .and_then(Yaml::as_str)
+                            .is_some_and(|p| p.contains(".tar.gz"))
+                })
+            });
+        if packages_locally {
+            gaps.push(format!(
+                "job {} packages or attests the tarballs itself, beside core's release-cli",
+                name.as_str().unwrap_or("?")
+            ));
+        }
+    }
+    gaps
+}
+
+/// The tarballs are packaged, attested and attached by rust-fs-core's
+/// release-cli workflow, pinned by commit SHA, at the core tag and
+/// toolchain this repository pins, and no local copy of the packaging
+/// remains (#181).
+#[test]
+fn the_tool_tarballs_are_released_by_core_release_cli() {
+    let gaps = release_cli_gaps(&workflow(), &chores_var("FS_CORE_REF"), &pinned_toolchain());
+    assert!(gaps.is_empty(), "{WORKFLOW}: {gaps:#?}");
+    for copy in [
+        "scripts/package-cli.sh",
+        "tests/scripts/test-package-cli.sh",
+    ] {
+        assert!(
+            !Path::new(env!("CARGO_MANIFEST_DIR")).join(copy).exists(),
+            "{copy} is a local copy of rust-fs-core's packaging; run it as scripts/core.sh package-cli"
+        );
+    }
+    let ci = read(".github/workflows/ci.yml");
+    assert!(
+        !ci.lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .any(|l| l.contains("scripts/package-cli.sh")),
+        "ci.yml runs a local scripts/package-cli.sh; run scripts/core.sh package-cli"
+    );
+}
+
+#[test]
+fn the_release_cli_reader_discriminates() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let good = format!(
+        "permissions:\n  contents: read\n\
+         jobs:\n  test:\n    steps:\n      - run: chore test\n\
+         \x20 publish:\n    needs: test\n    steps:\n      - run: cargo publish\n\
+         \x20 cli:\n    needs: [test, publish]\n\
+         \x20   permissions:\n      contents: write\n      id-token: write\n      attestations: write\n\
+         \x20   uses: {CORE_RELEASE_CLI}{sha} # v0.2.23\n\
+         \x20   with:\n      core-ref: v0.2.23\n      toolchain: 1.95.0\n"
+    );
+    let gaps = |yaml: &str| release_cli_gaps(yaml, "v0.2.23", "1.95.0");
+    assert_eq!(gaps(&good), Vec::<String>::new(), "{good}");
+    let expect = |yaml: String, want: &str| {
+        let got = gaps(&yaml);
+        assert!(
+            got.iter().any(|g| g.contains(want)),
+            "expected a gap mentioning {want:?}, got {got:#?} for\n{yaml}"
+        );
+    };
+    expect(good.replace(sha, "v0.2.23"), "pin a full commit SHA");
+    expect(
+        good.replace("needs: [test, publish]", "needs: [test]"),
+        "does not need job publish",
+    );
+    expect(
+        good.replace("needs: [test, publish]", "needs: publish"),
+        "does not need job test",
+    );
+    for grant in GRANTS {
+        expect(
+            good.replace(&format!("      {grant}: write\n"), ""),
+            &format!("without {grant}: write"),
+        );
+    }
+    expect(
+        good.replace("core-ref: v0.2.23", "core-ref: v0.2.18"),
+        "core-ref",
+    );
+    expect(
+        good.replace("toolchain: 1.95.0", "toolchain: stable"),
+        "toolchain",
+    );
+    expect(
+        good.replace(
+            CORE_RELEASE_CLI,
+            "someone/else/.github/workflows/release-cli.yml@",
+        ),
+        "not exactly one",
+    );
+    expect(
+        good.replace(
+            "      - run: chore test\n",
+            "      - run: scripts/package-cli.sh 1.0.0 x\n",
+        ),
+        "packages or attests the tarballs itself",
     );
 }
