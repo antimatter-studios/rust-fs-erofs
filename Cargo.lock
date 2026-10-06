@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "am-fs-erofs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "am-fs-core",
  "clap",
