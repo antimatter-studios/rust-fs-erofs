@@ -4,15 +4,6 @@ Notable changes to `rust-fs-erofs` (published as `am-fs-erofs` until its last ve
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
 
-## [0.4.0] — 2026-10-06
-
-### Changed
-
-- **Published as `rust-fs-erofs`, the repository's name.** The crate was `am-fs-erofs`
-  until its last version, which stays on crates.io pointing here. A
-  dependent changes one line in `Cargo.toml`; the import (`fs_erofs`) and the C symbols are unchanged.
-- **Depends on `rust-fs-core` 0.3.0**, the same library under its new name.
-
 ## [Unreleased]
 
 ### Changed
@@ -23,6 +14,15 @@ never does.
   (rust-fs-core 0.3.2, #212).
 - **A release's notes are its CHANGELOG section**, and a tag the CHANGELOG
   does not describe stops before anything is published (rust-fs-core#209).
+
+## [0.4.0] — 2026-10-06
+
+### Changed
+
+- **Published as `rust-fs-erofs`, the repository's name.** The crate was `am-fs-erofs`
+  until its last version, which stays on crates.io pointing here. A
+  dependent changes one line in `Cargo.toml`; the import (`fs_erofs`) and the C symbols are unchanged.
+- **Depends on `rust-fs-core` 0.3.0**, the same library under its new name.
 
 ## [0.3.1] — 2026-10-06
 
