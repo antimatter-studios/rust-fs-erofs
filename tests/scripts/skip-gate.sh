@@ -5,7 +5,7 @@
 # 0 failed; 1 ignored` behind, and a floor that reads only the passed count
 # stays green as long as N clears it. A test that decided not to run is not a
 # test that passed. rust-fs-core's floor refuses that when asked
-# (`scripts/core.sh test-floor --refuse-ignored`), and proves it in its own
+# (`../rust-fs-core/scripts/test-floor.sh --refuse-ignored`), and proves it in its own
 # tests; this repository's part is asking. So every floor this repository
 # runs -- in chores.yml and in the workflows -- must carry --refuse-ignored,
 # and there must be floors to check.
@@ -16,7 +16,7 @@ pass=0; fail=0
 ok()   { pass=$((pass + 1)); }
 bad()  { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
 printf 'skip-gate\n'
-calls="$(grep -nE 'core\.sh test-floor' chores.yml .github/workflows/*.yml 2>/dev/null \
+calls="$(grep -nE 'test-floor\.sh' chores.yml .github/workflows/*.yml 2>/dev/null \
     | grep -vE ':[0-9]+:\s*#' || true)"
 count="$(printf '%s\n' "$calls" | grep -c . || true)"
 if [ "${count:-0}" -ge 5 ]; then ok; else

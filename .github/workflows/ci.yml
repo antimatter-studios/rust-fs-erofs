@@ -33,8 +33,8 @@ name: CI
 #                first, then tests/cli/*.sh. A change that breaks a tool
 #                fails the pull request, not the release. Then the release
 #                tarball is packaged from the same build and its layout
-#                checked by rust-fs-core's package-cli (scripts/core.sh
-#                package-cli), the same packaging release.yml reaches
+#                checked by rust-fs-core's package-cli (run in place from
+#                ../rust-fs-core), the same packaging release.yml reaches
 #                through core's release-cli workflow, so a release is not
 #                the first time it is put together. No VM here: what erofs-utils
 #                and the kernel make of the tools' images is judged in the
@@ -353,7 +353,7 @@ jobs:
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           mkdir -p tmp/package
           cd tmp/package
-          bash ../../scripts/core.sh package-cli "$version" linux-x86_64
+          bash ../../../rust-fs-core/scripts/package-cli.sh "$version" linux-x86_64
       - name: Keep the tier logs
         # Not before the tier ran: there is no log then, and this step's red
         # would hide the real one.
@@ -379,12 +379,12 @@ jobs:
     # `chore check:semver`: this tree's public API against the newest
     # version on crates.io, refusing a break the version in Cargo.toml does
     # not declare. Why, and what it cannot see, is at the top of
-    # scripts/semver-check.sh.
+    # ../rust-fs-core/scripts/semver-check.sh.
     name: semver (public API against crates.io)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # The version scripts/semver-check.sh expects. A prebuilt binary,
+      # The version ../rust-fs-core/scripts/semver-check.sh expects. A prebuilt binary,
       # checksum-verified by the action, rather than a ten-minute build.
       CARGO_SEMVER_CHECKS_VERSION: "0.50.0"
       # A failing tier prints only its verdict by default. Here the tail IS

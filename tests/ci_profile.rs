@@ -1509,12 +1509,12 @@ fn the_pr_gate_still_hands_the_writers_images_to_fsck_erofs() {
         .iter()
         .find_map(|c| {
             c.trim()
-                .strip_prefix("bash scripts/core.sh test-floor --refuse-ignored oracle ")
+                .strip_prefix("bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored oracle ")
                 .and_then(|n| n.trim().parse::<u32>().ok())
         });
     assert!(
         floor.is_some_and(|n| n > 0),
-        "chores.yml `test:oracle` must end in `bash scripts/core.sh test-floor --refuse-ignored oracle N` \
+        "chores.yml `test:oracle` must end in `bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored oracle N` \
          with N > 0, \
          so the tier cannot go green having run nothing; found {floor:?}"
     );
@@ -1625,9 +1625,9 @@ mod cross_validation_paths_rules {
     use super::cross_validation_paths;
 
     const CHORES: &str = "version: '3'\ntasks:\n  test:\n    cmds:\n      - task: test:oracle\n  \
-                          test:oracle:\n    cmds:\n      - 'scripts/tier.sh test:oracle oracle 1 1 -- \
+                          test:oracle:\n    cmds:\n      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 1 1 -- \
                           scripts/test.sh --locked --release $(scripts/test-targets.sh oracle)'\n      \
-                          - 'bash scripts/core.sh test-floor --refuse-ignored oracle 80'\n";
+                          - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored oracle 80'\n";
 
     fn workflow(job_keys: &str, step_keys: &str) -> String {
         format!(
@@ -1667,8 +1667,8 @@ mod cross_validation_paths_rules {
     #[test]
     fn an_ignored_tier_command_is_not_a_gate() {
         let chores = CHORES.replace(
-            "      - 'scripts/tier.sh",
-            "      - ignore_error: true\n        cmd: 'scripts/tier.sh",
+            "      - '../rust-fs-core/scripts/tier.sh",
+            "      - ignore_error: true\n        cmd: '../rust-fs-core/scripts/tier.sh",
         );
         assert_eq!(found(&workflow("", ""), &chores), 0);
     }

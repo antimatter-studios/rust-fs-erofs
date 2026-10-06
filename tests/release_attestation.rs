@@ -459,15 +459,18 @@ fn the_tool_tarballs_are_released_by_core_release_cli() {
     ] {
         assert!(
             !Path::new(env!("CARGO_MANIFEST_DIR")).join(copy).exists(),
-            "{copy} is a local copy of rust-fs-core's packaging; run it as scripts/core.sh package-cli"
+            "{copy} is a local copy of rust-fs-core's packaging; run it as ../rust-fs-core/scripts/package-cli.sh"
         );
     }
     let ci = read(".github/workflows/ci.yml");
     assert!(
         !ci.lines()
             .filter(|l| !l.trim_start().starts_with('#'))
-            .any(|l| l.contains("scripts/package-cli.sh")),
-        "ci.yml runs a local scripts/package-cli.sh; run scripts/core.sh package-cli"
+            .any(|l| {
+                l.contains("scripts/package-cli.sh")
+                    && !l.contains("rust-fs-core/scripts/package-cli.sh")
+            }),
+        "ci.yml runs a local scripts/package-cli.sh; run ../rust-fs-core/scripts/package-cli.sh"
     );
 }
 

@@ -38,7 +38,7 @@ path = "src/cli/main.rs"
 required-features = ["cli"]
 
 # WHAT THE RELEASE TARBALL SHIPS, read by rust-fs-core's package-cli.sh
-# (`scripts/core.sh package-cli`), which release.yml reaches through core's
+# (`../rust-fs-core/scripts/package-cli.sh`), which release.yml reaches through core's
 # release-cli workflow and ci.yml's `cli` job runs on every pull request.
 # Each dotted name is a relative symlink to bin/rust-fs-erofs, with its man
 # page in the section given here; the binary's own `generate names` must
@@ -55,7 +55,7 @@ licenses = ["LICENSE"]
 cli = ["dep:clap", "rust-fs-core/cli"]
 
 [dependencies]
-rust-fs-core = { path = "../rust-fs-core", version = "0.3.0" }
+rust-fs-core = { path = "../rust-fs-core", version = "0.3.2" }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 lzma-rs = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
