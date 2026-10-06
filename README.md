@@ -1,22 +1,8 @@
 # rust-fs-erofs
 
-> **Renamed to [`rust-fs-erofs`](https://crates.io/crates/rust-fs-erofs).**
-> `am-fs-erofs` 0.3.1 is the last version published under this name. New versions
-> are published only as `rust-fs-erofs`, starting at 0.4.0. To move, change one line
-> in `Cargo.toml`:
->
-> ```toml
-> # before
-> am-fs-erofs = "0.3"
-> # after
-> rust-fs-erofs = "0.4"
-> ```
->
-> The import is unchanged: `use fs_erofs::...` keeps working.
-
 A pure-Rust, clean-room implementation of the **EROFS** (Enhanced Read-Only File System) on-disk format. Reads and writes images that the Linux kernel's EROFS driver and `erofs-utils` toolchain accept byte-for-byte.
 
-The repository ships one library crate (published on crates.io as `am-fs-erofs`, library name `fs_erofs`) plus its command-line tools: one multi-call binary, `rust-fs-erofs`, also installed as `mkfs.erofs` and `fs.erofs`.
+The repository ships one library crate (published on crates.io as `rust-fs-erofs`, library name `fs_erofs`) plus its command-line tools: one multi-call binary, `rust-fs-erofs`, also installed as `mkfs.erofs` and `fs.erofs`.
 
 - **Reader**: every EROFS feature emitted by `mkfs.erofs` 1.9 + AOSP build systems
 - **Writer (`mkfs.erofs`)**: produces images `fsck.erofs` accepts as valid
@@ -110,7 +96,7 @@ The repository ships one library crate (published on crates.io as `am-fs-erofs`,
 
 ```toml
 [dependencies]
-am-fs-erofs = "0.3"
+rust-fs-erofs = "0.4"
 ```
 
 ### From source (workspace path-dep)
@@ -118,7 +104,7 @@ am-fs-erofs = "0.3"
 ```toml
 [dependencies]
 fs-erofs = { path = "../rust-fs-erofs" }
-am-fs-core = { path = "../rust-fs-core" }
+rust-fs-core = { path = "../rust-fs-core" }
 ```
 
 ### Building locally
@@ -220,7 +206,7 @@ fs.erofs --offset 1048576 disk.img ls /         # a filesystem inside a larger i
 rust-fs-erofs doctor --text
 ```
 
-A result is JSON on stdout (`--text` for people); a failure is `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the command line was wrong, 3 the tool cannot do that (`mkfs.erofs --label` is refused until the builder takes a volume name, and `fs.erofs write`, `mkdir`, `set` and `resize` answer "EROFS is read-only"). `--version` prints `<tool> (am-fs-erofs) <version>`.
+A result is JSON on stdout (`--text` for people); a failure is `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the command line was wrong, 3 the tool cannot do that (`mkfs.erofs --label` is refused until the builder takes a volume name, and `fs.erofs write`, `mkdir`, `set` and `resize` answer "EROFS is read-only"). `--version` prints `<tool> (rust-fs-erofs) <version>`.
 
 erofs-utils installs a `mkfs.erofs` too. Only one can be first on `PATH`; `rust-fs-erofs doctor` says which, and how to change it.
 
@@ -332,8 +318,8 @@ repository, not uploaded from someone's machine. To check the crates.io
 download of version `X.Y.Z`:
 
 ```sh
-curl -sSfLo am-fs-erofs-X.Y.Z.crate https://static.crates.io/crates/am-fs-erofs/am-fs-erofs-X.Y.Z.crate
-gh attestation verify am-fs-erofs-X.Y.Z.crate \
+curl -sSfLo rust-fs-erofs-X.Y.Z.crate https://static.crates.io/crates/rust-fs-erofs/rust-fs-erofs-X.Y.Z.crate
+gh attestation verify rust-fs-erofs-X.Y.Z.crate \
   --repo antimatter-studios/rust-fs-erofs \
   --signer-workflow antimatter-studios/rust-fs-erofs/.github/workflows/release.yml
 ```
@@ -343,7 +329,7 @@ checksum crates.io records for that version, so the file on the release
 page and the crates.io download are the same bytes.
 
 The command-line tools ride the same release, at the same version:
-`am-fs-erofs-X.Y.Z-darwin-arm64.tar.gz` and `-linux-x86_64.tar.gz`, each an
+`rust-fs-erofs-X.Y.Z-darwin-arm64.tar.gz` and `-linux-x86_64.tar.gz`, each an
 install prefix (`bin/`, `share/man/`, the shell completions,
 `share/rust-fs-erofs/CAVEATS`, `LICENSE`). They are packaged and attested
 by rust-fs-core's shared `release-cli.yml` workflow, which this
@@ -351,7 +337,7 @@ repository's `release.yml` calls, so that is the workflow their
 attestations name:
 
 ```sh
-gh attestation verify am-fs-erofs-X.Y.Z-darwin-arm64.tar.gz \
+gh attestation verify rust-fs-erofs-X.Y.Z-darwin-arm64.tar.gz \
   --repo antimatter-studios/rust-fs-erofs \
   --signer-workflow antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml
 ```
@@ -385,9 +371,9 @@ Issues + PRs welcome. Before opening:
 
 | Crate | License | Purpose |
 |---|---|---|
-| [`am-fs-core`](https://crates.io/crates/am-fs-core) | MIT | Block-device traits (`BlockRead`, `FileDevice`, slice adapters) |
-| [`am-fs-erofs`](https://crates.io/crates/am-fs-erofs) (this) | MIT | EROFS read + write |
-| [`am-fs-ext4`](https://crates.io/crates/am-fs-ext4) | MIT | ext4 read + write (sister project) |
+| [`rust-fs-core`](https://crates.io/crates/rust-fs-core) | MIT | Block-device traits (`BlockRead`, `FileDevice`, slice adapters) |
+| [`rust-fs-erofs`](https://crates.io/crates/rust-fs-erofs) (this) | MIT | EROFS read + write |
+| [`rust-fs-ext4`](https://crates.io/crates/rust-fs-ext4) | MIT | ext4 read + write (sister project) |
 
 ## Acknowledgements
 

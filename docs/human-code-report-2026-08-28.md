@@ -585,7 +585,7 @@ The two functions also share ~15 lines of NONHEAD walk-back logic verbatim
 (`:1074-1093` vs `:1169-1187`), so the dead copy is a live maintenance cost.
 
 **Decision needed, not just a refactor.** Deleting a `pub` item from a published
-crate (`am-fs-erofs 0.1.2` is on crates.io) is a breaking change. The options are:
+crate (`rust-fs-erofs 0.1.2` is on crates.io) is a breaking change. The options are:
 delete in the next minor, keep it and fix the doc, or mark it `#[deprecated]`.
 That is your call, which is why this is listed rather than fixed.
 
@@ -957,7 +957,7 @@ covered by `tests/oracle_writer.rs`.
 
 # Divergence from the sibling crates
 
-`am-fs-erofs` is one of the two newest members of a seven-crate family
+`rust-fs-erofs` is one of the two newest members of a seven-crate family
 (`rust-fs-core`, `rust-fs-ext4`, `rust-fs-ntfs`, `rust-fs-xfs`, `rust-fs-btrfs`,
 `rust-fs-squashfs`). A comparison pass across all seven was run alongside this
 review. The headline is that erofs has picked up the family's *test* and

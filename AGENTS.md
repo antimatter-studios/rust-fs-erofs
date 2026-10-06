@@ -153,7 +153,7 @@ it**. Do not silence output to fit, and do not route around `tier.sh`.
 <!-- END SHARED BLOCK: agent-core v2 -->
 ## What this is
 
-Pure-Rust EROFS driver over `am-fs-core`, exposing a C ABI (`tests/capi_*.rs`)
+Pure-Rust EROFS driver over `rust-fs-core`, exposing a C ABI (`tests/capi_*.rs`)
 and linked into the app as a staticlib. Read-only by nature — EROFS is a
 read-only format — so the suite is about decoding hostile images correctly
 rather than round-tripping writes.
@@ -181,7 +181,7 @@ Two things about the local build, because they cost time otherwise: erofs-utils
 1.9.1 is built without root, and it **defaults to 16K pages** — pass `-b4096`
 where a 4 KiB block is meant. A missing tool **fails** the job; it does not skip.
 
-## The am-fs-core pin is declared in four places
+## The rust-fs-core pin is declared in four places
 
 `Cargo.toml`, `fuzz/Cargo.toml`, `chores.yml` (`FS_CORE_REF`) and `fuzz.yml`
 (the `git clone --branch` ref) each name the core release this crate builds

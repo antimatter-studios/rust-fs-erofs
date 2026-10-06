@@ -194,7 +194,7 @@ vars:
   # v0.2.23 is the first release with scripts/package-cli.sh and the
   # release-cli workflow release.yml calls (#181): the tarball's packaging
   # is core's now, and the path sibling must carry it.
-  FS_CORE_REF: v0.2.23
+  FS_CORE_REF: v0.3.0
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
@@ -618,7 +618,7 @@ tasks:
       - 'include/*.h'
       # fs_core.h is a source of ours because we ship it (see the cp below).
       # THIS PATH AND THE cp MUST AGREE, and nothing checks that they do —
-      # it is the same path Cargo.toml resolves am-fs-core from.
+      # it is the same path Cargo.toml resolves rust-fs-core from.
       - '../rust-fs-core/include/fs_core.h'
       # The task's own definition. Without it an edit to cmds:, a cp path or
       # vars.TRIPLE leaves the fingerprint unchanged, so chore reports

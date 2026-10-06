@@ -15,23 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "am-fs-core"
-version = "0.2.23"
-
-[[package]]
-name = "am-fs-erofs"
-version = "0.3.0"
-dependencies = [
- "am-fs-core",
- "crc32c",
- "flate2",
- "lru",
- "lz4_flex",
- "lzma-rs",
- "ruzstd",
-]
-
-[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -126,9 +109,9 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 name = "fs-erofs-fuzz"
 version = "0.0.0"
 dependencies = [
- "am-fs-core",
- "am-fs-erofs",
  "libfuzzer-sys",
+ "rust-fs-core",
+ "rust-fs-erofs",
 ]
 
 [[package]]
@@ -219,6 +202,23 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rust-fs-core"
+version = "0.3.0"
+
+[[package]]
+name = "rust-fs-erofs"
+version = "0.4.0"
+dependencies = [
+ "crc32c",
+ "flate2",
+ "lru",
+ "lz4_flex",
+ "lzma-rs",
+ "rust-fs-core",
+ "ruzstd",
+]
 
 [[package]]
 name = "rustc_version"

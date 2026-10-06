@@ -56,7 +56,7 @@ jobs:
       # --locked was passed`. github-guard's rust-deps-pinned check compares
       # these two and is what caught it.
       - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.23 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: git clone --depth 1 --branch v0.3.0 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
 
       # Nightly, not the pin in rust-toolchain.toml. cargo-fuzz needs
       # `-Z sanitizer`, which stable does not have. The explicit

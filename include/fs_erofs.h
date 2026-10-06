@@ -87,7 +87,7 @@ fs_erofs_fs_t *fs_erofs_mount(const char *device_path);
 fs_erofs_fs_t *fs_erofs_mount_with_callbacks(const fs_erofs_blockdev_cfg_t *cfg);
 
 /* Mount via an FsCoreDevice handle from a sister crate (e.g.
- * fs_core_device_from_callbacks / fs_core_device_slice_ro from am-fs-core).
+ * fs_core_device_from_callbacks / fs_core_device_slice_ro from rust-fs-core).
  * The handle's refcount is incremented; the caller still owns its
  * *FsCoreDevice and frees it via fs_core_device_close. Forward declared —
  * full definition in fs_core.h. NULL on failure. */
