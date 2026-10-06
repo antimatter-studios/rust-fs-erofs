@@ -205,7 +205,7 @@ an in-progress `CheckRun` reports its conclusion as an empty string, and a
 
 `chore check:ci-gate` holds both halves of that mechanically — every job in
 `ci.yml` must appear in `ci-ok`'s `needs:`, and `.github-guard` must require
-`ci-ok` and nothing else. The task runs `scripts/core.sh ci-gate` and nothing else,
+`ci-ok` and nothing else. The task runs `../rust-fs-core/scripts/ci-gate.sh` and nothing else,
 so the script is what can be tested, reviewed and run without `chore` at all.
 It replaced `tests/ci_aggregate_gate.rs`: that parsed a YAML file and compared
 strings, exercising nothing this crate ships, and as a `cargo test` it counted

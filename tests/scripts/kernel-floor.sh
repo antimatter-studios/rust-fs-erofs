@@ -11,7 +11,7 @@
 # selects for the tier and requires the floor chores.yml declares to EQUAL
 # that count: a floor below it lets a run one test short pass, and a floor
 # above it refuses a run that executed every test. The floor itself is
-# rust-fs-core's (scripts/core.sh test-floor), tested there; what is this
+# rust-fs-core's (../rust-fs-core/scripts/test-floor.sh), tested there; what is this
 # repository's is the number, so the number is what is checked here.
 set -uo pipefail
 
@@ -24,7 +24,7 @@ bad()  { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
 
 printf 'kernel-floor\n'
 
-floors="$(grep -oE 'core\.sh test-floor (--refuse-ignored )?kernel [0-9]+' chores.yml | awk '{ print $NF }')"
+floors="$(grep -oE 'test-floor\.sh (--refuse-ignored )?kernel [0-9]+' chores.yml | awk '{ print $NF }')"
 if [ "$(printf '%s\n' "$floors" | grep -c .)" -ne 1 ]; then
     bad "chores.yml must declare exactly one kernel floor (found: ${floors:-none})"
     floors=0
