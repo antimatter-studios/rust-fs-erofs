@@ -102,7 +102,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@c471c826edc78866f572b873cbc165cb61b86ccf # v0.3.2
+    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@943a3136cd9bc3f8e2ca55ce3bd624adba9f40b7 # v0.3.6
     with:
       core-ref: v0.3.2
       toolchain: 1.95.0
@@ -165,8 +165,9 @@ jobs:
       # A tag the CHANGELOG does not describe stops before crates.io has
       # anything (rust-fs-core#209).
       - name: the CHANGELOG describes this version
-        shell: bash
-        run: bash ../rust-fs-core/scripts/release-notes.sh "$GITHUB_REF_NAME" >/dev/null
+        uses: antimatter-studios/agent-skills/.github/actions/changelog-notes@ed0b96812c5908478dcd84543debf4d5f8bf87e3
+        with:
+          tag: ${{ github.ref_name }}
 
       - name: package the crate
         shell: bash
@@ -219,6 +220,13 @@ jobs:
       # So `gh attestation verify` has a file to check that anyone can
       # fetch beside the tag, and so the crates.io download can be
       # compared with it.
+      # The release body is this version's CHANGELOG section, from github-guard's
+      # changelog extraction through agent-skills' changelog-notes action.
+      - name: the release notes are this version's CHANGELOG section
+        uses: antimatter-studios/agent-skills/.github/actions/changelog-notes@ed0b96812c5908478dcd84543debf4d5f8bf87e3
+        with:
+          tag: ${{ github.ref_name }}
+          output-file: ${{ runner.temp }}/release-notes.md
       - name: attach the crate to the GitHub release
         shell: bash
         env:
@@ -226,8 +234,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # The release body is this version's CHANGELOG section (rust-fs-core#209).
-          bash ../rust-fs-core/scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
           else
