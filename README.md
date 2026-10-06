@@ -96,7 +96,7 @@ The repository ships one library crate (published on crates.io as `rust-fs-erofs
 
 ```toml
 [dependencies]
-rust-fs-erofs = "0.3"
+rust-fs-erofs = "0.4"
 ```
 
 ### From source (workspace path-dep)
