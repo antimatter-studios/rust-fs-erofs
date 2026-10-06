@@ -11,7 +11,7 @@
 # and says so: "core is broken" reported as a green tier, or as "core is
 # missing", is the quieter and more confusing failure.
 #
-# So this builds a throwaway crate whose am-fs-core is a fake with a wrapper
+# So this builds a throwaway crate whose rust-fs-core is a fake with a wrapper
 # of our choosing, runs the real tier.sh against it, and requires a refusal
 # for a wrong or missing answer and a run for the right one.
 set -uo pipefail
@@ -41,11 +41,11 @@ edition = "2021"
 publish = false
 
 [dependencies]
-am-fs-core = { path = "../core" }
+rust-fs-core = { path = "../core" }
 TOML
 cat > "$core/Cargo.toml" <<'TOML'
 [package]
-name = "am-fs-core"
+name = "rust-fs-core"
 version = "0.0.0"
 edition = "2021"
 publish = false

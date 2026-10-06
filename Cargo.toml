@@ -1,15 +1,20 @@
 [package]
-name = "am-fs-erofs"
-version = "0.3.1"
+name = "rust-fs-erofs"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
-description = "Renamed to rust-fs-erofs: this crate receives no further versions. Depend on rust-fs-erofs instead; the import is unchanged (use fs_erofs)."
+description = "Pure-Rust EROFS (Enhanced Read-Only File System) reader and writer. Clean-room implementation; reads mkfs.erofs 1.9 images (LZ4/LZMA/DEFLATE/ZSTD, compacted-2B, ztailpacking, fragments, dedupe, big_pcluster), and refuses rather than misreads the shapes it cannot vouch for and produces fsck.erofs-clean output."
 repository = "https://github.com/antimatter-studios/rust-fs-erofs"
 
 # The fuzz crate is its own package, on its own toolchain, and is not
 # part of this one. Without this, `cargo package` and `cargo publish`
 # try to include it and fail on the nightly-only dependency.
 exclude = ["fuzz"]
+
+# The name this crate had on crates.io: the semver check's baseline until
+# a release exists under the new one (rust-fs-core's semver-check.sh).
+[package.metadata.semver]
+former-name = "am-fs-erofs"
 
 [lib]
 name = "fs_erofs"
@@ -45,12 +50,12 @@ licenses = ["LICENSE"]
 [features]
 # The command-line tools and nothing else. The plumbing they share --
 # dispatch, --version, doctor, the output contract, man pages and
-# completions -- is am-fs-core's `cli` feature, turned on only here, so
+# completions -- is rust-fs-core's `cli` feature, turned on only here, so
 # the static library gains nothing. clap is MIT/Apache-2.0.
-cli = ["dep:clap", "am-fs-core/cli"]
+cli = ["dep:clap", "rust-fs-core/cli"]
 
 [dependencies]
-am-fs-core = { path = "../rust-fs-core", version = "0.2.23" }
+rust-fs-core = { path = "../rust-fs-core", version = "0.3.0" }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 lzma-rs = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

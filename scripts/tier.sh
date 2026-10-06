@@ -46,12 +46,12 @@ CORE_DIR="$(cargo metadata --format-version 1 --locked --manifest-path "$REPO/Ca
 import json, sys
 packages = json.load(sys.stdin)["packages"]
 print(next((p["manifest_path"].rsplit("/", 1)[0]
-            for p in packages if p["name"] == "am-fs-core"), ""))
+            for p in packages if p["name"] == "rust-fs-core"), ""))
 ')"
 if [ -z "$CORE_DIR" ] || [ ! -f "$CORE_DIR/scripts/output-budget.sh" ]; then
-    echo "tier.sh: cargo could not say where am-fs-core is, or its copy has no" >&2
+    echo "tier.sh: cargo could not say where rust-fs-core is, or its copy has no" >&2
     echo "         scripts/output-budget.sh. The wrapper lives in rust-fs-core;" >&2
-    echo "         check the am-fs-core dependency resolves and is at a version" >&2
+    echo "         check the rust-fs-core dependency resolves and is at a version" >&2
     echo "         that ships it (v0.2.11 or later) -- 'chore siblings' moves the" >&2
     echo "         ../rust-fs-core checkout to the ref chores.yml pins." >&2
     exit 1

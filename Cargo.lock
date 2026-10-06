@@ -15,33 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "am-fs-core"
-version = "0.2.23"
-dependencies = [
- "clap",
- "clap_complete",
- "clap_mangen",
-]
-
-[[package]]
-name = "am-fs-erofs"
-version = "0.3.1"
-dependencies = [
- "am-fs-core",
- "clap",
- "crc32c",
- "flate2",
- "fs-erofs-test-support",
- "lru",
- "lz4_flex",
- "lzma-rs",
- "ruzstd",
- "saphyr",
- "sha2",
- "tempfile",
-]
-
-[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -442,6 +415,33 @@ name = "roff"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
+name = "rust-fs-core"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+]
+
+[[package]]
+name = "rust-fs-erofs"
+version = "0.4.0"
+dependencies = [
+ "clap",
+ "crc32c",
+ "flate2",
+ "fs-erofs-test-support",
+ "lru",
+ "lz4_flex",
+ "lzma-rs",
+ "rust-fs-core",
+ "ruzstd",
+ "saphyr",
+ "sha2",
+ "tempfile",
+]
 
 [[package]]
 name = "rustc_version"
