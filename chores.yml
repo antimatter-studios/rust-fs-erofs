@@ -92,8 +92,10 @@ chore_min_version: 0.10.0
 #
 #     tier      measured          budget            headroom, and why
 #     tier      measured          budget            headroom, and why
-#     unit      568 l / 30,665 B  740 l / 40,000 B  +63 lines for a COLD
-#               453 tests                           build (see below), then ~15%
+#     unit      792 l / 42,371 B  920 l / 49,000 B  measured COLD on CI (run
+#               453 tests                           37471725686: a Cargo.lock
+#                                                   change misses the build
+#                                                   cache), then ~15%
 #     images     13 l /    684 B  120 l /  8,000 B  the first --release tier in
 #                 3 tests                           a job, so it pays the cold
 #                                                   build too: 73 l cold
@@ -357,7 +359,7 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 740 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 920 49000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
       - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 420'
 
   test:images:
