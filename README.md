@@ -1,5 +1,19 @@
 # rust-fs-erofs
 
+> **Renamed to [`rust-fs-erofs`](https://crates.io/crates/rust-fs-erofs).**
+> `am-fs-erofs` 0.3.1 is the last version published under this name. New versions
+> are published only as `rust-fs-erofs`, starting at 0.4.0. To move, change one line
+> in `Cargo.toml`:
+>
+> ```toml
+> # before
+> am-fs-erofs = "0.3"
+> # after
+> rust-fs-erofs = "0.4"
+> ```
+>
+> The import is unchanged: `use fs_erofs::...` keeps working.
+
 A pure-Rust, clean-room implementation of the **EROFS** (Enhanced Read-Only File System) on-disk format. Reads and writes images that the Linux kernel's EROFS driver and `erofs-utils` toolchain accept byte-for-byte.
 
 The repository ships one library crate (published on crates.io as `am-fs-erofs`, library name `fs_erofs`) plus its command-line tools: one multi-call binary, `rust-fs-erofs`, also installed as `mkfs.erofs` and `fs.erofs`.

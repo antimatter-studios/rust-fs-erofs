@@ -6,6 +6,16 @@ never does.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-10-06
+
+### Renamed
+
+- **The last version published as `am-fs-erofs`.** The crate is renamed to
+  `rust-fs-erofs`, the repository's name; every later version is published under
+  that name only, starting at 0.4.0. The description and the README say where
+  the crate went. The import is unchanged: `use fs_erofs::...` keeps working.
+
+
 ### Changed
 
 - **The release tarballs are packaged, attested and attached by
@@ -364,6 +374,7 @@ never does.
 
 - Package renamed to `am-fs-erofs`; the lib name stays `fs_erofs`.
 
+[0.3.1]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.1.4...v0.1.5
