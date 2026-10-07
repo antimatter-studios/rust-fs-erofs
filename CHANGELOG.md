@@ -6,6 +6,14 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cold cargo cache no longer fails the unit tier's output budget.**
+  `chore test:unit` compiles its tests before the budgeted run starts
+  counting, so the toolchain install, downloads and `Compiling` lines are
+  no longer counted against the tier. The budget goes back to 740 lines /
+  40,000 bytes, sized for the test output alone (#189).
+
 ### Changed
 
 - **The family's scripts run in place from rust-fs-core, and this repository
