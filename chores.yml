@@ -92,10 +92,15 @@ chore_min_version: 0.10.0
 #
 #     tier      measured          budget            headroom, and why
 #     tier      measured          budget            headroom, and why
-#     unit      792 l / 42,371 B  920 l / 49,000 B  measured COLD on CI (run
-#               453 tests                           37471725686: a Cargo.lock
-#                                                   change misses the build
-#                                                   cache), then ~15%
+#     unit      643 l / 35,194 B  740 l / 40,000 B  ~15%. The tests' own output:
+#               453 tests                           the build runs first,
+#                                                   outside the budget (#189),
+#                                                   so a cold cache no longer
+#                                                   counts. From main run
+#                                                   37545116802's unit.log,
+#                                                   792 l / 42,371 B cold,
+#                                                   less its 149 cargo and
+#                                                   rustup lines
 #     images     13 l /    684 B  120 l /  8,000 B  the first --release tier in
 #                 3 tests                           a job, so it pays the cold
 #                                                   build too: 73 l cold
@@ -148,9 +153,10 @@ chore_min_version: 0.10.0
 #   (74 packages in Cargo.lock) by `cargo clean` then the suite tier: 709
 #   lines warm against 771 cold. It lands on whichever tier runs FIRST in
 #   a job, and on BOTH profiles -- `unit` is the only debug tier, so it
-#   pays its own. That is why the two smallest tiers carry the largest
-#   proportional headroom: `images` legitimately prints 13 lines and
-#   legitimately prints 73.
+#   would pay its own, which is why `test:unit` builds before its tier
+#   starts counting (#189). The release tiers still pay it, which is why
+#   `images`, the smallest, carries the largest proportional headroom: it
+#   legitimately prints 13 lines and legitimately prints 73.
 #
 #   Raise one DELIBERATELY when a tier grows, the way the executed-test
 #   floors are raised. A budget nobody can breach measures nothing.
@@ -358,8 +364,17 @@ tasks:
     # Which targets: scripts/test-targets.sh, derived from the tests
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
+    #
+    # BUILT FIRST, OUTSIDE THE BUDGET (#189). The same command with
+    # `--no-run`: on a cold cache it is what installs the pinned toolchain,
+    # downloads the crates and compiles them, and none of that is the
+    # tier's output. Inside tier.sh it was 149 lines of a 792-line log
+    # (run 37471725686), enough to refuse a tier whose tests all passed.
+    # `--quiet` keeps a warm run silent. tests/ci_profile.rs requires this
+    # step to build exactly what the tier runs.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 920 49000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'scripts/test.sh --locked --no-run --quiet $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 740 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
       - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 420'
 
   test:images:
