@@ -13,6 +13,9 @@ never does.
   counting, so the toolchain install, downloads and `Compiling` lines are
   no longer counted against the tier. The budget goes back to 740 lines /
   40,000 bytes, sized for the test output alone (#189).
+- **A transient HTTP 5xx from the chore release download no longer fails a CI
+  job.** `scripts/ci-install-chore.sh` retries both downloads up to five times
+  on any error; the checksum check still guards what was fetched.
 
 ### Changed
 
