@@ -3298,3 +3298,139 @@ fn ci_cancels_only_a_pull_requests_superseded_run() {
          cancelled by the next: {group}"
     );
 }
+
+/// THE UNIT TIER COMPILES BEFORE ITS BUDGET STARTS COUNTING (#189).
+///
+/// `tier.sh` budgets everything the wrapped command prints, and the
+/// first `cargo test` in a job prints the build: rustup installing the
+/// pinned toolchain, `Updating crates.io index`, a `Downloaded` line per
+/// crate and a `Compiling` line per package. The cargo cache is keyed on
+/// `Cargo.lock`, so every lockfile change starts the `unit` job cold, and
+/// run 37471725686 refused a tier whose every test passed: 792 lines
+/// against 740, of which 149 were the build. The cache is saved only by
+/// a green job, so the re-run was cold again, and so would every run be
+/// until someone raised the budget -- which is what happened, to the
+/// cold figure, and that hides 143 lines of real growth in the tests.
+///
+/// So the test binaries are built FIRST, by the same command with
+/// `--no-run`, outside `tier.sh`. Its output goes to the terminal and
+/// the job log, not to `tmp/logs/unit.log`, and the tier then runs what
+/// is already built. Same command is the point: a build that differed
+/// in features, profile or selection would leave the tier compiling its
+/// own, and the budget counting it again.
+///
+/// Returns why `chores` fails that, or `Ok`.
+fn unit_tier_builds_outside_its_budget(chores: &str) -> Result<(), String> {
+    let tasks = parse_chores(chores);
+    let commands = gating_chore_commands(&tasks, "test:unit", &mut Vec::new());
+    let is_tier = |c: &str| {
+        shell_commands(c).iter().any(|words| {
+            words.iter().any(|w| w.ends_with("/tier.sh"))
+                && words
+                    .windows(2)
+                    .any(|p| p[0] == "test:unit" && p[1] == "unit")
+        })
+    };
+    let Some(at) = commands.iter().position(|c| is_tier(c)) else {
+        return Err(format!(
+            "chores.yml's `test:unit` runs no `tier.sh test:unit unit ...`: {commands:?}"
+        ));
+    };
+    let Some((_, budgeted)) = commands[at].split_once(" -- ") else {
+        return Err(format!(
+            "cannot find the budgeted command after ` -- ` in {:?}",
+            commands[at]
+        ));
+    };
+    let budgeted = budgeted.trim();
+    let builds_the_same = |c: &str| {
+        let words: Vec<&str> = c.split_whitespace().collect();
+        !c.contains("tier.sh")
+            && words.contains(&"--no-run")
+            && words
+                .iter()
+                .filter(|w| !matches!(**w, "--no-run" | "--quiet"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ")
+                == budgeted
+    };
+    if commands[..at].iter().any(|c| builds_the_same(c)) {
+        return Ok(());
+    }
+    Err(format!(
+        "nothing in chores.yml's `test:unit` builds the tests before the budgeted \
+         `{budgeted}` runs, so on a cold cargo cache tier.sh counts the toolchain \
+         install, the downloads and every `Compiling` line against the unit budget \
+         (#189). Run `{budgeted}` with `--no-run` (and optionally `--quiet`), outside \
+         tier.sh, before the tier. Commands found: {commands:?}"
+    ))
+}
+
+#[test]
+fn the_unit_tier_compiles_before_its_budget_starts_counting() {
+    let chores = read_or_panic(&manifest_dir().join("chores.yml"));
+    if let Err(why) = unit_tier_builds_outside_its_budget(&chores) {
+        panic!("{why}");
+    }
+}
+
+mod unit_build_rules {
+    use super::unit_tier_builds_outside_its_budget as check;
+
+    const TIER: &str = "'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh \
+                        test:unit unit 740 40000 -- scripts/test.sh --locked \
+                        $(scripts/test-targets.sh unit)'";
+
+    fn chores(cmds: &[&str], extra: &str) -> String {
+        let mut text = String::from("tasks:\n  test:unit:\n    cmds:\n");
+        for c in cmds {
+            text.push_str(&format!("      - {c}\n"));
+        }
+        text.push_str(extra);
+        text
+    }
+
+    const BUILD: &str =
+        "'scripts/test.sh --locked --no-run --quiet $(scripts/test-targets.sh unit)'";
+
+    #[test]
+    fn a_build_before_the_tier_passes() {
+        assert_eq!(check(&chores(&[BUILD, TIER], "")), Ok(()));
+    }
+
+    #[test]
+    fn a_build_through_a_task_passes() {
+        let extra = format!("  build:unit:\n    cmds:\n      - {BUILD}\n");
+        assert_eq!(check(&chores(&["task: build:unit", TIER], &extra)), Ok(()));
+    }
+
+    #[test]
+    fn no_build_fails() {
+        assert!(check(&chores(&[TIER], "")).is_err());
+    }
+
+    #[test]
+    fn a_build_after_the_tier_fails() {
+        assert!(check(&chores(&[TIER, BUILD], "")).is_err());
+    }
+
+    #[test]
+    fn a_build_of_another_selection_fails() {
+        let other = "'scripts/test.sh --locked --no-run $(scripts/test-targets.sh all)'";
+        assert!(check(&chores(&[other, TIER], "")).is_err());
+    }
+
+    #[test]
+    fn a_build_in_another_profile_fails() {
+        let release =
+            "'scripts/test.sh --locked --release --no-run $(scripts/test-targets.sh unit)'";
+        assert!(check(&chores(&[release, TIER], "")).is_err());
+    }
+
+    #[test]
+    fn a_build_whose_failure_is_ignored_fails() {
+        let ignored = format!("{{ cmd: {BUILD}, ignore_error: true }}");
+        assert!(check(&chores(&[&ignored, TIER], "")).is_err());
+    }
+}
