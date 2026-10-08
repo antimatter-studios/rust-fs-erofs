@@ -6,6 +6,13 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/features.md`, a features page kept current by every pull request.**
+  Each feature's state, the release it shipped in, its tracking issue and the
+  test that checks it. The README's capability tables are a short summary
+  pointing to it.
+
 ### Fixed
 
 - **A cold cargo cache no longer fails the unit tier's output budget.**
