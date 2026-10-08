@@ -11,77 +11,17 @@ The repository ships one library crate (published on crates.io as `rust-fs-erofs
 
 ## Status
 
-**Feature-complete.** Every on-disk format feature this driver could plausibly encounter is implemented end-to-end with both library tests and integration tests against `mkfs.erofs` / `fsck.erofs` / `dump.erofs` as oracles. Workspace test coverage sits at **95% line / 97% function**.
-
-## What this driver can do
-
-### Reader
-
-| Capability | Status |
-|---|---|
-| Superblock parsing + CRC32C verification (a mismatch refuses the image at open) | ✅ |
-| Compact (32-byte) and extended (64-byte) inodes | ✅ |
-| Layout `FLAT_PLAIN` (contiguous) | ✅ |
-| Layout `FLAT_INLINE` (tail-packed in metadata block) | ✅ |
-| Layout `ChunkBased` + sparse holes | ✅ |
-| Layout `Compression` (legacy/uncompacted index) | ✅ |
-| Layout `Compression` (compacted-2B index) | ✅ |
-| Codec: **LZ4** | ✅ |
-| Codec: **LZMA** (LZMA1 raw stream) | ✅ |
-| Codec: **DEFLATE** (raw, no zlib wrapper) | ✅ |
-| `BIG_PCLUSTER_1` / `BIG_PCLUSTER_2` (multi-block pclusters) | ✅ |
-| `FRAGMENT_PCLUSTER` (cross-file packed-tail dedup) | ✅ |
-| `INTERLACED_PCLUSTER` (rotate-and-paste PLAIN) | ✅ |
-| `INLINE_PCLUSTER` (ztailpacking — last pcluster in metadata) | ✅ (except the `-Eall-fragments,ztailpacking` tail below) |
-| `DEDUPE` (`-Ededupe`, partial-reference extents) | ✅ where `fsck.erofs` accepts the image; see below |
-| `HEAD2` separate-algorithm dispatch | ✅ |
-| `COMPR_CFGS` blob (LZMA dict_size etc.) | ✅ |
-| Multi-lcluster pcluster spans | ✅ |
-| Multi-device images (device_id routing) | ✅ |
-| Inline xattrs + shared (block-area) xattrs | ✅ |
-| POSIX ACLs (access + default) | ✅ |
-| Custom xattr prefix dictionary (`mkfs.erofs -x N`) | ✅ |
-| Symbolic links + symlink loop protection (`MAXSYMLINKS=40`) | ✅ |
-| Special files: chrdev, blkdev, fifo, socket | ✅ |
-| Hardlinks (multiple dirents → same NID) | ✅ (incidental) |
-| Hash-sorted dirent layout (kernel-mountable) | ✅ |
-| Decompressed-pcluster LRU cache (≈8.5× speedup) | ✅ |
-
-### Writer (`mkfs.erofs`)
-
-| Capability | Status |
-|---|---|
-| FLAT_PLAIN + FLAT_INLINE + ChunkBased emission | ✅ |
-| Compact + extended inode auto-promotion | ✅ |
-| LZ4 / LZMA / DEFLATE / ZSTD decompression | ✅ |
-| Legacy + compacted-2B index format | ✅ |
-| ztailpacking (single-pcluster inline tail) | ✅ |
-| Multi-lcluster pcluster collation (greedy) | ✅ (writer-default; better compression ratios) |
-| Inline xattrs, POSIX ACL emit | ✅ |
-| Custom xattr prefix dictionary | ✅ |
-| `COMPR_CFGS` blob with non-default LZMA props | ✅ |
-| Symlinks, special files (chr/blk/fifo/sock) | ✅ |
-| Hash-sorted dirents (kernel-mountable output) | ✅ |
-| SB CRC32C checksum | ✅ |
-| Accurate directory `nlink` (`2 + child_dirs`) | ✅ |
-| Deterministic image layout (reproducible builds) | ✅ |
-| Output is `fsck.erofs`-clean across the matrix | ✅ |
-
-## What this driver cannot (yet) do
-
-| Feature | Reason | Workaround |
-|---|---|---|
-| **Compacted-1B index** | Format reportedly never existed in published kernels; no producer found | n/a — unobservable in practice |
-| **HEAD2 separate-algorithm WRITER** | Our writer emits single-codec images only | Use `mkfs.erofs` with `-z lz4hc,lzma` if you need this |
-| **Multi-device WRITER** | `mkfs.erofs --blobdev` is broken in upstream 1.9 | Wait for upstream fix or hand-build |
-| **48-bit block addressing** (`-E48bit`, incompat `0x80`) | Block addresses are read at 32 bits; the image is **refused at open by name** rather than read at the wrong width | Build without `-E48bit` |
-| **Metabox** (`-m`, incompat `0x100`) | The metabox-flagged root nid does not fit the 16-bit slot; **refused at open by name** | Build without `-m` |
-| Any other unknown `feature_incompat` bit | Refused at open (`EROFS_FEATURE_INCOMPAT_SUPPORTED`) | n/a |
-| **Mutate an existing EROFS image in place** | EROFS is read-only by spec — no journal, no allocator, no rewrite path | See "Read-write semantics" below |
-| **Verified boot / dm-verity hash trees** | Layer above EROFS, out of scope | Use `verity` tools alongside |
-| **The file in an `-Eall-fragments,ztailpacking` inline tail** | erofs-utils 1.9.1 stores that tail's bytes unrotated but marks it interlaced, so by the format's reading they run past the inline data; the Linux 6.1 driver and `fsck.erofs --extract` read the file wrong too. Reading it is **refused** with an error; the rest of the image reads | Build with `-Efragments,ztailpacking` or `-Eall-fragments` |
-| **`-Ededupe` / `-Eztailpacking,dedupe` without fragments, from erofs-utils 1.9.1** | That mkfs writes directory entries naming inodes that do not exist: `fsck.erofs` rejects the image and the kernel answers `Structure needs cleaning`. The affected lookups **fail**; nothing reads as another file's bytes | Add `-Efragments` (`-Efragments,dedupe` images are clean and read in full) |
-| **ZSTD WRITER** | Reading `-zzstd` images works; our writer emits LZ4 / LZMA / DEFLATE only | Use `mkfs.erofs -zzstd` to produce one |
+Reads every layout, index and codec erofs-utils writes (LZ4, LZMA, DEFLATE,
+ZSTD), with big, fragmented, interlaced and inline pclusters, deduplicated
+images, multi-device images, extended attributes and ACLs; 48-bit addressing,
+the metabox and any other unknown incompatible bit are refused by name. The
+library builds LZ4, LZMA and DEFLATE images the kernel mounts; the
+`mkfs.erofs` tool builds uncompressed ones. Each is checked against
+`mkfs.erofs`, `fsck.erofs`, `dump.erofs` and the kernel in the harness VM.
+**[docs/features.md](docs/features.md) is the full list**: every feature, its
+state (supported, partial, refused, not supported, upcoming or unobservable),
+the release it shipped in, its tracking issue and the test that checks it.
+Every pull request that changes behaviour updates it.
 
 ## Use cases
 

@@ -158,6 +158,16 @@ and linked into the app as a staticlib. Read-only by nature — EROFS is a
 read-only format — so the suite is about decoding hostile images correctly
 rather than round-tripping writes.
 
+## Keep the features page current
+
+`docs/features.md` lists every feature with its state, the release it shipped
+in, its tracking issue and the test that checks it. **A pull request that
+adds, fixes, refuses or removes behaviour updates its row in the same pull
+request**, with the PR number under **Since** (`Unreleased (#N)` until a
+release, then the version). A finding that leaves something unsupported or
+unobservable gets a row too, naming its issue. Releases turn every
+`Unreleased` into the version they ship as.
+
 ## Running tests
 
 ```sh
