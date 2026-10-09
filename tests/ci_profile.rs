@@ -3321,19 +3321,29 @@ fn ci_cancels_only_a_pull_requests_superseded_run() {
 ///
 /// Returns why `chores` fails that, or `Ok`.
 fn unit_tier_builds_outside_its_budget(chores: &str) -> Result<(), String> {
+    tier_builds_outside_its_budget(chores, "test:unit", "unit", "#189")
+}
+
+/// The rule [`unit_tier_builds_outside_its_budget`] states for the unit
+/// tier, for any chores.yml `task` whose budgeted run is `tier.sh task
+/// tier ...`. `issue` names the run that showed the cold build inside it.
+fn tier_builds_outside_its_budget(
+    chores: &str,
+    task: &str,
+    tier: &str,
+    issue: &str,
+) -> Result<(), String> {
     let tasks = parse_chores(chores);
-    let commands = gating_chore_commands(&tasks, "test:unit", &mut Vec::new());
+    let commands = gating_chore_commands(&tasks, task, &mut Vec::new());
     let is_tier = |c: &str| {
         shell_commands(c).iter().any(|words| {
             words.iter().any(|w| w.ends_with("/tier.sh"))
-                && words
-                    .windows(2)
-                    .any(|p| p[0] == "test:unit" && p[1] == "unit")
+                && words.windows(2).any(|p| p[0] == task && p[1] == tier)
         })
     };
     let Some(at) = commands.iter().position(|c| is_tier(c)) else {
         return Err(format!(
-            "chores.yml's `test:unit` runs no `tier.sh test:unit unit ...`: {commands:?}"
+            "chores.yml's `{task}` runs no `tier.sh {task} {tier} ...`: {commands:?}"
         ));
     };
     let Some((_, budgeted)) = commands[at].split_once(" -- ") else {
@@ -3359,10 +3369,10 @@ fn unit_tier_builds_outside_its_budget(chores: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "nothing in chores.yml's `test:unit` builds the tests before the budgeted \
+        "nothing in chores.yml's `{task}` builds the tests before the budgeted \
          `{budgeted}` runs, so on a cold cargo cache tier.sh counts the toolchain \
-         install, the downloads and every `Compiling` line against the unit budget \
-         (#189). Run `{budgeted}` with `--no-run` (and optionally `--quiet`), outside \
+         install, the downloads and every `Compiling` line against the {tier} budget \
+         ({issue}). Run `{budgeted}` with `--no-run` (and optionally `--quiet`), outside \
          tier.sh, before the tier. Commands found: {commands:?}"
     ))
 }
@@ -3371,6 +3381,19 @@ fn unit_tier_builds_outside_its_budget(chores: &str) -> Result<(), String> {
 fn the_unit_tier_compiles_before_its_budget_starts_counting() {
     let chores = read_or_panic(&manifest_dir().join("chores.yml"));
     if let Err(why) = unit_tier_builds_outside_its_budget(&chores) {
+        panic!("{why}");
+    }
+}
+
+/// The android tier has the same defect the unit tier had (#195). Its
+/// cargo cache is keyed on `Cargo.lock`, so the first nightly run after
+/// any lockfile change is cold, and the cold build's toolchain install,
+/// downloads and `Compiling` lines -- 156 lines against a 115-line
+/// budget, run 37607539617 -- failed a tier whose one test passed.
+#[test]
+fn the_android_tier_compiles_before_its_budget_starts_counting() {
+    let chores = read_or_panic(&manifest_dir().join("chores.yml"));
+    if let Err(why) = tier_builds_outside_its_budget(&chores, "test:android", "android", "#195") {
         panic!("{why}");
     }
 }
