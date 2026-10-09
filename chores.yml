@@ -455,7 +455,16 @@ tasks:
     # Cold is the case to budget for: actions/cache saves only after a
     # passing job, so a failing tier never warms its own cache. Warm, the
     # tier prints 8 lines.
+    #
+    # THE BUILD IS NOT THE TIER'S (#195). android.yml's cargo cache is keyed
+    # on Cargo.lock, so the first nightly run after any lockfile change is
+    # cold, and a cold build inside the tier printed 156 lines against the
+    # 115 above, with the one test passing (run 37607539617). The first
+    # command builds exactly what the tier runs, outside tier.sh, so the
+    # toolchain install, the downloads and the Compiling lines never reach
+    # tmp/logs/android.log; the tier compiles nothing.
     cmds:
+      - 'scripts/test.sh --locked --release --no-run --quiet $(scripts/test-targets.sh android)'
       - '../rust-fs-core/scripts/tier.sh test:android android 115 5200 -- scripts/test.sh --locked --release $(scripts/test-targets.sh android)'
     # One test, so one is the honest floor; it exists to catch the
     # selection going empty, not to measure the suite's size.
