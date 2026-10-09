@@ -131,23 +131,25 @@ chore_min_version: 0.10.0
 #                                                   is a visible step. Was 12 l /
 #                                                   466 B with mkfs.erofs alone,
 #                                                   16 l / 604 B before the docs
-#     android    88 l /  4,005 B  115 l /  5,200 B  measured COLD on the runner
-#                 1 test                            (android.yml run
-#                                                   36686318558): the only tier
-#                                                   in its nightly job, so it
-#                                                   always pays the build -- a
-#                                                   Downloading line, 8
-#                                                   Downloaded, 71 Compiling,
-#                                                   and ~1,070 B of colour
-#                                                   (CARGO_TERM_COLOR=always).
-#                                                   8 l warm. ~30%. The first
-#                                                   row, 100 l / 3,500 B, was
-#                                                   measured on a host with no
-#                                                   downloads and no colour,
-#                                                   and failed its first run
-#                                                   (#166). Replaced gsi, which
-#                                                   could never pass (#133) and
-#                                                   so was never measured
+#     android     8 l /    358 B   11 l /    470 B  the test alone, measured on
+#                 1 test                            the runner from a cold cargo
+#                                                   cache (android.yml run
+#                                                   38004890949): the build runs
+#                                                   before the tier since #195,
+#                                                   so the cache state no longer
+#                                                   reaches it. ~30%. Was 88 l /
+#                                                   4,005 B -> 115 l / 5,200 B
+#                                                   with the cold build inside,
+#                                                   which a lockfile change grew
+#                                                   to 156 l (run 37607539617).
+#                                                   The first row, 100 l / 3,500
+#                                                   B, was measured on a host
+#                                                   with no downloads and no
+#                                                   colour, and failed its first
+#                                                   run (#166). Replaced gsi,
+#                                                   which could never pass
+#                                                   (#133) and so was never
+#                                                   measured
 #
 #   A COLD BUILD ADDS 63 `Compiling` LINES, measured on this crate's graph
 #   (74 packages in Cargo.lock) by `cargo clean` then the suite tier: 709
@@ -446,26 +448,23 @@ tasks:
     # ok having opened no image: inside the tier a missing fixture fails,
     # naming the script (#54).
     #
-    # THE BUDGET IS THE RUNNER'S COLD BUILD, measured there: 88 lines,
-    # 4,005 bytes (android.yml run 36686318558) -- a Downloading line, 8
-    # Downloaded, 71 Compiling, then the test. Colour is ~1,070 of those
-    # bytes: android.yml sets CARGO_TERM_COLOR=always. The row it replaces
-    # was measured cold on a host with the crates already fetched and no
-    # colour, 80 lines / 2,676 bytes, and failed that first run (#166).
-    # Cold is the case to budget for: actions/cache saves only after a
-    # passing job, so a failing tier never warms its own cache. Warm, the
-    # tier prints 8 lines.
+    # THE BUDGET IS THE TEST'S OUTPUT ALONE, measured on the runner from a
+    # cold cargo cache with the build moved out of the tier (android.yml
+    # run 38004890949 on #198): 8 lines, 358 bytes -- cargo's Finished and
+    # Running lines, then the test. ~30% over that is 11 lines / 470 bytes.
+    # It was 115 / 5200 while the tier also carried the cold build, which
+    # a lockfile change grew past it (#166, #195).
     #
     # THE BUILD IS NOT THE TIER'S (#195). android.yml's cargo cache is keyed
     # on Cargo.lock, so the first nightly run after any lockfile change is
     # cold, and a cold build inside the tier printed 156 lines against the
-    # 115 above, with the one test passing (run 37607539617). The first
+    # 115 it had then, with the one test passing (run 37607539617). The first
     # command builds exactly what the tier runs, outside tier.sh, so the
     # toolchain install, the downloads and the Compiling lines never reach
     # tmp/logs/android.log; the tier compiles nothing.
     cmds:
       - 'scripts/test.sh --locked --release --no-run --quiet $(scripts/test-targets.sh android)'
-      - '../rust-fs-core/scripts/tier.sh test:android android 115 5200 -- scripts/test.sh --locked --release $(scripts/test-targets.sh android)'
+      - '../rust-fs-core/scripts/tier.sh test:android android 11 470 -- scripts/test.sh --locked --release $(scripts/test-targets.sh android)'
     # One test, so one is the honest floor; it exists to catch the
     # selection going empty, not to measure the suite's size.
       - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored android 1'
