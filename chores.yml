@@ -204,7 +204,7 @@ vars:
   # v0.2.23 is the first release with ../rust-fs-core/scripts/package-cli.sh and the
   # release-cli workflow release.yml calls (#181): the tarball's packaging
   # is core's now, and the path sibling must carry it.
-  FS_CORE_REF: v0.3.7
+  FS_CORE_REF: v0.3.8
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
