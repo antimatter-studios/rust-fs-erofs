@@ -41,6 +41,12 @@ jq_check() {
 
 mkdir -p "$REPO/tmp"
 SANDBOX="$(mktemp -d "$REPO/tmp/cli-$NAME.XXXXXX")"
+# On Windows (Git Bash) the tools are Windows programs: they are handed, and
+# report back, Windows paths. The mixed form, D:/a/..., is one bash reads
+# as well, so every path built from SANDBOX is the same text on both sides.
+if command -v cygpath >/dev/null 2>&1; then
+    SANDBOX="$(cygpath -m "$SANDBOX")"
+fi
 trap 'rm -rf "$SANDBOX"' EXIT HUP INT TERM
 
 finish() {
