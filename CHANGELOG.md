@@ -15,6 +15,10 @@ never does.
 
 ### Fixed
 
+- **A cold cargo cache no longer fails the android tier's output budget.**
+  `chore test:android` compiles its test before the budgeted run starts
+  counting, as the unit tier already does, so the nightly run after a
+  `Cargo.lock` change no longer fails with its test passing (#195).
 - **A cold cargo cache no longer fails the unit tier's output budget.**
   `chore test:unit` compiles its tests before the budgeted run starts
   counting, so the toolchain install, downloads and `Compiling` lines are
