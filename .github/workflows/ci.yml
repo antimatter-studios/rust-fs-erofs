@@ -462,7 +462,7 @@ jobs:
           ref="$(sed -n 's/^  FS_CORE_REF: *//p' chores.yml)"
           # TEMPORARY, until rust-fs-core#233 is released and FS_CORE_REF
           # moves to that tag: the commit carrying its Windows packaging.
-          ref=c0cb8b9f41a2d9a237504f690e9edf2e1649f43c
+          ref=59130433f33c1ca72506d0e2df6379ad1f61d048
           [ -n "$url" ] && [ -n "$ref" ] || { echo "::error::no FS_CORE_URL/FS_CORE_REF in chores.yml" >&2; exit 1; }
           git init --quiet ../rust-fs-core
           git -C ../rust-fs-core remote add origin "$url"
