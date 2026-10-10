@@ -12,6 +12,14 @@ never does.
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's capability tables are a short summary
   pointing to it.
+- **The tools are built and released for Windows (#185).** A release now
+  attaches `rust-fs-erofs-<version>-windows-x86_64.zip` and `-windows-arm64.zip`
+  beside the tarballs, packaged by rust-fs-core 0.3.9's release-cli: the
+  binary as `bin/rust-fs-erofs.exe` and each of `fs.erofs` and `mkfs.erofs` a
+  copy of it, since a symlink needs Developer Mode or an administrator there.
+  A `cli-windows` CI job builds that zip on `windows-latest`, unpacks it with
+  `Expand-Archive` and runs the same CLI suite against those tools first on
+  PATH. Publishing to winget is still to come.
 
 ### Fixed
 

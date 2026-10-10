@@ -35,11 +35,14 @@ jq_check "the report counts $files files and $dirs directories" \
     ".files == $files and .directories == $dirs" "$SANDBOX/mkfs.json"
 jq_check "the inode count covers every file and directory" \
     ".inodes == $(( files + dirs ))" "$SANDBOX/mkfs.json"
+# Windows joins the walked directory and the name with a backslash, so a
+# reported path is compared with its separators as slashes.
 jq_check "the symlink is named as left out" \
-    ".skipped == [{\"path\": \"$src/link\", \"reason\": \"symlink\"}]" "$SANDBOX/mkfs.json"
+    "(.skipped | map(.path |= (split(\"\\\\\") | join(\"/\")))) == [{\"path\": \"$src/link\", \"reason\": \"symlink\"}]" "$SANDBOX/mkfs.json"
 jq_check "the UUID is 8-4-4-4-12 hex" \
     '.uuid | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")' "$SANDBOX/mkfs.json"
-check "the symlink is warned about on stderr" grep -q "warning: left out $src/link (symlink)" "$SANDBOX/mkfs.err"
+tr '\\' / <"$SANDBOX/mkfs.err" >"$SANDBOX/mkfs.err.slashed"
+check "the symlink is warned about on stderr" grep -q "warning: left out $src/link (symlink)" "$SANDBOX/mkfs.err.slashed"
 
 # The repository-named form is the same program, and the build is
 # deterministic, so it writes the same bytes.

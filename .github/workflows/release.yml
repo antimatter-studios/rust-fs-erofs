@@ -102,10 +102,13 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@375a64daba786cd1d9077c74b5d9d690a1fb6802 # v0.3.8
+    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@0b2efdc9c5a19c131c350de830086a03be8ac1d3 # v0.3.9
     with:
-      core-ref: v0.3.8
+      core-ref: v0.3.9
       toolchain: 1.95.0
+      # The Windows zips, windows-x86_64 and windows-arm64, beside the
+      # tarballs (#185); the cli-windows job in ci.yml tests the same zip.
+      windows: true
 
   publish:
     name: publish to crates.io

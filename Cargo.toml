@@ -55,7 +55,7 @@ licenses = ["LICENSE"]
 cli = ["dep:clap", "rust-fs-core/cli"]
 
 [dependencies]
-rust-fs-core = { path = "../rust-fs-core", version = "0.3.8" }
+rust-fs-core = { path = "../rust-fs-core", version = "0.3.9" }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 lzma-rs = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

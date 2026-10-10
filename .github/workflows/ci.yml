@@ -39,6 +39,9 @@ name: CI
 #                the first time it is put together. No VM here: what erofs-utils
 #                and the kernel make of the tools' images is judged in the
 #                oracle and kernel tiers, in the `test` job.
+#   cli-windows  the same suite on windows-latest, against the tools from
+#                the .zip a release attaches for Windows, unpacked as a user
+#                unpacks it (#185).
 #   ci-ok        the one required check: green only when every job above
 #                ran and succeeded (failed, cancelled OR skipped fails it).
 #
@@ -426,6 +429,89 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  # The tools as a Windows user gets them (#185): built for
+  # x86_64-pc-windows-msvc, packaged by rust-fs-core's package-cli into the
+  # .zip release-cli attaches, unpacked with PowerShell's Expand-Archive,
+  # and tested from there, first on PATH, by the same scripts/test-cli.sh
+  # suite the `cli` job runs. No chore: chore has no Windows build, so the
+  # sibling is fetched the way `chore siblings` fetches it, from the pin in
+  # chores.yml, and the tier runs its command line from there.
+  #
+  # Git Bash rewrites any argument that starts with / into a Windows path,
+  # `fs.erofs IMG ls /` included. MSYS_NO_PATHCONV turns that off for the
+  # suite alone, which hands the tools Windows-form paths itself
+  # (tests/cli/lib.sh); the build and the packaging rely on the rewriting,
+  # since cargo cannot read /d/a/.../Cargo.toml. A native symlink needs
+  # winsymlinks:nativestrict, or `ln -s` copies the file and mkfs never
+  # meets the symlink it is meant to leave out.
+  cli-windows:
+    name: cli (Windows, the release zip's tools on PATH)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      MSYS: winsymlinks:nativestrict
+    steps:
+      - uses: actions/checkout@v4
+      - name: The rust-fs-core sibling, at chores.yml's pin
+        run: |
+          set -euo pipefail
+          url="$(sed -n 's/^  FS_CORE_URL: *//p' chores.yml)"
+          ref="$(sed -n 's/^  FS_CORE_REF: *//p' chores.yml)"
+          [ -n "$url" ] && [ -n "$ref" ] || { echo "::error::no FS_CORE_URL/FS_CORE_REF in chores.yml" >&2; exit 1; }
+          git init --quiet ../rust-fs-core
+          git -C ../rust-fs-core remote add origin "$url"
+          git -C ../rust-fs-core fetch --quiet --depth 1 origin "$ref"
+          git -C ../rust-fs-core checkout --quiet FETCH_HEAD
+          echo "rust-fs-core at $ref ($(git -C ../rust-fs-core rev-parse --short HEAD))"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cli-cargo-
+      - name: Build the tools
+        run: cargo build --locked --release --features cli --bin rust-fs-erofs --quiet
+      - name: The release zip, packaged and its layout checked
+        id: pack
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          mkdir -p tmp/package
+          cd tmp/package
+          zip="$(bash ../../../rust-fs-core/scripts/package-cli.sh "$version" windows-x86_64 | tail -n 1)"
+          echo "zip=tmp/package/$zip" >> "$GITHUB_OUTPUT"
+      - name: Unpacked as a Windows user would, first on PATH
+        shell: pwsh
+        env:
+          ZIP: ${{ steps.pack.outputs.zip }}
+        run: |
+          $prefix = Join-Path $PWD 'tmp\cli-windows'
+          Expand-Archive -Path $env:ZIP -DestinationPath $prefix -Force
+          Join-Path $prefix 'bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: test:cli, the tools from the zip
+        id: tier
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set -euo pipefail
+          bash ../rust-fs-core/scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 130
+      - name: Keep the tier logs
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-cli-windows
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
   # ONE CHECK GATES A MERGE, AND IT STANDS FOR EVERY JOB (#123).
   #
   # Branch protection names checks, and a check is a job name. Naming
@@ -473,7 +559,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, unit, fixtures, test, test-arm64, suite-in-vm, cli, semver]
+    needs: [changes, unit, fixtures, test, test-arm64, suite-in-vm, cli, cli-windows, semver]
     runs-on: ubuntu-latest
     steps:
       - name: Every job ran and succeeded
