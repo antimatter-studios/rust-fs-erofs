@@ -46,6 +46,9 @@ SANDBOX="$(mktemp -d "$REPO/tmp/cli-$NAME.XXXXXX")"
 # as well, so every path built from SANDBOX is the same text on both sides.
 if command -v cygpath >/dev/null 2>&1; then
     SANDBOX="$(cygpath -m "$SANDBOX")"
+    # jq.exe ends every line it prints with CRLF, and a listing built from
+    # it then never equals one built in bash. pipefail keeps jq -e's status.
+    jq() { command jq "$@" | tr -d '\r'; }
 fi
 trap 'rm -rf "$SANDBOX"' EXIT HUP INT TERM
 
