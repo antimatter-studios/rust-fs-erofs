@@ -419,6 +419,18 @@ fn release_cli_gaps(yaml: &str, core_ref: &str, toolchain: &str) -> Vec<String> 
                 with("toolchain")
             ));
         }
+        // THE WINDOWS ZIPS ARE ASKED FOR (#185). release-cli packages
+        // windows-x86_64 and windows-arm64 only for a caller that sets the
+        // input; without it a release ships no Windows build at all.
+        let windows = job
+            .as_mapping_get("with")
+            .and_then(|w| w.as_mapping_get("windows"))
+            .and_then(Yaml::as_bool);
+        if windows != Some(true) {
+            gaps.push(format!(
+                "job {name} does not pass windows: true, so the release ships no Windows zip"
+            ));
+        }
     }
     for (name, job) in jobs {
         let packages_locally = job
@@ -484,7 +496,7 @@ fn the_release_cli_reader_discriminates() {
          \x20 cli:\n    needs: [test, publish]\n\
          \x20   permissions:\n      contents: write\n      id-token: write\n      attestations: write\n\
          \x20   uses: {CORE_RELEASE_CLI}{sha} # v0.2.23\n\
-         \x20   with:\n      core-ref: v0.2.23\n      toolchain: 1.95.0\n"
+         \x20   with:\n      core-ref: v0.2.23\n      toolchain: 1.95.0\n      windows: true\n"
     );
     let gaps = |yaml: &str| release_cli_gaps(yaml, "v0.2.23", "1.95.0");
     assert_eq!(gaps(&good), Vec::<String>::new(), "{good}");
@@ -517,6 +529,14 @@ fn the_release_cli_reader_discriminates() {
     expect(
         good.replace("toolchain: 1.95.0", "toolchain: stable"),
         "toolchain",
+    );
+    expect(
+        good.replace("      windows: true\n", ""),
+        "does not pass windows: true",
+    );
+    expect(
+        good.replace("windows: true", "windows: false"),
+        "does not pass windows: true",
     );
     expect(
         good.replace(
