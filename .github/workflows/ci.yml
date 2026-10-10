@@ -438,10 +438,12 @@ jobs:
   # chores.yml, and the tier runs its command line from there.
   #
   # Git Bash rewrites any argument that starts with / into a Windows path,
-  # `fs.erofs IMG ls /` included; MSYS_NO_PATHCONV turns that off, and
-  # tests/cli/lib.sh hands the tools Windows-form paths itself. A native
-  # symlink needs winsymlinks:nativestrict, or `ln -s` copies the file and
-  # mkfs never meets the symlink it is meant to leave out.
+  # `fs.erofs IMG ls /` included. MSYS_NO_PATHCONV turns that off for the
+  # suite alone, which hands the tools Windows-form paths itself
+  # (tests/cli/lib.sh); the build and the packaging rely on the rewriting,
+  # since cargo cannot read /d/a/.../Cargo.toml. A native symlink needs
+  # winsymlinks:nativestrict, or `ln -s` copies the file and mkfs never
+  # meets the symlink it is meant to leave out.
   cli-windows:
     name: cli (Windows, the release zip's tools on PATH)
     runs-on: windows-latest
@@ -450,7 +452,6 @@ jobs:
       run:
         shell: bash
     env:
-      MSYS_NO_PATHCONV: "1"
       MSYS: winsymlinks:nativestrict
     steps:
       - uses: actions/checkout@v4
@@ -500,6 +501,8 @@ jobs:
           Join-Path $prefix 'bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: test:cli, the tools from the zip
         id: tier
+        env:
+          MSYS_NO_PATHCONV: "1"
         run: |
           set -euo pipefail
           bash ../rust-fs-core/scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh
