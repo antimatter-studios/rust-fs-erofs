@@ -88,6 +88,6 @@ States:
 | `fs.erofs` `write`, `mkdir`, `set`, `resize` | Refused: "EROFS is read-only" (exit 3) | 0.3.0 | | `tests/cli/test-fs.sh` |
 | `rust-fs-erofs doctor`, man pages, shell completions | Supported | 0.3.0 | | `cli_dispatch.rs`, `cli_docs.rs` |
 | Release tarballs: darwin-arm64, linux-x86_64 | Supported | 0.3.0 | | `release_attestation.rs` |
-| Release zips for Windows: windows-x86_64, windows-arm64, each dotted name a copy of `rust-fs-erofs.exe` | Supported | Unreleased (#185) | | `release_attestation.rs` |
-| The tools tested on Windows, from the release zip (`cli-windows` job) | Supported | Unreleased (#185) | | `tests/cli/test-*.sh` |
+| Release zips for Windows: windows-x86_64, windows-arm64, each dotted name a copy of `rust-fs-erofs.exe` | Supported | 0.4.1 (#185) | | `release_attestation.rs` |
+| The tools tested on Windows, from the release zip (`cli-windows` job) | Supported | 0.4.1 (#185) | | `tests/cli/test-*.sh` |
 | The tools published to winget | Upcoming | | #185 | |

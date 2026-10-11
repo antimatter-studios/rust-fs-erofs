@@ -6,6 +6,8 @@ never does.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-10-11
+
 ### Added
 
 - **`docs/features.md`, a features page kept current by every pull request.**
@@ -422,6 +424,7 @@ never does.
 
 - Package renamed to `am-fs-erofs`; the lib name stays `fs_erofs`.
 
+[0.4.1]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.2.0...v0.3.0
