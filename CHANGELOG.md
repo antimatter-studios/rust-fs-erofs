@@ -4,6 +4,9 @@ Notable changes to `rust-fs-erofs` (published as `am-fs-erofs` until its last ve
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
 
+Changes not yet released are fragments in [`changelog.d/`](changelog.d/), one per
+pull request; a release gathers them into a section here.
+
 ## [Unreleased]
 
 ## [0.4.1] — 2026-10-11
