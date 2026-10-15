@@ -3591,3 +3591,202 @@ fn the_chore_download_retries_a_transient_server_error() {
          add `--retry 5 --retry-all-errors --retry-delay 2`: {bare:#?}"
     );
 }
+
+/// The merge-group planner, executed rather than read: the real
+/// `Classify the change` and `Choose the profile` steps from ci.yml run over
+/// disposable base/head commits, with rust-fs-core's real code-changed.sh.
+mod merge_group_planner_runs {
+    use super::*;
+    use std::process::Command;
+
+    fn step_run(name: &str) -> String {
+        let path = workflow_path("ci.yml");
+        let text = read_or_panic(&path);
+        let document = load_document(&text, &path);
+        let changes = job(&document, "changes", &path);
+        steps_of(changes, "changes")
+            .iter()
+            .find(|step| field(step, "name").and_then(Yaml::as_str) == Some(name))
+            .map(|step| run_of(step).to_string())
+            .unwrap_or_else(|| panic!("jobs.changes has no step named {name}"))
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=ci",
+                "-c",
+                "user.email=ci@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A sandbox laid out like the CI checkout: the repository beside a
+    /// `rust-fs-core` that is the real sibling, so the step's
+    /// `../rust-fs-core/scripts/code-changed.sh` is the real classifier.
+    fn sandbox(tag: &str) -> (PathBuf, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "erofs-planner-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        let core = manifest_dir().join("../rust-fs-core");
+        assert!(
+            core.join("scripts/code-changed.sh").is_file(),
+            "{} is missing: run `chore siblings` to provide rust-fs-core",
+            core.join("scripts/code-changed.sh").display()
+        );
+        std::os::unix::fs::symlink(&core, root.join("rust-fs-core")).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(repo.join("docs/notes.md"), "notes\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        (root, repo)
+    }
+
+    fn commit_change(repo: &Path, file: &str) -> String {
+        std::fs::write(repo.join(file), "changed\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", "head"]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// Runs the step body, returning (exit success, GITHUB_OUTPUT, changed.txt).
+    fn run_step(repo: &Path, body: &str, env: &[(&str, &str)]) -> (bool, String, Option<String>) {
+        let output = repo.join("github_output");
+        let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_file(repo.join("changed.txt"));
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(body)
+            .current_dir(repo)
+            .env("GITHUB_OUTPUT", &output);
+        for key in [
+            "EVENT",
+            "REF",
+            "PR_BASE",
+            "PR_HEAD",
+            "MQ_BASE",
+            "MQ_HEAD",
+            "PUSH_BEFORE",
+            "PUSH_AFTER",
+        ] {
+            command.env(key, "");
+        }
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let status = command.output().expect("bash runs").status;
+        (
+            status.success(),
+            std::fs::read_to_string(&output).unwrap_or_default(),
+            std::fs::read_to_string(repo.join("changed.txt")).ok(),
+        )
+    }
+
+    #[test]
+    fn a_code_change_in_the_merge_queue_selects_the_full_fixture_pipeline() {
+        let (root, repo) = sandbox("code");
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let head = commit_change(&repo, "src/lib.rs");
+        let (ok, output, changed) = run_step(
+            &repo,
+            &step_run("Classify the change"),
+            &[
+                ("EVENT", "merge_group"),
+                ("MQ_BASE", &base),
+                ("MQ_HEAD", &head),
+            ],
+        );
+        assert!(
+            ok,
+            "the classify step must succeed on a well-formed merge-group range"
+        );
+        assert_eq!(
+            changed.as_deref(),
+            Some("src/lib.rs\n"),
+            "the emitted changed-path set"
+        );
+        assert_eq!(output, "code=true\n");
+        let (ok, profile, _) = run_step(
+            &repo,
+            &step_run("Choose the profile"),
+            &[("EVENT", "merge_group")],
+        );
+        assert!(ok);
+        assert_eq!(
+            profile, "profile=full\n",
+            "the merge queue runs the full profile"
+        );
+        // code=true and profile=full is exactly the fixtures leg's condition,
+        // the one the structured guard holds jobs.fixtures to.
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_documentation_only_merge_group_is_classified_as_no_code() {
+        let (root, repo) = sandbox("docs");
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let head = commit_change(&repo, "docs/notes.md");
+        let (ok, output, changed) = run_step(
+            &repo,
+            &step_run("Classify the change"),
+            &[
+                ("EVENT", "merge_group"),
+                ("MQ_BASE", &base),
+                ("MQ_HEAD", &head),
+            ],
+        );
+        assert!(ok);
+        assert_eq!(
+            changed.as_deref(),
+            Some("docs/notes.md\n"),
+            "the emitted changed-path set"
+        );
+        assert_eq!(
+            output, "code=false\n",
+            "documentation alone skips the code legs, by policy"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_or_half_merge_group_range_never_reports_no_code() {
+        let (root, repo) = sandbox("half");
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let body = step_run("Classify the change");
+        for env in [
+            vec![("EVENT", "merge_group")],
+            vec![("EVENT", "merge_group"), ("MQ_BASE", base.as_str())],
+            vec![("EVENT", "merge_group"), ("MQ_HEAD", base.as_str())],
+            vec![("EVENT", "workflow_dispatch")],
+        ] {
+            let (ok, output, _) = run_step(&repo, &body, &env);
+            assert!(
+                !ok || output == "code=true\n",
+                "{env:?}: an unusable range must fail the step or run everything, got {output:?}"
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
