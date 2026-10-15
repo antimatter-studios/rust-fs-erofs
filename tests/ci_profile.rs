@@ -3648,6 +3648,13 @@ mod merge_group_planner_runs {
         let repo = root.join("repo");
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::create_dir_all(repo.join("docs")).unwrap();
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        // The profile step invokes the repository's real script as CI does.
+        std::fs::copy(
+            manifest_dir().join("scripts/ci-profile.sh"),
+            repo.join("scripts/ci-profile.sh"),
+        )
+        .expect("provide the real profile script in the planner checkout");
         let core = manifest_dir().join("../rust-fs-core");
         assert!(
             core.join("scripts/code-changed.sh").is_file(),
