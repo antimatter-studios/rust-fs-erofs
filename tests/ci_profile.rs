@@ -940,10 +940,13 @@ fn assert_unconditional(job: &Yaml, name: &str, workflow: &str) {
 }
 
 /// As `assert_unconditional`, but the job may carry the one condition
-/// rust-fs-core's ci-gate accepts: `if: needs.changes.outputs.code ==
-/// 'true'`, needing `changes`. It is skipped, with the jobs after it, for a
-/// change to documentation alone, and ci-ok accepts that skip only then.
-/// Any other condition, and `continue-on-error`, is still refused.
+/// the event/profile contract allows: `if: needs.changes.outputs.code ==
+/// 'true' && needs.changes.outputs.profile == 'full'`, needing `changes`.
+/// It is skipped, with the jobs after it, for a change to documentation
+/// alone or on the quick profile a pull request runs; the merge queue, a
+/// push, a tag and a manual run choose the full profile, so the leg still
+/// runs before anything lands. ci-ok accepts those skips only. Any other
+/// condition, and `continue-on-error`, is still refused.
 fn assert_unconditional_or_skipped_for_documentation(job: &Yaml, name: &str, workflow: &str) {
     let keys = keys_of(job);
     assert!(
@@ -953,8 +956,9 @@ fn assert_unconditional_or_skipped_for_documentation(job: &Yaml, name: &str, wor
     if let Some(condition) = field(job, "if") {
         assert_eq!(
             condition.as_str(),
-            Some("needs.changes.outputs.code == 'true'"),
-            "{workflow} jobs.{name} may be skipped only for a change to documentation alone"
+            Some("needs.changes.outputs.code == 'true' && needs.changes.outputs.profile == 'full'"),
+            "{workflow} jobs.{name} may be skipped only for a change to documentation alone \
+             or on the quick profile"
         );
         assert!(
             needs_of(job).iter().any(|n| n == "changes"),
@@ -1147,6 +1151,23 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
     // jobs.fixtures
     let fixtures = job(&document, "fixtures", &path);
     assert_unconditional_or_skipped_for_documentation(fixtures, "fixtures", "ci.yml");
+    // A leg skipped on the quick profile is only safe while the merge queue
+    // and a manual run exist to take the full one, and the profile comes from
+    // the script its truth table holds.
+    let on = field(&document, "on").or_else(|| field(&document, "true"));
+    for event in ["merge_group", "workflow_dispatch", "pull_request", "push"] {
+        assert!(
+            on.is_some_and(|on| field(on, event).is_some()),
+            "ci.yml must trigger on {event}, or the quick/full profile contract has a hole"
+        );
+    }
+    let changes = job(&document, "changes", &path);
+    assert!(
+        steps_of(changes, "changes")
+            .iter()
+            .any(|step| run_of(step).contains("bash scripts/ci-profile.sh profile")),
+        "jobs.changes must choose the profile with scripts/ci-profile.sh"
+    );
     let runner = field(fixtures, "runs-on")
         .and_then(Yaml::as_str)
         .unwrap_or("");
