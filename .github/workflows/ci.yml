@@ -429,9 +429,10 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
-  # The tools as a Windows user gets them (#185): built for
-  # x86_64-pc-windows-msvc, packaged by rust-fs-core's package-cli into the
-  # .zip release-cli attaches, unpacked with PowerShell's Expand-Archive,
+  # The tools as a Windows user gets them (#185): built natively for
+  # x86_64-pc-windows-msvc on windows-latest and for aarch64-pc-windows-msvc
+  # on windows-11-arm, each packaged by rust-fs-core's package-cli into the
+  # .zip release-cli attaches for that platform, unpacked with PowerShell's Expand-Archive,
   # and tested from there, first on PATH, by the same scripts/test-cli.sh
   # suite the `cli` job runs. No chore: chore has no Windows build, so the
   # sibling is fetched the way `chore siblings` fetches it, from the pin in
@@ -445,8 +446,16 @@ jobs:
   # winsymlinks:nativestrict, or `ln -s` copies the file and mkfs never
   # meets the symlink it is meant to leave out.
   cli-windows:
-    name: cli (Windows, the release zip's tools on PATH)
-    runs-on: windows-latest
+    name: cli (Windows ${{ matrix.label }}, the release zip's tools on PATH)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            label: windows-x86_64
+          - runner: windows-11-arm
+            label: windows-arm64
     timeout-minutes: 45
     defaults:
       run:
@@ -475,8 +484,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cli-cargo-
+          key: ${{ runner.os }}-${{ runner.arch }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cli-cargo-
       - name: Build the tools
         run: cargo build --locked --release --features cli --bin rust-fs-erofs --quiet
       - name: The release zip, packaged and its layout checked
@@ -486,7 +495,7 @@ jobs:
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           mkdir -p tmp/package
           cd tmp/package
-          zip="$(bash ../../../rust-fs-core/scripts/package-cli.sh "$version" windows-x86_64 | tail -n 1)"
+          zip="$(bash ../../../rust-fs-core/scripts/package-cli.sh "$version" "${{ matrix.label }}" | tail -n 1)"
           echo "zip=tmp/package/$zip" >> "$GITHUB_OUTPUT"
       - name: Unpacked as a Windows user would, first on PATH
         shell: pwsh
@@ -508,7 +517,7 @@ jobs:
         if: always() && steps.tier.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
-          name: tier-logs-cli-windows
+          name: tier-logs-cli-${{ matrix.label }}
           path: tmp/logs/*.log
           if-no-files-found: error
 
