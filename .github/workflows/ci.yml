@@ -95,6 +95,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CHORE_VERSION: "0.11.0"
+  # Declare profile-conditional jobs to core's static ci-gate contract.
+  # This permits their scheduling conditions only: ci-ok still needs every
+  # job and rejects failures, cancellations and skips not allowed by the plan.
+  CI_GATE_NON_GATING: "fixtures cli cli-windows"
 
 jobs:
   # Does this change need the full pipeline? rust-fs-core's
