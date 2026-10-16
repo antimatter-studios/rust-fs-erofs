@@ -42,6 +42,14 @@ name: CI
 #   cli-windows  the same suite on windows-latest, against the tools from
 #                the .zip a release attaches for Windows, unpacked as a user
 #                unpacks it (#185).
+#   PROFILES     a pull request runs the QUICK profile: changes, unit (with
+#                the CI profile truth table) and semver. The merge queue, a
+#                push to main or a tag, and a manual workflow_dispatch run the
+#                FULL profile: every job above, including the fixture VM, the
+#                oracle and kernel tiers, x86_64 and arm64, the suite in the
+#                guest, and the CLI on Linux and both Windows architectures.
+#                scripts/ci-profile.sh makes both decisions and
+#                tests/scripts/ci-profile.sh holds them to a truth table.
 #   ci-ok        the one required check: green only when every job above
 #                ran and succeeded (failed, cancelled OR skipped fails it).
 #
@@ -74,6 +82,8 @@ on:
   # decides whether they land. The queue reads ci-ok only from a workflow
   # that triggers here.
   merge_group:
+  # A full run of any branch by hand: every leg, the same as the merge queue.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -85,6 +95,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CHORE_VERSION: "0.11.0"
+  # Declare profile-conditional jobs to core's static ci-gate contract.
+  # This permits their scheduling conditions only: ci-ok still needs every
+  # job and rejects failures, cancellations and skips not allowed by the plan.
+  CI_GATE_NON_GATING: "fixtures cli cli-windows"
 
 jobs:
   # Does this change need the full pipeline? rust-fs-core's
@@ -100,6 +114,10 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.c.outputs.code }}
+      # quick for a pull request, full for the merge queue, main, tags and a
+      # manual run: scripts/ci-profile.sh decides, tests/scripts/ci-profile.sh
+      # holds it to its truth table.
+      profile: ${{ steps.p.outputs.profile }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,6 +160,15 @@ jobs:
           fi
           echo "code=$code ($EVENT${range:+ $range})"
           echo "code=$code" >> "$GITHUB_OUTPUT"
+      - name: Choose the profile
+        id: p
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          profile="$(bash scripts/ci-profile.sh profile "$EVENT")"
+          echo "profile=$profile ($EVENT)"
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
 
   unit:
     name: unit (no tools, no VM)
@@ -180,6 +207,13 @@ jobs:
           fi
       - name: chore test:unit
         run: chore test:unit
+      # The profile truth table runs on the quick tier, so a pull request that
+      # breaks it is refused before the full legs it governs are skipped.
+      - name: The CI profile truth table
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+          bash tests/scripts/ci-profile.sh
       - name: Keep the tier logs
         # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
         # verdict; without this the detail dies with the runner and the only
@@ -195,7 +229,7 @@ jobs:
   fixtures:
     name: fixtures (harness VM, x86_64 KVM)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.profile == 'full'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -381,6 +415,8 @@ jobs:
 
   cli:
     name: cli (the installed tools, on PATH)
+    needs: changes
+    if: needs.changes.outputs.profile == 'full'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -447,6 +483,8 @@ jobs:
   # meets the symlink it is meant to leave out.
   cli-windows:
     name: cli (Windows ${{ matrix.label }}, the release zip's tools on PATH)
+    needs: changes
+    if: needs.changes.outputs.profile == 'full'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -571,19 +609,13 @@ jobs:
     needs: [changes, unit, fixtures, test, test-arm64, suite-in-vm, cli, cli-windows, semver]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Every job ran and succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
           # false only for a change to documentation alone: then, and only
-          # then, a skipped job is not a failed one.
+          # then, a skipped job is not a failed one -- or, on the quick
+          # profile, a skipped full-only leg (scripts/ci-profile.sh).
           CODE: ${{ needs.changes.outputs.code }}
-        run: |
-          set -euo pipefail
-          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          echo "code changed: $CODE"
-          bad="$(echo "$NEEDS" | jq -r --arg code "$CODE" '[to_entries[] | select(.value.result != "success" and ($code != "false" or .value.result != "skipped")) | .key] | join(", ")')"
-          if [ -n "$bad" ]; then
-            echo "::error::not green: $bad (failed, cancelled or skipped)"
-            exit 1
-          fi
-          echo "all required jobs succeeded"
+          PROFILE: ${{ needs.changes.outputs.profile }}
+        run: echo "$NEEDS" | bash scripts/ci-profile.sh verdict

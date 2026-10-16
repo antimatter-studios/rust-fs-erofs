@@ -940,10 +940,13 @@ fn assert_unconditional(job: &Yaml, name: &str, workflow: &str) {
 }
 
 /// As `assert_unconditional`, but the job may carry the one condition
-/// rust-fs-core's ci-gate accepts: `if: needs.changes.outputs.code ==
-/// 'true'`, needing `changes`. It is skipped, with the jobs after it, for a
-/// change to documentation alone, and ci-ok accepts that skip only then.
-/// Any other condition, and `continue-on-error`, is still refused.
+/// the event/profile contract allows: `if: needs.changes.outputs.code ==
+/// 'true' && needs.changes.outputs.profile == 'full'`, needing `changes`.
+/// It is skipped, with the jobs after it, for a change to documentation
+/// alone or on the quick profile a pull request runs; the merge queue, a
+/// push, a tag and a manual run choose the full profile, so the leg still
+/// runs before anything lands. ci-ok accepts those skips only. Any other
+/// condition, and `continue-on-error`, is still refused.
 fn assert_unconditional_or_skipped_for_documentation(job: &Yaml, name: &str, workflow: &str) {
     let keys = keys_of(job);
     assert!(
@@ -953,8 +956,9 @@ fn assert_unconditional_or_skipped_for_documentation(job: &Yaml, name: &str, wor
     if let Some(condition) = field(job, "if") {
         assert_eq!(
             condition.as_str(),
-            Some("needs.changes.outputs.code == 'true'"),
-            "{workflow} jobs.{name} may be skipped only for a change to documentation alone"
+            Some("needs.changes.outputs.code == 'true' && needs.changes.outputs.profile == 'full'"),
+            "{workflow} jobs.{name} may be skipped only for a change to documentation alone \
+             or on the quick profile"
         );
         assert!(
             needs_of(job).iter().any(|n| n == "changes"),
@@ -1147,6 +1151,23 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
     // jobs.fixtures
     let fixtures = job(&document, "fixtures", &path);
     assert_unconditional_or_skipped_for_documentation(fixtures, "fixtures", "ci.yml");
+    // A leg skipped on the quick profile is only safe while the merge queue
+    // and a manual run exist to take the full one, and the profile comes from
+    // the script its truth table holds.
+    let on = field(&document, "on").or_else(|| field(&document, "true"));
+    for event in ["merge_group", "workflow_dispatch", "pull_request", "push"] {
+        assert!(
+            on.is_some_and(|on| field(on, event).is_some()),
+            "ci.yml must trigger on {event}, or the quick/full profile contract has a hole"
+        );
+    }
+    let changes = job(&document, "changes", &path);
+    assert!(
+        steps_of(changes, "changes")
+            .iter()
+            .any(|step| run_of(step).contains("bash scripts/ci-profile.sh profile")),
+        "jobs.changes must choose the profile with scripts/ci-profile.sh"
+    );
     let runner = field(fixtures, "runs-on")
         .and_then(Yaml::as_str)
         .unwrap_or("");
@@ -3569,4 +3590,210 @@ fn the_chore_download_retries_a_transient_server_error() {
         "these chore downloads fail the job on one transient HTTP 5xx; \
          add `--retry 5 --retry-all-errors --retry-delay 2`: {bare:#?}"
     );
+}
+
+/// The merge-group planner, executed rather than read: the real
+/// `Classify the change` and `Choose the profile` steps from ci.yml run over
+/// disposable base/head commits, with rust-fs-core's real code-changed.sh.
+mod merge_group_planner_runs {
+    use super::*;
+    use std::process::Command;
+
+    fn step_run(name: &str) -> String {
+        let path = workflow_path("ci.yml");
+        let text = read_or_panic(&path);
+        let document = load_document(&text, &path);
+        let changes = job(&document, "changes", &path);
+        steps_of(changes, "changes")
+            .iter()
+            .find(|step| field(step, "name").and_then(Yaml::as_str) == Some(name))
+            .map(|step| run_of(step).to_string())
+            .unwrap_or_else(|| panic!("jobs.changes has no step named {name}"))
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=ci",
+                "-c",
+                "user.email=ci@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A sandbox laid out like the CI checkout: the repository beside a
+    /// `rust-fs-core` that is the real sibling, so the step's
+    /// `../rust-fs-core/scripts/code-changed.sh` is the real classifier.
+    fn sandbox(tag: &str) -> (PathBuf, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "erofs-planner-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        // The profile step invokes the repository's real script as CI does.
+        std::fs::copy(
+            manifest_dir().join("scripts/ci-profile.sh"),
+            repo.join("scripts/ci-profile.sh"),
+        )
+        .expect("provide the real profile script in the planner checkout");
+        let core = manifest_dir().join("../rust-fs-core");
+        assert!(
+            core.join("scripts/code-changed.sh").is_file(),
+            "{} is missing: run `chore siblings` to provide rust-fs-core",
+            core.join("scripts/code-changed.sh").display()
+        );
+        std::os::unix::fs::symlink(&core, root.join("rust-fs-core")).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(repo.join("docs/notes.md"), "notes\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        (root, repo)
+    }
+
+    fn commit_change(repo: &Path, file: &str) -> String {
+        std::fs::write(repo.join(file), "changed\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", "head"]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// Runs the step body, returning (exit success, GITHUB_OUTPUT, changed.txt).
+    fn run_step(repo: &Path, body: &str, env: &[(&str, &str)]) -> (bool, String, Option<String>) {
+        let output = repo.join("github_output");
+        let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_file(repo.join("changed.txt"));
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(body)
+            .current_dir(repo)
+            .env("GITHUB_OUTPUT", &output);
+        for key in [
+            "EVENT",
+            "REF",
+            "PR_BASE",
+            "PR_HEAD",
+            "MQ_BASE",
+            "MQ_HEAD",
+            "PUSH_BEFORE",
+            "PUSH_AFTER",
+        ] {
+            command.env(key, "");
+        }
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let status = command.output().expect("bash runs").status;
+        (
+            status.success(),
+            std::fs::read_to_string(&output).unwrap_or_default(),
+            std::fs::read_to_string(repo.join("changed.txt")).ok(),
+        )
+    }
+
+    #[test]
+    fn a_code_change_in_the_merge_queue_selects_the_full_fixture_pipeline() {
+        let (root, repo) = sandbox("code");
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let head = commit_change(&repo, "src/lib.rs");
+        let (ok, output, changed) = run_step(
+            &repo,
+            &step_run("Classify the change"),
+            &[
+                ("EVENT", "merge_group"),
+                ("MQ_BASE", &base),
+                ("MQ_HEAD", &head),
+            ],
+        );
+        assert!(
+            ok,
+            "the classify step must succeed on a well-formed merge-group range"
+        );
+        assert_eq!(
+            changed.as_deref(),
+            Some("src/lib.rs\n"),
+            "the emitted changed-path set"
+        );
+        assert_eq!(output, "code=true\n");
+        let (ok, profile, _) = run_step(
+            &repo,
+            &step_run("Choose the profile"),
+            &[("EVENT", "merge_group")],
+        );
+        assert!(ok);
+        assert_eq!(
+            profile, "profile=full\n",
+            "the merge queue runs the full profile"
+        );
+        // code=true and profile=full is exactly the fixtures leg's condition,
+        // the one the structured guard holds jobs.fixtures to.
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_documentation_only_merge_group_is_classified_as_no_code() {
+        let (root, repo) = sandbox("docs");
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let head = commit_change(&repo, "docs/notes.md");
+        let (ok, output, changed) = run_step(
+            &repo,
+            &step_run("Classify the change"),
+            &[
+                ("EVENT", "merge_group"),
+                ("MQ_BASE", &base),
+                ("MQ_HEAD", &head),
+            ],
+        );
+        assert!(ok);
+        assert_eq!(
+            changed.as_deref(),
+            Some("docs/notes.md\n"),
+            "the emitted changed-path set"
+        );
+        assert_eq!(
+            output, "code=false\n",
+            "documentation alone skips the code legs, by policy"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_or_half_merge_group_range_never_reports_no_code() {
+        let (root, repo) = sandbox("half");
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let body = step_run("Classify the change");
+        for env in [
+            vec![("EVENT", "merge_group")],
+            vec![("EVENT", "merge_group"), ("MQ_BASE", base.as_str())],
+            vec![("EVENT", "merge_group"), ("MQ_HEAD", base.as_str())],
+            vec![("EVENT", "workflow_dispatch")],
+        ] {
+            let (ok, output, _) = run_step(&repo, &body, &env);
+            assert!(
+                !ok || output == "code=true\n",
+                "{env:?}: an unusable range must fail the step or run everything, got {output:?}"
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
