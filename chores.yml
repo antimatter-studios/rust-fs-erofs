@@ -207,7 +207,7 @@ vars:
   #
   # v0.3.9 packages the tools for Windows when release.yml asks
   # (`windows: true`), and doctor finds a name as its .exe there (#185).
-  FS_CORE_REF: v0.3.12
+  FS_CORE_REF: v0.3.13
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
@@ -694,6 +694,7 @@ tasks:
       - cargo fmt --check
       - bash ../rust-fs-core/scripts/agents-core-check.sh
       - bash ../rust-fs-core/scripts/changelog-check.sh
+      - bash ../rust-fs-core/scripts/features-check.sh
       # The family scripts are rust-fs-core's alone: fails on a committed copy,
       # or a call to a local copy.
       - bash ../rust-fs-core/scripts/family-check.sh
