@@ -132,7 +132,7 @@ One binary, `rust-fs-erofs`, dispatching on the name it is started under, the wa
 | name | what |
 |---|---|
 | `mkfs.erofs OUTPUT SOURCE [-b BYTES]` | build an uncompressed image of a directory (the same argument order as erofs-utils) |
-| `fs.erofs IMAGE ls\|read\|get\|info [...]` | list a directory, read a file's bytes, or report the volume, without mounting it (every compressor the library reads) |
+| `fs.erofs IMAGE ls\|stat\|read\|get\|info [...]` | list a directory, inspect a path, read a file's bytes, or report the volume, without mounting it (every compressor the library reads) |
 | `rust-fs-erofs doctor` | is every name on `PATH` this program? If not, what wins and how to fix it |
 
 ```sh
@@ -140,6 +140,7 @@ mkfs.erofs out.img source-tree/                 # 4 KiB blocks, no compression
 mkfs.erofs -b 16384 out.img source-tree/        # another block size
 mkfs.erofs out.img source-tree/ | jq .skipped   # what was left out, and why
 fs.erofs out.img ls /etc                        # JSON entries; a symlink's carries its target
+fs.erofs out.img stat /etc/hostname             # one path's full metadata, without following symlinks
 fs.erofs out.img read /etc/hostname > hostname  # raw bytes, or -o FILE
 fs.erofs out.img get erofs.uuid --text
 fs.erofs --offset 1048576 disk.img ls /         # a filesystem inside a larger image
@@ -147,6 +148,8 @@ rust-fs-erofs doctor --text
 ```
 
 A result is JSON on stdout (`--text` for people); a failure is `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the command line was wrong, 3 the tool cannot do that (`mkfs.erofs --label` is refused until the builder takes a volume name, and `fs.erofs write`, `mkdir`, `set` and `resize` answer "EROFS is read-only"). `--version` prints `<tool> (rust-fs-erofs) <version>`.
+
+`stat` reports identity, type, permissions, owner, links, logical size, allocated bytes and mtime as signed seconds plus nanoseconds. A compact inode uses the image's build time; an extended inode supplies its own mtime. Access, change and birth times are null because EROFS does not record them independently. The `erofs` object reports the inode layout, data layout, actual xattr count and raw format flags in hex. A symlink adds `target`; a device adds `major` and `minor`.
 
 erofs-utils installs a `mkfs.erofs` too. Only one can be first on `PATH`; `rust-fs-erofs doctor` says which, and how to change it.
 
