@@ -1,7 +1,7 @@
 //! `fs.erofs <target> <verb>`: an errand inside an EROFS image, without
 //! mounting it.
 //!
-//! The verbs are the shared set every `fs.<fs>` answers: `ls`, `read`,
+//! The verbs are the shared set every `fs.<fs>` answers: `ls`, `stat`, `read`,
 //! `get`/`info`, and `write`, `mkdir`, `set`, `resize`. EROFS is a
 //! read-only format, so the last four exist and refuse, with exit status 3
 //! and "EROFS is read-only": a script moved here from a writable
@@ -18,7 +18,7 @@ use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
 use fs_core::cli::{CliError, Json, Outcome, Tool};
 use fs_core::{BlockRead, FileDevice, OwnedSlice};
-use fs_erofs::{FileType, Filesystem, Inode, InodeVersion};
+use fs_erofs::{DataLayout, FileType, Filesystem, Inode, InodeVersion};
 
 pub const TOOL: Tool = Tool {
     name: "fs.erofs",
@@ -88,6 +88,25 @@ fn command() -> Cmd {
                      fs.erofs rootfs.erofs ls / | jq -r '.[].name'\n  \
                      fs.erofs rootfs.erofs ls /bin/sh | jq -r '.[0].target'\n  \
                      fs.erofs rootfs.erofs ls --text /",
+                ),
+        )
+        .subcommand(
+            Cmd::new("stat")
+                .about("Report one path: identity, type, mode, owner, links, sizes and times")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.erofs rootfs.erofs stat /etc/hostname\n  \
+                     fs.erofs rootfs.erofs stat /var/log | jq .nlink\n  \
+                     fs.erofs rootfs.erofs stat --text /bin/sh\n\n\
+                     A symlink is reported, not followed. Times are signed seconds since \
+                     the epoch plus nanoseconds. Compact inodes use the image's build time; \
+                     extended inodes store mtime. Access, change and birth times are not \
+                     recorded and are null. Allocated bytes use the kernel's block accounting.",
                 ),
         )
         .subcommand(
@@ -211,6 +230,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         .unwrap_or(0);
     match verb {
         "ls" => ls(&open(target, offset)?, path_arg(sub)),
+        "stat" => stat(&open(target, offset)?, path_arg(sub)),
         "read" => read(&open(target, offset)?, path_arg(sub), sub.get_one("output")),
         "get" | "info" => get(
             &open(target, offset)?,
@@ -387,6 +407,87 @@ fn ls(fs: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
         .collect::<Vec<_>>()
         .join("\n");
     Ok(Outcome::report(Json::Arr(entries)).with_text(text))
+}
+
+/// Report the inode itself, retaining absent fields as null rather than
+/// copying mtime into access/change time as a mounted kernel does.
+fn stat(fs: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
+    let inode = fs
+        .lookup_path_bytes(path)
+        .map_err(|e| erofs_error(path, e))?;
+    let sb = fs.superblock();
+    let (layout, seconds, nanos) = match inode.format.version {
+        InodeVersion::Compact => ("compact", sb.build_time, sb.build_time_nsec),
+        InodeVersion::Extended => ("extended", inode.mtime, inode.mtime_nsec),
+    };
+    // EROFS accounts compressed data with i_u's compressed-block count.
+    // Other data layouts charge the rounded logical size, even inline
+    // tails and sparse chunks; device IDs are never block counts.
+    let blocks = match inode.file_type() {
+        FileType::RegularFile | FileType::Dir | FileType::Symlink => match inode.format.layout {
+            DataLayout::Compression | DataLayout::CompressionLegacy => u64::from(inode.raw_u),
+            _ => inode.size.div_ceil(sb.block_size()),
+        },
+        _ => 0,
+    };
+    let allocated = blocks
+        .checked_mul(sb.block_size())
+        .ok_or_else(|| CliError::failed(format!("{}: allocated size overflows", show(path))))?;
+    let datalayout = match inode.format.layout {
+        DataLayout::FlatPlain => "flat_plain",
+        DataLayout::FlatInline => "flat_inline",
+        DataLayout::CompressionLegacy => "compression_legacy",
+        DataLayout::Compression => "compression",
+        DataLayout::ChunkBased => "chunk_based",
+    };
+    let mut fields = vec![
+        ("path", Json::from(show(path))),
+        ("inode", Json::from(inode.nid)),
+        ("type", Json::from(type_name(inode.file_type()))),
+        ("mode", Json::from(format!("{:04o}", inode.mode & 0o7777))),
+        ("uid", Json::from(inode.uid)),
+        ("gid", Json::from(inode.gid)),
+        ("nlink", Json::from(inode.nlink)),
+        ("size", Json::from(inode.size)),
+        ("allocated_bytes", Json::from(allocated)),
+        ("atime", Json::Null),
+        ("atime_nsec", Json::Null),
+        ("mtime", Json::from(seconds as i64)),
+        ("mtime_nsec", Json::from(nanos)),
+        ("ctime", Json::Null),
+        ("ctime_nsec", Json::Null),
+        ("btime", Json::Null),
+        ("btime_nsec", Json::Null),
+    ];
+    if std::str::from_utf8(path).is_err() {
+        fields.push((
+            "path_hex",
+            Json::from(path.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+    if inode.is_symlink() {
+        let target = fs
+            .read_symlink_target(&inode)
+            .map_err(|e| erofs_error(path, e))?;
+        fields.push(("target", Json::from(show(&target))));
+    }
+    if let Some((major, minor)) = inode.rdev() {
+        fields.extend([("major", Json::from(major)), ("minor", Json::from(minor))]);
+    }
+    let xattrs = fs.xattrs(&inode).map_err(|e| erofs_error(path, e))?;
+    fields.push((
+        "erofs",
+        Json::object([
+            ("layout", Json::from(layout)),
+            ("datalayout", Json::from(datalayout)),
+            ("xattr_count", Json::from(xattrs.len() as u64)),
+            (
+                "flags",
+                Json::from(format!("0x{:04x}", inode.format.flags << 4)),
+            ),
+        ]),
+    ));
+    Ok(Outcome::report(Json::object(fields)))
 }
 
 /// Stream a regular file's bytes. Each chunk is read before it is
