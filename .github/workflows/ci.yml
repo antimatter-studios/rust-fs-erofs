@@ -550,7 +550,7 @@ jobs:
         run: |
           set -euo pipefail
           bash ../rust-fs-core/scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh
-          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 247
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 605
       - name: Keep the tier logs
         if: always() && steps.tier.outcome != 'skipped'
         uses: actions/upload-artifact@v4
