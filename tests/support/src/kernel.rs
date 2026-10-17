@@ -452,6 +452,27 @@ pub fn guest_kernel_link_report(image: &str, what: &str) -> BTreeMap<(String, St
     parse(&guest_kernel_read_ok(image, what, LINK_REPORT))
 }
 
+/// GNU stat's full metadata, without following symlinks, on a mounted
+/// reference image. Hex path labels preserve arbitrary filename bytes.
+pub fn guest_kernel_stat_report(image: &str) -> String {
+    guest_kernel_read_ok(
+        image,
+        "stat",
+        r#"
+cd "$MNT"
+find . -print0 | sort -z | while IFS= read -r -d '' path; do
+    printf '%s|' "$(printf '%s' "$path" | od -An -v -tx1 | tr -d ' \n')"
+    stat -c '%i|%f|%u|%g|%h|%s|%b|%B|%X|%x|%Y|%y|%Z|%z|%W|%w|%t|%T' -- "$path"
+    if [ -L "$path" ]; then
+        printf 'target|%s\n' "$(readlink -- "$path")"
+    fi
+    names="$(getfattr -h -m '^user\.' --absolute-names "$path" 2>/dev/null)"
+    printf 'xattrs|%s\n' "$(printf '%s\n' "$names" | grep -c '^user\.' || true)"
+done
+"#,
+    )
+}
+
 /// Mount `image` read-only in the guest and report everything in it:
 /// for every path, its type, mode, owner, size, SHA-256, symlink target,
 /// device number and extended attributes, keyed by `(kind, path)`.
