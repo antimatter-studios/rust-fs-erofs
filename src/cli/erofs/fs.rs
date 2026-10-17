@@ -10,6 +10,7 @@
 //! Metadata is JSON (or `--text`); file content is raw bytes. Every layout
 //! the library reads is read here, compressed ones included.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::Write;
 use std::sync::Arc;
@@ -78,6 +79,31 @@ fn command() -> Cmd {
             Cmd::new("ls")
                 .about("List a directory: name, type, size, mode, mtime (and a symlink's target)")
                 .arg(
+                    Arg::new("recursive")
+                        .long("recursive")
+                        .short('R')
+                        .action(ArgAction::SetTrue)
+                        .help("Walk depth first, sorting names as bytes; never follow symlinks"),
+                )
+                .arg(
+                    Arg::new("max-depth")
+                        .long("max-depth")
+                        .value_name("N")
+                        .value_parser(value_parser!(u64))
+                        .requires("recursive")
+                        .help(
+                            "Maximum recursive depth (default: 64); direct children have depth 1",
+                        ),
+                )
+                .arg(
+                    Arg::new("limit")
+                        .long("limit")
+                        .value_name("N")
+                        .value_parser(value_parser!(u64))
+                        .requires("recursive")
+                        .help("Maximum recursive entries (default: 100000)"),
+                )
+                .arg(
                     Arg::new("path")
                         .value_name("PATH")
                         .default_value("/")
@@ -87,7 +113,14 @@ fn command() -> Cmd {
                     "Examples:\n  fs.erofs rootfs.erofs ls /etc\n  \
                      fs.erofs rootfs.erofs ls / | jq -r '.[].name'\n  \
                      fs.erofs rootfs.erofs ls /bin/sh | jq -r '.[0].target'\n  \
-                     fs.erofs rootfs.erofs ls --text /",
+                     fs.erofs rootfs.erofs ls --text /\n  \
+                     fs.erofs rootfs.erofs ls -R --max-depth 8 --limit 1000 /etc\n\n\
+                     Recursive entries add volume-absolute path and depth. The starting \
+                     directory is omitted; a starting file or symlink has depth 0. A repeated \
+                     directory inode is listed with revisited: true and not entered. If another \
+                     entry would exceed either bound, or a directory cannot be read, the \
+                     collected prefix stays on stdout and an error names the bound or path \
+                     on stderr (exit 1). Exact fits succeed; zero allows no entries or depth.",
                 ),
         )
         .subcommand(
@@ -229,6 +262,9 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         .copied()
         .unwrap_or(0);
     match verb {
+        "ls" if sub.get_flag("recursive") => {
+            ls_recursive(&open(target, offset)?, path_arg(sub), sub)
+        }
         "ls" => ls(&open(target, offset)?, path_arg(sub)),
         "stat" => stat(&open(target, offset)?, path_arg(sub)),
         "read" => read(&open(target, offset)?, path_arg(sub), sub.get_one("output")),
@@ -361,10 +397,15 @@ fn entry_text(e: &Json) -> String {
         type_char(&field("type")),
         field("mode"),
         field("size"),
-        field("name")
+        e.get("path")
+            .map(Json::to_text)
+            .unwrap_or_else(|| field("name"))
     );
     if let Some(target) = e.get("target") {
         line.push_str(&format!(" -> {}", target.to_text()));
+    }
+    if e.get("revisited").is_some() {
+        line.push_str(" [revisited]");
     }
     line
 }
@@ -407,6 +448,126 @@ fn ls(fs: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
         .collect::<Vec<_>>()
         .join("\n");
     Ok(Outcome::report(Json::Arr(entries)).with_text(text))
+}
+
+fn recursive_entry(
+    fs: &Filesystem,
+    path: &[u8],
+    depth: u64,
+    inode: &Inode,
+    revisited: bool,
+) -> Result<Json, CliError> {
+    let name = path.rsplit(|b| *b == b'/').next().unwrap_or(path);
+    let Json::Obj(mut fields) = entry(fs, name, inode).map_err(|e| erofs_error(path, e))? else {
+        unreachable!()
+    };
+    fields.push(("path".into(), Json::from(show(path))));
+    if std::str::from_utf8(path).is_err() {
+        fields.push((
+            "path_hex".into(),
+            Json::from(path.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+    fields.push(("depth".into(), Json::from(depth)));
+    if revisited {
+        fields.push(("revisited".into(), Json::from(true)));
+    }
+    Ok(Json::Obj(fields))
+}
+
+/// Directory iterators live on an explicit stack, so a large requested
+/// depth cannot overflow the process call stack. Bounds exclude the next
+/// entry; empty directories and exact fits still succeed.
+fn ls_recursive(fs: &Filesystem, path: &[u8], sub: &ArgMatches) -> Result<Outcome, CliError> {
+    let inode = fs
+        .lookup_path_bytes(path)
+        .map_err(|e| erofs_error(path, e))?;
+    let max_depth = sub.get_one::<u64>("max-depth").copied().unwrap_or(64);
+    let limit = sub.get_one::<u64>("limit").copied().unwrap_or(100_000);
+    let mut full = Vec::new();
+    for component in path.split(|b| *b == b'/').filter(|c| !c.is_empty()) {
+        full.push(b'/');
+        full.extend_from_slice(component);
+    }
+    if full.is_empty() {
+        full.push(b'/');
+    }
+    let mut entries = Vec::new();
+    let result = (|| {
+        if !inode.is_dir() {
+            if limit == 0 {
+                return Err(CliError::failed(format!(
+                    "--limit 0 reached at {}",
+                    show(&full)
+                )));
+            }
+            entries.push(recursive_entry(fs, &full, 0, &inode, false)?);
+            return Ok(());
+        }
+        let children = |node: &Inode, at: &[u8]| {
+            let mut children = fs.read_dir(node).map_err(|e| erofs_error(at, e))?;
+            children.retain(|e| e.name != b"." && e.name != b"..");
+            children.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok::<_, CliError>(children.into_iter())
+        };
+        let mut visited = HashSet::from([inode.nid]);
+        let first = children(&inode, &full)?;
+        let mut stack = vec![(full, 0u64, first)];
+        while let Some((parent, parent_depth, children_iter)) = stack.last_mut() {
+            let Some(child) = children_iter.next() else {
+                stack.pop();
+                continue;
+            };
+            let mut full = parent.clone();
+            if !full.ends_with(b"/") {
+                full.push(b'/');
+            }
+            full.extend_from_slice(&child.name);
+            let depth = *parent_depth + 1;
+            if entries.len() as u64 >= limit {
+                return Err(CliError::failed(format!(
+                    "--limit {limit} reached at {}",
+                    show(&full)
+                )));
+            }
+            if depth > max_depth {
+                return Err(CliError::failed(format!(
+                    "--max-depth {max_depth} reached at {}",
+                    show(&full)
+                )));
+            }
+            let inode = fs
+                .read_inode(child.nid)
+                .map_err(|e| erofs_error(&full, e))?;
+            let revisited = inode.is_dir() && !visited.insert(inode.nid);
+            entries.push(recursive_entry(fs, &full, depth, &inode, revisited)?);
+            if inode.is_dir() && !revisited {
+                let next = children(&inode, &full)?;
+                stack.push((full, depth, next));
+            }
+        }
+        Ok(())
+    })();
+    let text = entries
+        .iter()
+        .map(entry_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = Outcome::report(Json::Arr(entries)).with_text(text);
+    match result {
+        Ok(()) => Ok(report),
+        Err(error) => {
+            // Outcome carries one stream. Render the partial report here
+            // and let the dispatcher render the error in the same format.
+            let format = fs_core::cli::Format::of(sub, &std::env::args_os().collect::<Vec<_>>());
+            let partial = fs_core::cli::output::render("fs.erofs", format, Ok(report));
+            std::io::stdout()
+                .lock()
+                .write_all(partial.stdout.as_bytes())
+                .map_err(|e| CliError::failed(format!("write: {e}")))?;
+            Err(error)
+        }
+    }
 }
 
 /// Report the inode itself, retaining absent fields as null rather than
