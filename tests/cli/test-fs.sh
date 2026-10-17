@@ -72,10 +72,101 @@ for verb in "write /new" "mkdir /newdir" "set label X" "resize 1G --force"; do
     jq_check "$verb says EROFS is read-only" '.code == 3 and (.error | test("EROFS is read-only"))' "$SANDBOX/ro.err"
 done
 
+# Every mutation form parses, but refuses before opening even a missing or
+# invalid image. Hash each existing target before and after every refusal;
+# also compare the real image with its saved copy, byte for byte.
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d ' ' -f 1
+    else
+        shasum -a 256 | cut -d ' ' -f 1
+    fi
+}
+cp "$img" "$SANDBOX/readonly.erofs"
+cp "$img" "$SANDBOX/before.erofs"
+chmod 444 "$SANDBOX/readonly.erofs"
+printf 'not an EROFS image\n' >"$SANDBOX/foreign.img"
+refuse_mutation() {
+    local target="$1" what="$2" before=absent after=absent
+    shift 2
+    if [ -f "$target" ]; then
+        before="$(sha256 <"$target")" || fail "$what needs SHA-256 (install coreutils or Perl's shasum)"
+    fi
+    fs.erofs "$target" "$@" <&- >"$SANDBOX/mutation.out" 2>"$SANDBOX/mutation.err"
+    check "$what exits 3" test $? -eq 3
+    check "$what prints nothing on stdout" test ! -s "$SANDBOX/mutation.out"
+    jq_check "$what uses the existing refusal" \
+        ". == {\"error\": \"$1: EROFS is read-only; build a new image with mkfs.erofs instead\", \"code\": 3}" \
+        "$SANDBOX/mutation.err"
+    if [ -f "$target" ]; then
+        after="$(sha256 <"$target")" || fail "$what needs SHA-256 (install coreutils or Perl's shasum)"
+    fi
+    check "$what preserves the target's SHA-256 or absence" test "$before" = "$after"
+    check "$what preserves every image byte" cmp -s "$SANDBOX/readonly.erofs" "$SANDBOX/before.erofs"
+}
+
+for mutation in \
+    "write /one" "write /one --at 0" \
+    "write --at 18446744073709551615 /one" \
+    "mkdir /newdir" "mkdir --parents /new/dir" "mkdir -p /new/dir" \
+    "rm /one" "rmdir /a" "mv /one /renamed" \
+    "ln /one /hardlink" "ln -s ../one /symlink" \
+    "ln --symbolic /one /symlink" \
+    "truncate /one 0" "truncate /one 18446744073709551615" \
+    "set label X" "resize 1G --force"; do
+    for target in "$SANDBOX/readonly.erofs" "$SANDBOX/foreign.img" "$SANDBOX/absent.erofs"; do
+        # shellcheck disable=SC2086  # each string is an intentional argument list
+        refuse_mutation "$target" "$mutation on $(basename "$target")" $mutation
+    done
+done
+check "no mutation creates a missing image" test ! -e "$SANDBOX/absent.erofs"
+refuse_mutation "$SANDBOX/readonly.erofs" "mv paths with spaces" mv '/old name' '/new name'
+refuse_mutation "$SANDBOX/readonly.erofs" "ln target beginning with a dash" ln -s -- '-target' '/new link'
+
+# A refused write does not consume stdin, even when --at is present.
+printf 'unconsumed input\n' >"$SANDBOX/stdin"
+before="$(sha256 <"$SANDBOX/readonly.erofs")" || fail "write --at needs SHA-256 (install coreutils or Perl's shasum)"
+exec 9<"$SANDBOX/stdin"
+fs.erofs "$SANDBOX/readonly.erofs" write /one --at 1 <&9 \
+    >"$SANDBOX/stdin.out" 2>"$SANDBOX/stdin.err"
+check "write --at with stdin exits 3" test $? -eq 3
+check "write --at leaves stdin unread" test "$(cat <&9)" = 'unconsumed input'
+exec 9<&-
+after="$(sha256 <"$SANDBOX/readonly.erofs")" || fail "write --at needs SHA-256 (install coreutils or Perl's shasum)"
+check "write --at preserves the image's SHA-256" test "$before" = "$after"
+check "write --at leaves the image intact" cmp -s "$SANDBOX/readonly.erofs" "$SANDBOX/before.erofs"
+
+# Malformed invocations remain usage errors, not format refusals.
+for mutation in "rm" "rmdir" "mv /old" "ln /target" "ln -s /target" \
+    "truncate /one" "truncate /one -1" "truncate /one nope" \
+    "truncate /one 18446744073709551616" "write /one --at" \
+    "write /one --at -1" "write /one --at nope" \
+    "write /one --at 18446744073709551616" "mkdir --parents"; do
+    # shellcheck disable=SC2086  # each string is an intentional argument list
+    fs.erofs "$SANDBOX/absent.erofs" $mutation <&- >"$SANDBOX/usage.out" 2>"$SANDBOX/usage.err"
+    check "$mutation exits 2" test $? -eq 2
+    check "$mutation prints nothing on stdout" test ! -s "$SANDBOX/usage.out"
+    jq_check "$mutation is a structured usage error" '.code == 2 and (.error|type) == "string"' "$SANDBOX/usage.err"
+done
+
+for verb in rm rmdir mv ln truncate write mkdir; do
+    fs.erofs "$SANDBOX/absent.erofs" "$verb" --help >"$SANDBOX/help" 2>"$SANDBOX/help.err"
+    check "$verb help exits 0" test $? -eq 0
+    check "$verb help names the format refusal" grep -q 'EROFS is read-only' "$SANDBOX/help"
+    check "$verb help includes examples" grep -q '^Examples:' "$SANDBOX/help"
+done
+
 # --offset: the image embedded a MiB into a larger file.
 { head -c 1048576 /dev/zero; cat "$img"; } >"$SANDBOX/embedded.img"
 fs.erofs --offset 1048576 "$SANDBOX/embedded.img" read /one >"$SANDBOX/off.out" 2>/dev/null
 check "--offset reaches the embedded image" cmp -s "$src/one" "$SANDBOX/off.out"
+for mutation in "rm /one" "rmdir /a" "mv /one /renamed" \
+    "ln /one /hardlink" "ln -s one /symlink" \
+    "truncate /one 0" "mkdir --parents /new/dir" "write /one --at 2"; do
+    # shellcheck disable=SC2086  # --at is a file position; --offset is a device offset
+    refuse_mutation "$SANDBOX/embedded.img" "$mutation with a filesystem offset" \
+        $mutation --offset 1048576
+done
 
 # Failures: status 1, a structured error, nothing on stdout -- never a panic.
 refuse() {
