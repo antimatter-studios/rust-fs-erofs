@@ -7,8 +7,8 @@ mod kernel;
 mod oracle;
 
 pub use kernel::{
-    guest_kernel_acl_report, guest_kernel_link_report, guest_kernel_refusal, guest_kernel_report,
-    guest_kernel_stat_report, sha256_hex,
+    guest_kernel_acl_report, guest_kernel_link_report, guest_kernel_read, guest_kernel_refusal,
+    guest_kernel_report, guest_kernel_stat_report, sha256_hex,
 };
 pub use oracle::{guest_base64, guest_quote, mkfs_from_guest_tree, oracle, Oracle};
 

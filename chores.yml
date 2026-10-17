@@ -438,9 +438,10 @@ tasks:
     # 10 with tests/hardlink_oracle.rs: link counts and inode identity,
     # compact and extended inodes. 12 with cli_stat_kernel.rs: every
     # stored stat field on reference-made compact and extended inodes.
+    # 13 with cli_ls_recursive_kernel.rs: the full recursive reference tree.
     # tests/scripts/kernel-floor.sh fails if this falls below the number of
     # tests the tier holds.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 12'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 13'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
@@ -605,7 +606,8 @@ tasks:
     cmds:
       - '../rust-fs-core/scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh'
       # test-stat.sh adds 70 checks over compact and extended inodes.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 200'
+      # test-ls-recursive.sh adds 47 checks; execution remains CI-only.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 247'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob

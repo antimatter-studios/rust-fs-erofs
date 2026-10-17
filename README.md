@@ -140,6 +140,7 @@ mkfs.erofs out.img source-tree/                 # 4 KiB blocks, no compression
 mkfs.erofs -b 16384 out.img source-tree/        # another block size
 mkfs.erofs out.img source-tree/ | jq .skipped   # what was left out, and why
 fs.erofs out.img ls /etc                        # JSON entries; a symlink's carries its target
+fs.erofs out.img ls -R --max-depth 8 --limit 1000 /etc # a bounded depth-first walk
 fs.erofs out.img stat /etc/hostname             # one path's full metadata, without following symlinks
 fs.erofs out.img read /etc/hostname > hostname  # raw bytes, or -o FILE
 fs.erofs out.img get erofs.uuid --text
@@ -150,6 +151,10 @@ rust-fs-erofs doctor --text
 A result is JSON on stdout (`--text` for people); a failure is `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the command line was wrong, 3 the tool cannot do that (`mkfs.erofs --label` is refused until the builder takes a volume name, and `fs.erofs write`, `mkdir`, `set` and `resize` answer "EROFS is read-only"). `--version` prints `<tool> (rust-fs-erofs) <version>`.
 
 `stat` reports identity, type, permissions, owner, links, logical size, allocated bytes and mtime as signed seconds plus nanoseconds. A compact inode uses the image's build time; an extended inode supplies its own mtime. Access, change and birth times are null because EROFS does not record them independently. The `erofs` object reports the inode layout, data layout, actual xattr count and raw format flags in hex. A symlink adds `target`; a device adds `major` and `minor`.
+
+`ls --recursive` (`-R`) walks depth first with names sorted as bytes in each directory. Entries retain the plain `ls` fields and add volume-absolute `path` and relative `depth` (direct children are depth 1); non-UTF-8 paths add `path_hex`. The starting directory is omitted; a starting file or symlink is listed at depth 0. Symlinks are never followed. A directory inode already visited is listed with `revisited: true` and not entered again.
+
+Recursive defaults are `--max-depth 64 --limit 100000`; both options require `--recursive`. Zero allows no depth or entries, and exact fits succeed. If the next entry would exceed a bound, or an entry or directory cannot be read, the collected array stays on stdout and the error on stderr names the bound or path (exit 1). A missing starting path produces no report. `--text` uses full paths and marks repeated directories with `[revisited]`.
 
 erofs-utils installs a `mkfs.erofs` too. Only one can be first on `PATH`; `rust-fs-erofs doctor` says which, and how to change it.
 
