@@ -106,8 +106,16 @@ chore_min_version: 0.10.0
 #                                                   build too: 73 l cold
 #     oracle    529 l / 41,268 B  700 l / 55,000 B  runs warm in CI (unit and
 #                87 tests                           images built already): ~18%
-#     kernel     24 l /  1,173 B  130 l /  9,000 B  warm in CI; sized for cold
-#                 2 tests                           anyway, it is cheap to
+#     kernel    174 l / 10,876 B  230 l / 14,500 B  ~30%, measured in CI: the
+#                13 tests                           x86_64 merge-queue run
+#                                                   39074951731 of the chain
+#                                                   through #221 (#227). Every
+#                                                   kernel test adds its
+#                                                   --show-output evidence:
+#                                                   main was 122 l / 7,508 B
+#                                                   for 10 tests, against
+#                                                   130 l / 9,000 B. Was 24 l
+#                                                   / 1,173 B for 2 tests
 #     suite     771 l / 39,019 B  900 l / 50,000 B  measured COLD; warm in CI
 #               545 tests                           at 709 l, so ~17% on cold
 #     vm        898 l / 45,000 B  1,150 l / 60,000  measured COLD, from
@@ -426,7 +434,7 @@ tasks:
     # deliberate corruption the kernel has to refuse.
     cmds:
       - scripts/tools.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 130 9000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 230 14500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
     # 5: the 3 measured on main at ca0c577 (CI run 36351672753) -- the
     # third being the readlink kernel oracle #139 added -- plus the two
     # #125 added: the deduplicated images read back through the kernel,
@@ -436,10 +444,11 @@ tasks:
     # tests/cli_fs_kernel.rs: `fs.erofs` reading what the kernel reads;
     # 8 with tests/acl_oracle.rs: POSIX ACLs agreeing with the kernel's;
     # 10 with tests/hardlink_oracle.rs: link counts and inode identity,
-    # compact and extended inodes.
+    # compact and extended inodes. 12 with cli_stat_kernel.rs: every
+    # stored stat field on reference-made compact and extended inodes.
     # tests/scripts/kernel-floor.sh fails if this falls below the number of
     # tests the tier holds.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 10'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 12'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
@@ -603,7 +612,8 @@ tasks:
     # and it only goes up.
     cmds:
       - '../rust-fs-core/scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 130'
+      # test-stat.sh adds 70 checks over compact and extended inodes.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 200'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
