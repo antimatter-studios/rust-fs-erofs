@@ -418,11 +418,12 @@ checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
 
 [[package]]
 name = "rust-fs-core"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "sha2",
 ]
 
 [[package]]
