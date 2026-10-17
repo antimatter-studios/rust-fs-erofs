@@ -121,7 +121,7 @@ chore_min_version: 0.10.0
 #                                                   repository does not control
 #     scripts     3 l /     77 B   30 l /  2,000 B  one shell test today, and
 #                                                   the glob picks up the next
-#     cli        19 l /    683 B   28 l /  1,000 B  the installed tools, no cargo
+#     cli        19 l /    683 B   31 l /  1,100 B  the installed tools, no cargo
 #               137 checks                          output at all: 19 lines on a
 #                                                   Mac with erofs-utils linked
 #                                                   (doctor names it as not run),
@@ -130,7 +130,12 @@ chore_min_version: 0.10.0
 #                                                   when it passes, so a new one
 #                                                   is a visible step. Was 12 l /
 #                                                   466 B with mkfs.erofs alone,
-#                                                   16 l / 604 B before the docs
+#                                                   16 l / 604 B before the docs.
+#                                                   test-xattr.sh adds 3 fixed
+#                                                   verdict lines / 81 B (37
+#                                                   checks), so its budget adds
+#                                                   3 lines / 100 B; suites
+#                                                   remain CI-only.
 #     android     8 l /    358 B   11 l /    470 B  the test alone, measured on
 #                 1 test                            the runner from a cold cargo
 #                                                   cache (android.yml run
@@ -441,7 +446,8 @@ tasks:
     # 13 with cli_ls_recursive_kernel.rs: the full recursive reference tree.
     # tests/scripts/kernel-floor.sh fails if this falls below the number of
     # tests the tier holds.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 13'
+      # cli_xattr_kernel.rs adds inline/shared/prefix attributes versus getfattr.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 14'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
@@ -604,12 +610,13 @@ tasks:
     # with the man pages and completions; the floor is about 95% of that,
     # and it only goes up.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 31 1100 -- scripts/test-cli.sh'
       # test-stat.sh adds 70 checks over compact and extended inodes.
       # test-ls-recursive.sh adds 47 checks; execution remains CI-only.
       # Mutation refusals add 358 checks: 58 calls x 5, one missing-image
       # check, four stdin checks, 14 usage cases x 3, seven help cases x 3.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 605'
+      # test-xattr.sh adds 37 checks; execution remains CI-only.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 642'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob

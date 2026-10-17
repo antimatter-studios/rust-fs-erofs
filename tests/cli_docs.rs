@@ -56,8 +56,8 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
     }
     // fs.erofs's subcommands have pages of their own, which its list names.
     for verb in [
-        "ls", "stat", "read", "write", "mkdir", "rm", "rmdir", "mv", "ln", "truncate", "get",
-        "info", "set", "resize",
+        "ls", "stat", "read", "xattr", "write", "mkdir", "rm", "rmdir", "mv", "ln", "truncate",
+        "get", "info", "set", "resize",
     ] {
         assert!(
             share.join(format!("man/man1/fs.erofs-{verb}.1")).is_file(),
@@ -100,6 +100,7 @@ fn every_name_has_a_zsh_bash_and_fish_completion() {
         if name == "fs.erofs" {
             for flag in [
                 "recursive",
+                "xattr",
                 "max-depth",
                 "limit",
                 "rm",
