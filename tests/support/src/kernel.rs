@@ -48,7 +48,7 @@ use crate::oracle::{guest_quote, guest_shell, repo, session, Run};
 /// The mount is `ro` AND the loop device is read-only, which is what
 /// EROFS is anyway — the belt is free and it makes the intent explicit.
 #[track_caller]
-fn guest_kernel_read(image: &str, script: &str) -> Output {
+pub fn guest_kernel_read(image: &str, script: &str) -> Output {
     run(image, script, MountExpectation::Succeeds)
 }
 
