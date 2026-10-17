@@ -63,6 +63,10 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
             "no fs.erofs-{verb}.1"
         );
     }
+    let page = std::fs::read_to_string(share.join("man/man1/fs.erofs-ls.1")).unwrap();
+    for flag in ["recursive", "max\\-depth", "limit"] {
+        assert!(page.contains(flag), "ls man page is missing {flag}");
+    }
 }
 
 #[test]
@@ -86,5 +90,12 @@ fn every_name_has_a_zsh_bash_and_fish_completion() {
             std::fs::read_to_string(share.join(format!("fish/vendor_completions.d/{name}.fish")))
                 .unwrap_or_else(|e| panic!("fish {name}: {e}"));
         assert!(fish.contains(&format!("complete -c {name}")), "fish {name}");
+        if name == "fs.erofs" {
+            for flag in ["recursive", "max-depth", "limit"] {
+                for completion in [&zsh, &bash, &fish] {
+                    assert!(completion.contains(flag), "completion is missing {flag}");
+                }
+            }
+        }
     }
 }
