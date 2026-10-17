@@ -132,7 +132,7 @@ One binary, `rust-fs-erofs`, dispatching on the name it is started under, the wa
 | name | what |
 |---|---|
 | `mkfs.erofs OUTPUT SOURCE [-b BYTES]` | build an uncompressed image of a directory (the same argument order as erofs-utils) |
-| `fs.erofs IMAGE ls\|stat\|read\|get\|info [...]` | list a directory, inspect a path, read a file's bytes, or report the volume, without mounting it (every compressor the library reads) |
+| `fs.erofs IMAGE ls\|stat\|read\|xattr\|get\|info [...]` | list a directory, inspect a path or its attributes, read raw bytes, or report the volume, without mounting it (every compressor the library reads) |
 | `rust-fs-erofs doctor` | is every name on `PATH` this program? If not, what wins and how to fix it |
 
 ```sh
@@ -143,6 +143,8 @@ fs.erofs out.img ls /etc                        # JSON entries; a symlink's carr
 fs.erofs out.img ls -R --max-depth 8 --limit 1000 /etc # a bounded depth-first walk
 fs.erofs out.img stat /etc/hostname             # one path's full metadata, without following symlinks
 fs.erofs out.img read /etc/hostname > hostname  # raw bytes, or -o FILE
+fs.erofs out.img xattr /bin/tool                # JSON names and value sizes
+fs.erofs out.img xattr /bin/tool security.capability -o caps.bin # raw value
 fs.erofs out.img get erofs.uuid --text
 fs.erofs --offset 1048576 disk.img ls /         # a filesystem inside a larger image
 rust-fs-erofs doctor --text
@@ -166,6 +168,8 @@ the filesystem's byte offset inside the image. Byte counts accept unsigned
 `ls --recursive` (`-R`) walks depth first with names sorted as bytes in each directory. Entries retain the plain `ls` fields and add volume-absolute `path` and relative `depth` (direct children are depth 1); non-UTF-8 paths add `path_hex`. The starting directory is omitted; a starting file or symlink is listed at depth 0. Symlinks are never followed. A directory inode already visited is listed with `revisited: true` and not entered again.
 
 Recursive defaults are `--max-depth 64 --limit 100000`; both options require `--recursive`. Zero allows no depth or entries, and exact fits succeed. If the next entry would exceed a bound, or an entry or directory cannot be read, the collected array stays on stdout and the error on stderr names the bound or path (exit 1). A missing starting path produces no report. `--text` uses full paths and marks repeated directories with `[revisited]`.
+
+`xattr PATH` lists extended attributes as `[{"name": "user.comment", "size": 12}, ...]`, sorted by raw name bytes. Non-UTF-8 names add `name_hex`; `--text` shows size, a tab and name. `xattr PATH NAME` writes the value's raw bytes, even with `--text`, or writes through `FILE.partial` and renames on success with `-o FILE`. Empty values succeed; a missing path or attribute fails with exit 1 and nothing on stdout. Symlinks are inspected without following them. Inline, shared and prefix-dictionary attributes are supported; setting and removing attributes are unavailable.
 
 erofs-utils installs a `mkfs.erofs` too. Only one can be first on `PATH`; `rust-fs-erofs doctor` says which, and how to change it.
 
