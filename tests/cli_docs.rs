@@ -73,6 +73,7 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
         ("mkdir", "parents"),
         ("ln", "symbolic"),
         ("export", "replace"),
+        ("export", "preserve"),
         ("import", "replace"),
     ] {
         let page =
@@ -110,6 +111,7 @@ fn every_name_has_a_zsh_bash_and_fish_completion() {
                 "export",
                 "import",
                 "replace",
+                "preserve",
                 "max-depth",
                 "limit",
                 "rm",

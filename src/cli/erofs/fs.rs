@@ -168,20 +168,25 @@ fn command() -> Cmd {
         .subcommand(
             Cmd::new("export")
                 .about("Copy a regular file, or with --recursive a directory tree")
-                .args(transfer::export_args_with_tree())
+                .args(transfer::export_args_with_times())
                 .after_help(
                     "Examples:\n  fs.erofs rootfs.erofs export /backup.tar backup.tar\n  \
                      fs.erofs rootfs.erofs export --replace /etc/hostname hostname\n  \
                      fs.erofs rootfs.erofs export /backup.tar - | tar tf -\n  \
-                     fs.erofs rootfs.erofs export --recursive /etc etc\n\n\
+                     fs.erofs rootfs.erofs export --recursive /etc etc\n  \
+                     fs.erofs rootfs.erofs export --recursive --preserve=links,times /etc etc\n\n\
                      Files are copied in fixed chunks. A local destination is published only \
                      when complete; an existing name is refused unless --replace is given. \
                      The report includes the byte count and SHA-256; DEST - writes only raw \
                      bytes to stdout. Without --recursive directories are refused.\n\n\
                      Recursive export uses the shared tree transfer and reports every item. \
                      Existing directories are merged into; existing files require --replace. \
-                     --max-depth bounds the walk. Symlinks and special files are skipped, \
-                     never followed. --verify reads each staged file back before publication.",
+                     --max-depth bounds the walk. Special files are skipped. Symlinks require \
+                     --preserve=links, which recreates opaque targets without following them \
+                     and copies each regular inode once. --preserve=times sets modification \
+                     times from extended inodes or the build time for compact inodes; access \
+                     times are unavailable and reported as such. Symlink times are not set. \
+                     --verify reads each staged file back before publication.",
                 ),
         )
         .subcommand(
@@ -421,13 +426,15 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             let fs = open(target, offset)?;
             if tree.recursive {
                 fs.set_pcluster_cache_capacity(0);
-                transfer::export_tree(
+                transfer::export_tree_with_times(
                     &request,
                     &mut TreeExport {
                         fs: &fs,
                         image: std::path::Path::new(target),
                     },
                     tree,
+                    transfer::LinkOptions::from_matches(sub)?,
+                    transfer::TimeOptions::from_matches(sub)?,
                 )
             } else {
                 export(&fs, &request, transfer::ExportOptions::from_matches(sub)?)
@@ -984,6 +991,26 @@ fn os_name(name: Vec<u8>) -> OsString {
 }
 
 impl transfer::TreeSource for TreeExport<'_> {
+    fn symbolic_link(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<Option<transfer::SymbolicLink>, CliError> {
+        let (bytes, inode) = self.resolve(path)?;
+        if !inode.is_symlink() {
+            return Ok(None);
+        }
+        let target = self
+            .fs
+            .read_symlink_target(&inode)
+            .map_err(|e| erofs_error(&bytes, e))?;
+        Ok(Some(transfer::SymbolicLink {
+            target: os_name(target).into(),
+            // EROFS stores no directory bit for symlinks. Never resolve
+            // the target to guess one, even when it happens to exist.
+            target_is_directory: false,
+        }))
+    }
+
     fn image_path(&self) -> Option<&std::path::Path> {
         Some(self.image)
     }

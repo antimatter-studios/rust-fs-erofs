@@ -468,7 +468,8 @@ tasks:
       # cli_xattr_kernel.rs adds inline/shared/prefix attributes versus getfattr.
       # cli_export_kernel.rs adds two tests against Linux and reference extraction.
       # cli_export_tree_kernel.rs adds one case over plain and compressed 33-deep trees (#235).
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 17'
+      # #239 adds one declared case comparing compact and extended preservation with the kernel.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 18'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
@@ -545,8 +546,8 @@ tasks:
         # shellcheck disable=SC2086  # the words are the point
         ../rust-fs-core/scripts/tier.sh test:vm vm 1150 60000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
-        # The recursive export kernel case adds one declared test (#235).
-        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 528
+        # #239 adds one declared preservation test to the 528-case floor (#235).
+        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 529
 
   test:
     desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
@@ -602,8 +603,8 @@ tasks:
       # keeps the `running N tests` and `test result:` lines test-floor.sh
       # counts, and a failure still prints its name and output.
       - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all) -- --quiet'
-      # The recursive export kernel case adds one declared test (#235).
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 528'
+      # #239 adds one declared preservation test to the 528-case floor (#235).
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 529'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
