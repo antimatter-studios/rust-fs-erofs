@@ -221,7 +221,9 @@ vars:
   # v0.3.9 packages the tools for Windows when release.yml asks
   # (`windows: true`), and doctor finds a name as its .exe there (#185).
   # v0.3.14 supplies the shared bounded single-file export transfer.
-  FS_CORE_REF: v0.3.14
+  # v0.3.15 supplies the shared tree transfer: TreeSource, TreeMetadata
+  # and export_tree, with links and times preserved (#231).
+  FS_CORE_REF: v0.3.15
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
@@ -395,8 +397,9 @@ tasks:
       - 'scripts/test.sh --locked --no-run --quiet $(scripts/test-targets.sh unit)'
       - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 740 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
       # local-unit.sh measured 518 baseline cases plus five import refusal
-      # cases on 2026-10-18; every baseline case remains in the unit tier.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 523'
+      # cases on 2026-10-18, and 524 with the core pin floor guard (#231);
+      # every baseline case remains in the unit tier.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 524'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'

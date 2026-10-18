@@ -3238,6 +3238,36 @@ fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
     );
 }
 
+/// The oldest `rust-fs-core` release that carries the shared tree
+/// transfer: `TreeSource`, `TreeMetadata` and `export_tree`, with links
+/// and times preserved.
+const CORE_WITH_TREE_SOURCE: [u64; 3] = [0, 3, 15];
+
+/// The `rust-fs-core` this crate is pinned to carries the shared tree
+/// transfer that recursive export (#232) adapts (#231).
+///
+/// 0.3.14 carries only `FileSource` and single-file export. The tree
+/// API was on core's main but in no tag, so recursive export could not
+/// be built against the declared release without building against
+/// unreleased main instead.
+#[test]
+fn the_rust_fs_core_pin_carries_the_shared_tree_transfer() {
+    let root = manifest_dir();
+    let (_, pinned) = am_fs_core_versions_declared(&read_or_panic(&root.join("Cargo.toml")))
+        .into_iter()
+        .next()
+        .expect("Cargo.toml declares the rust-fs-core pin");
+    let parts: Vec<u64> = pinned
+        .split('.')
+        .map(|p| p.parse().expect("the rust-fs-core pin is numeric"))
+        .collect();
+    assert!(
+        parts.as_slice() >= CORE_WITH_TREE_SOURCE.as_slice(),
+        "rust-fs-core is pinned at {pinned}, older than {CORE_WITH_TREE_SOURCE:?}, the \
+         first release carrying the shared tree transfer recursive export needs"
+    );
+}
+
 mod core_pin_parser {
     use super::{am_fs_core_versions_declared, as_version};
 
