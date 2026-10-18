@@ -167,16 +167,21 @@ fn command() -> Cmd {
         )
         .subcommand(
             Cmd::new("export")
-                .about("Copy a regular file out through the shared bounded transfer")
-                .args(transfer::export_args())
+                .about("Copy a regular file, or with --recursive a directory tree")
+                .args(transfer::export_args_with_tree())
                 .after_help(
                     "Examples:\n  fs.erofs rootfs.erofs export /backup.tar backup.tar\n  \
                      fs.erofs rootfs.erofs export --replace /etc/hostname hostname\n  \
-                     fs.erofs rootfs.erofs export /backup.tar - | tar tf -\n\n\
+                     fs.erofs rootfs.erofs export /backup.tar - | tar tf -\n  \
+                     fs.erofs rootfs.erofs export --recursive /etc etc\n\n\
                      Files are copied in fixed chunks. A local destination is published only \
                      when complete; an existing name is refused unless --replace is given. \
                      The report includes the byte count and SHA-256; DEST - writes only raw \
-                     bytes to stdout. Directories, symlinks and special files are refused.",
+                     bytes to stdout. Without --recursive directories are refused.\n\n\
+                     Recursive export uses the shared tree transfer and reports every item. \
+                     Existing directories are merged into; existing files require --replace. \
+                     --max-depth bounds the walk. Symlinks and special files are skipped, \
+                     never followed. --verify reads each staged file back before publication.",
                 ),
         )
         .subcommand(
@@ -412,7 +417,21 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         "read" => read(&open(target, offset)?, path_arg(sub), sub.get_one("output")),
         "export" => {
             let request = transfer::ExportRequest::from_matches(sub)?;
-            export(&open(target, offset)?, &request)
+            let tree = transfer::TreeOptions::from_matches(sub)?;
+            let fs = open(target, offset)?;
+            if tree.recursive {
+                fs.set_pcluster_cache_capacity(0);
+                transfer::export_tree(
+                    &request,
+                    &mut TreeExport {
+                        fs: &fs,
+                        image: std::path::Path::new(target),
+                    },
+                    tree,
+                )
+            } else {
+                export(&fs, &request, transfer::ExportOptions::from_matches(sub)?)
+            }
         }
         "xattr" => xattr(&open(target, offset)?, path_arg(sub), sub),
         "get" | "info" => get(
@@ -890,7 +909,11 @@ impl transfer::FileSource for ExportSource<'_> {
     }
 }
 
-fn export(fs: &Filesystem, request: &transfer::ExportRequest) -> Result<Outcome, CliError> {
+fn export(
+    fs: &Filesystem,
+    request: &transfer::ExportRequest,
+    options: transfer::ExportOptions,
+) -> Result<Outcome, CliError> {
     let path = os_bytes(&request.path);
     let inode = fs
         .lookup_path_bytes(path)
@@ -904,7 +927,114 @@ fn export(fs: &Filesystem, request: &transfer::ExportRequest) -> Result<Outcome,
     // Export reads once in order: retaining decompressed clusters would
     // keep earlier chunks alive after core has moved past them.
     fs.set_pcluster_cache_capacity(0);
-    transfer::export(request, &mut ExportSource { fs, inode, path })
+    transfer::export_with_options(request, &mut ExportSource { fs, inode, path }, options)
+}
+
+/// EROFS only supplies filesystem operations. Core owns traversal, depth,
+/// safe names, destination merging, publication and per-item reports.
+struct TreeExport<'a> {
+    fs: &'a Filesystem,
+    image: &'a std::path::Path,
+}
+
+impl TreeExport<'_> {
+    fn resolve(&self, path: &std::path::Path) -> Result<(Vec<u8>, Inode), CliError> {
+        let bytes = os_bytes(&path.as_os_str().to_owned()).to_vec();
+        let inode = self
+            .fs
+            .lookup_path_bytes(&bytes)
+            .map_err(|e| erofs_error(&bytes, e))?;
+        Ok((bytes, inode))
+    }
+
+    fn metadata_for(&self, inode: &Inode) -> transfer::TreeMetadata {
+        let (seconds, nanos) = match inode.format.version {
+            InodeVersion::Compact => (
+                self.fs.superblock().build_time,
+                self.fs.superblock().build_time_nsec,
+            ),
+            InodeVersion::Extended => (inode.mtime, inode.mtime_nsec),
+        };
+        transfer::TreeMetadata {
+            kind: match inode.file_type() {
+                FileType::RegularFile => transfer::TreeKind::File,
+                FileType::Dir => transfer::TreeKind::Directory,
+                _ => transfer::TreeKind::Other,
+            },
+            size: inode.size,
+            inode: inode.nid,
+            // EROFS does not store access times; do not invent one from mtime.
+            accessed: None,
+            modified: std::time::Duration::from_secs(seconds)
+                .checked_add(std::time::Duration::from_nanos(u64::from(nanos)))
+                .and_then(|time| std::time::UNIX_EPOCH.checked_add(time)),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn os_name(name: Vec<u8>) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(name)
+}
+
+#[cfg(not(unix))]
+fn os_name(name: Vec<u8>) -> OsString {
+    OsString::from(String::from_utf8_lossy(&name).into_owned())
+}
+
+impl transfer::TreeSource for TreeExport<'_> {
+    fn image_path(&self) -> Option<&std::path::Path> {
+        Some(self.image)
+    }
+
+    fn metadata(&mut self, path: &std::path::Path) -> Result<transfer::TreeMetadata, CliError> {
+        let (_, inode) = self.resolve(path)?;
+        Ok(self.metadata_for(&inode))
+    }
+
+    fn read_dir(&mut self, path: &std::path::Path) -> Result<Vec<transfer::TreeEntry>, CliError> {
+        let (bytes, inode) = self.resolve(path)?;
+        self.fs
+            .read_dir(&inode)
+            .map_err(|e| erofs_error(&bytes, e))?
+            .into_iter()
+            .filter(|entry| entry.name != b"." && entry.name != b"..")
+            .map(|entry| {
+                let child = self.fs.read_inode(entry.nid).map_err(|e| {
+                    let mut full = bytes.clone();
+                    if !full.ends_with(b"/") {
+                        full.push(b'/');
+                    }
+                    full.extend_from_slice(&entry.name);
+                    erofs_error(&full, e)
+                })?;
+                Ok(transfer::TreeEntry {
+                    name: os_name(entry.name),
+                    metadata: self.metadata_for(&child),
+                })
+            })
+            .collect()
+    }
+
+    fn read_file_at(
+        &mut self,
+        path: &std::path::Path,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, CliError> {
+        let (bytes, inode) = self.resolve(path)?;
+        if inode.file_type() != FileType::RegularFile {
+            return Err(CliError::failed(format!(
+                "{}: not a regular file",
+                show(&bytes)
+            )));
+        }
+        self.fs
+            .read_file(&inode, offset, buf)
+            .map_err(|e| erofs_error(&bytes, e))?;
+        Ok(buf.len())
+    }
 }
 
 fn xattr(fs: &Filesystem, path: &[u8], sub: &ArgMatches) -> Result<Outcome, CliError> {

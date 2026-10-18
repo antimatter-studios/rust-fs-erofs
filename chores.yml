@@ -106,16 +106,21 @@ chore_min_version: 0.10.0
 #                                                   build too: 73 l cold
 #     oracle    529 l / 41,268 B  700 l / 55,000 B  runs warm in CI (unit and
 #                87 tests                           images built already): ~18%
-#     kernel    174 l / 10,876 B  230 l / 14,500 B  ~30%, measured in CI: the
-#                13 tests                           x86_64 merge-queue run
-#                                                   39074951731 of the chain
-#                                                   through #221 (#227). Every
-#                                                   kernel test adds its
-#                                                   --show-output evidence:
-#                                                   main was 122 l / 7,508 B
-#                                                   for 10 tests, against
-#                                                   130 l / 9,000 B. Was 24 l
-#                                                   / 1,173 B for 2 tests
+#     kernel    244 l / 16,065 B  320 l / 21,000 B  ~30%, measured in CI: the
+#                17 tests                           x86_64 merge-queue run
+#                                                   39169325727 of #237
+#                                                   (#243). Every kernel test
+#                                                   adds its --show-output
+#                                                   evidence: the recursive
+#                                                   export case adds 23 l.
+#                                                   Was 174 l / 10,876 B for
+#                                                   13 tests against 230 l /
+#                                                   14,500 B (run 39074951731,
+#                                                   #227); main was 122 l /
+#                                                   7,508 B for 10 tests,
+#                                                   against 130 l / 9,000 B.
+#                                                   Was 24 l / 1,173 B for 2
+#                                                   tests
 #     suite     771 l / 39,019 B  900 l / 50,000 B  measured COLD; warm in CI
 #               545 tests                           at 709 l, so ~17% on cold
 #     vm        898 l / 45,000 B  1,150 l / 60,000  measured COLD, from
@@ -445,7 +450,7 @@ tasks:
     # deliberate corruption the kernel has to refuse.
     cmds:
       - scripts/tools.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 230 14500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 320 21000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
     # 5: the 3 measured on main at ca0c577 (CI run 36351672753) -- the
     # third being the readlink kernel oracle #139 added -- plus the two
     # #125 added: the deduplicated images read back through the kernel,
@@ -462,7 +467,8 @@ tasks:
     # tests the tier holds.
       # cli_xattr_kernel.rs adds inline/shared/prefix attributes versus getfattr.
       # cli_export_kernel.rs adds two tests against Linux and reference extraction.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 16'
+      # cli_export_tree_kernel.rs adds one case over plain and compressed 33-deep trees (#235).
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 17'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
@@ -539,7 +545,8 @@ tasks:
         # shellcheck disable=SC2086  # the words are the point
         ../rust-fs-core/scripts/tier.sh test:vm vm 1150 60000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
-        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 527
+        # The recursive export kernel case adds one declared test (#235).
+        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 528
 
   test:
     desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
@@ -587,8 +594,16 @@ tasks:
       # `all`, not a bare `cargo test`: that would also select the
       # Android suite, whose fixture no machine here can be expected to
       # have.
-      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all)'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 527'
+      #
+      # `--quiet` because the suite repeats tests whose names the unit,
+      # oracle and kernel tiers already log: one line per test was 642 of
+      # the 903 lines run 39173503690 printed against this 900 budget
+      # (#244). Quiet, libtest prints a row of dots per test binary and
+      # keeps the `running N tests` and `test result:` lines test-floor.sh
+      # counts, and a failure still prints its name and output.
+      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all) -- --quiet'
+      # The recursive export kernel case adds one declared test (#235).
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 528'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
