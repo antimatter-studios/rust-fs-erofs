@@ -394,7 +394,9 @@ tasks:
     cmds:
       - 'scripts/test.sh --locked --no-run --quiet $(scripts/test-targets.sh unit)'
       - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 740 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 420'
+      # local-unit.sh measured 518 baseline cases plus five import refusal
+      # cases on 2026-10-18; every baseline case remains in the unit tier.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 523'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -534,7 +536,7 @@ tasks:
         # shellcheck disable=SC2086  # the words are the point
         ../rust-fs-core/scripts/tier.sh test:vm vm 1150 60000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
-        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 522
+        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 527
 
   test:
     desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
@@ -583,7 +585,7 @@ tasks:
       # Android suite, whose fixture no machine here can be expected to
       # have.
       - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all)'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 522'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 527'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
@@ -626,8 +628,8 @@ tasks:
       # Mutation refusals add 358 checks: 58 calls x 5, one missing-image
       # check, four stdin checks, 14 usage cases x 3, seven help cases x 3.
       # test-xattr.sh adds 37 checks; execution remains CI-only.
-      # Generated documentation checks one additional export subcommand.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 643'
+      # Generated documentation checks the export and import subcommands.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 644'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
