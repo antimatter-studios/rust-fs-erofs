@@ -314,3 +314,229 @@ PY
         );
     }
 }
+
+/// Below `/tree`: `file` and `sub` at depth 1, `sub/file` and `sub/a` at 2,
+/// `sub/a/b` at 3 and the deepest entry, `sub/a/b/deep`, at [`POLICY_DEPTH`].
+const POLICY_STAGE: &str = "mkdir -p tree/sub/a/b\nprintf 'top\\n' > tree/file\n\
+     printf 'sub file\\n' > tree/sub/file\npython3 - <<'PY'\n\
+     with open('tree/sub/a/b/deep', 'wb') as f:\n    f.write(bytes(range(256)) * 64 + b'!')\nPY\n";
+const POLICY_DEPTH: usize = 4;
+const POLICY_FILES: [&str; 3] = ["file", "sub/file", "sub/a/b/deep"];
+
+/// `fs.erofs IMAGE GLOBAL... export --recursive FLAGS... /tree DEST`.
+fn export_tree(
+    image: &std::path::Path,
+    global: &[&str],
+    flags: &[&str],
+    dest: &std::path::Path,
+) -> std::process::Output {
+    tool("fs.erofs")
+        .arg(image)
+        .args(global)
+        .args(["export", "--recursive"])
+        .args(flags)
+        .arg("/tree")
+        .arg(dest)
+        .output()
+        .unwrap()
+}
+
+/// The value of `dump.erofs`'s `Filesystem <label>:` line.
+#[track_caller]
+fn dump_field(dump: &str, label: &str) -> String {
+    let prefix = format!("Filesystem {label}:");
+    dump.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| panic!("dump.erofs printed no `{prefix}` line:\n{dump}"))
+}
+
+#[test]
+fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
+    for compressed in [false, true] {
+        let dir = ScratchDir::new("cli-export-tree-policy");
+        let image = dir.join("source.img");
+        let args = if compressed {
+            vec!["-b4096", "-zlz4"]
+        } else {
+            vec!["-b4096"]
+        };
+        let built = mkfs_from_guest_tree(&image, POLICY_STAGE, &args);
+        assert!(built.status.success(), "mkfs.erofs: {}", stderr(&built));
+        assert_fsck_clean(image.to_str().unwrap(), "export policy source");
+        let before = std::fs::read(&image).unwrap();
+        let kernel = guest_kernel_report(image.to_str().unwrap(), "export policy reference");
+        let kernel_value = |kind: &str, name: &str| {
+            kernel
+                .get(&(kind.to_string(), format!("tree/{name}")))
+                .unwrap_or_else(|| panic!("the kernel reported no {kind} for tree/{name}"))
+                .clone()
+        };
+        let assert_files = |root: &std::path::Path, names: &[&str]| {
+            for name in names {
+                let bytes = std::fs::read(root.join(name)).unwrap();
+                assert_eq!(
+                    sha256_hex(&bytes),
+                    kernel_value("sha256", name),
+                    "{}/{name}: exported versus kernel",
+                    root.display()
+                );
+            }
+        };
+
+        // Exact fit: the deepest entry sits at --max-depth and is exported.
+        let fit = dir.join("fit");
+        let depth = POLICY_DEPTH.to_string();
+        let out = export_tree(&image, &[], &["--max-depth", &depth], &fit);
+        let report = stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{report}{}", stderr(&out));
+        assert_eq!(json_field(&report, "completed"), "7", "{report}");
+        assert_eq!(json_field(&report, "failed"), "0", "{report}");
+        assert_eq!(json_field(&report, "merged_directories"), "0", "{report}");
+        assert_files(&fit, &POLICY_FILES);
+
+        // Overflow: one level less fails the deepest entry and nothing else.
+        let over = dir.join("over");
+        let shallow = (POLICY_DEPTH - 1).to_string();
+        let out = export_tree(&image, &[], &["--max-depth", &shallow], &over);
+        let report = stdout(&out);
+        assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+        assert_eq!(json_field(&report, "completed"), "6", "{report}");
+        assert_eq!(json_field(&report, "failed"), "1", "{report}");
+        let deep = item(&report, "/tree/sub/a/b/deep");
+        assert!(deep.contains("\"status\": \"failed\""), "{deep}");
+        assert!(deep.contains("maximum depth exceeded"), "{deep}");
+        assert!(over.join("sub/a/b").is_dir());
+        assert!(std::fs::symlink_metadata(over.join("sub/a/b/deep")).is_err());
+        assert_files(&over, &POLICY_FILES[..2]);
+
+        // Existing directories are merged into; their other entries survive.
+        let merged = dir.join("merged");
+        std::fs::create_dir_all(merged.join("sub/a")).unwrap();
+        std::fs::write(merged.join("sub/local-only"), b"not from the image").unwrap();
+        let out = export_tree(&image, &[], &[], &merged);
+        let report = stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{report}{}", stderr(&out));
+        assert_eq!(json_field(&report, "completed"), "7", "{report}");
+        assert_eq!(json_field(&report, "merged_directories"), "3", "{report}");
+        for path in ["/tree", "/tree/sub", "/tree/sub/a"] {
+            let entry = item(&report, path);
+            assert!(entry.contains("merged into existing directory"), "{entry}");
+        }
+        assert!(!item(&report, "/tree/sub/a/b").contains("merged into existing directory"));
+        assert_eq!(
+            std::fs::read(merged.join("sub/local-only")).unwrap(),
+            b"not from the image"
+        );
+        assert_files(&merged, &POLICY_FILES);
+
+        // Existing names are refused, never replaced, without --replace; with
+        // it only an existing file is replaced, never a directory or a file
+        // standing where a directory belongs.
+        let kept = dir.join("kept");
+        std::fs::create_dir_all(kept.join("file")).unwrap();
+        std::fs::create_dir_all(kept.join("sub")).unwrap();
+        std::fs::write(kept.join("sub/file"), b"keep me").unwrap();
+        std::fs::write(kept.join("sub/a"), b"not a directory").unwrap();
+        for replace in [false, true] {
+            let flags: &[&str] = if replace { &["--replace"] } else { &[] };
+            let out = export_tree(&image, &[], flags, &kept);
+            let report = stdout(&out);
+            assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+            let refused = if replace { "2" } else { "3" };
+            assert_eq!(json_field(&report, "refused"), refused, "{report}");
+            assert_eq!(json_field(&report, "failed"), "0", "{report}");
+            let file = item(&report, "/tree/file");
+            assert!(file.contains("\"status\": \"refused\""), "{file}");
+            assert!(
+                file.contains("--replace permits existing files only"),
+                "{file}"
+            );
+            assert!(kept.join("file").is_dir());
+            let a = item(&report, "/tree/sub/a");
+            assert!(a.contains("\"status\": \"refused\""), "{a}");
+            assert!(
+                a.contains("destination exists and is not a directory"),
+                "{a}"
+            );
+            assert!(!report.contains("\"path\": \"/tree/sub/a/b\""), "{report}");
+            assert_eq!(
+                std::fs::read(kept.join("sub/a")).unwrap(),
+                b"not a directory"
+            );
+            let sub_file = item(&report, "/tree/sub/file");
+            if replace {
+                assert!(sub_file.contains("\"status\": \"completed\""), "{sub_file}");
+                assert_files(&kept, &["sub/file"]);
+            } else {
+                assert!(sub_file.contains("\"status\": \"refused\""), "{sub_file}");
+                assert_eq!(std::fs::read(kept.join("sub/file")).unwrap(), b"keep me");
+            }
+        }
+
+        // An image at an offset exports the same tree only through --offset.
+        let embedded = dir.join("embedded");
+        let mut shifted_bytes = vec![0; 4096];
+        shifted_bytes.extend_from_slice(&before);
+        std::fs::write(&embedded, shifted_bytes).unwrap();
+        let unshifted = dir.join("unshifted");
+        let out = export_tree(&embedded, &[], &[], &unshifted);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert!(!unshifted.exists());
+        let shifted = dir.join("shifted");
+        let out = export_tree(&embedded, &["--offset", "4096"], &[], &shifted);
+        let report = stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{report}{}", stderr(&out));
+        assert_eq!(json_field(&report, "completed"), "7", "{report}");
+        assert_files(&shifted, &POLICY_FILES);
+
+        // Single-file read, export, get and info are unchanged, at either
+        // position, and agree with the kernel and dump.erofs.
+        let dump = oracle("dump.erofs").arg(&image).output();
+        assert!(dump.status.success(), "dump.erofs: {}", stderr(&dump));
+        let dump = stdout(&dump);
+        for (target, global) in [(&image, &[][..]), (&embedded, &["--offset", "4096"][..])] {
+            for name in POLICY_FILES {
+                let path = format!("/tree/{name}");
+                let want = kernel_value("sha256", name);
+                let read = ok(tool("fs.erofs")
+                    .arg(target)
+                    .args(global)
+                    .args(["read", &path]));
+                assert_eq!(sha256_hex(&read.stdout), want, "read {path}");
+                let raw = ok(tool("fs.erofs")
+                    .arg(target)
+                    .args(global)
+                    .args(["export", &path, "-"]));
+                assert_eq!(raw.stdout, read.stdout, "export {path} -");
+                assert!(raw.stderr.is_empty());
+                let dest = dir.join(&format!("single-{}", global.len()));
+                let report = stdout(&ok(tool("fs.erofs")
+                    .arg(target)
+                    .args(global)
+                    .args(["export", "--replace", &path])
+                    .arg(&dest)));
+                assert_eq!(json_field(&report, "bytes"), kernel_value("size", name));
+                assert_eq!(json_field(&report, "sha256"), want);
+                assert_eq!(sha256_hex(&std::fs::read(&dest).unwrap()), want);
+            }
+            let get = stdout(&ok(tool("fs.erofs").arg(target).args(global).arg("get")));
+            let info = stdout(&ok(tool("fs.erofs").arg(target).args(global).arg("info")));
+            assert_eq!(info, get, "info and get differ");
+            assert_eq!(json_field(&get, "fs"), "erofs");
+            assert_eq!(
+                dump_field(&dump, "blocksize"),
+                json_field(&get, "block_size")
+            );
+            assert_eq!(
+                dump_field(&dump, "blocks"),
+                json_field(&get, "total_blocks")
+            );
+        }
+        assert_eq!(
+            std::fs::read(&image).unwrap(),
+            before,
+            "export changed its source"
+        );
+    }
+}
