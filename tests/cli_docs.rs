@@ -56,8 +56,8 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
     }
     // fs.erofs's subcommands have pages of their own, which its list names.
     for verb in [
-        "ls", "stat", "read", "xattr", "write", "mkdir", "rm", "rmdir", "mv", "ln", "truncate",
-        "get", "info", "set", "resize",
+        "ls", "stat", "read", "export", "xattr", "write", "mkdir", "rm", "rmdir", "mv", "ln",
+        "truncate", "get", "info", "set", "resize",
     ] {
         assert!(
             share.join(format!("man/man1/fs.erofs-{verb}.1")).is_file(),
@@ -68,7 +68,12 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
     for flag in ["recursive", "max\\-depth", "limit"] {
         assert!(page.contains(flag), "ls man page is missing {flag}");
     }
-    for (verb, option) in [("write", "at"), ("mkdir", "parents"), ("ln", "symbolic")] {
+    for (verb, option) in [
+        ("write", "at"),
+        ("mkdir", "parents"),
+        ("ln", "symbolic"),
+        ("export", "replace"),
+    ] {
         let page =
             std::fs::read_to_string(share.join(format!("man/man1/fs.erofs-{verb}.1"))).unwrap();
         assert!(page.contains(option), "{verb} man page omits {option}");
@@ -101,6 +106,8 @@ fn every_name_has_a_zsh_bash_and_fish_completion() {
             for flag in [
                 "recursive",
                 "xattr",
+                "export",
+                "replace",
                 "max-depth",
                 "limit",
                 "rm",

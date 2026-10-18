@@ -1,7 +1,7 @@
 //! `fs.erofs <target> <verb>`: an errand inside an EROFS image, without
 //! mounting it.
 //!
-//! The verbs are the shared set every `fs.<fs>` answers: `ls`, `stat`, `read`, `xattr`,
+//! The verbs are the shared set every `fs.<fs>` answers: `ls`, `stat`, `read`, `export`, `xattr`,
 //! `get`/`info`, and `write`, `mkdir`, `rm`, `rmdir`, `mv`, `ln`, `truncate`,
 //! `set`, `resize`. EROFS is a read-only format, so mutations refuse with exit status 3
 //! and "EROFS is read-only": a script moved here from a writable
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
-use fs_core::cli::{CliError, Json, Outcome, Tool};
+use fs_core::cli::{transfer, CliError, Json, Outcome, Tool};
 use fs_core::{BlockRead, FileDevice, OwnedSlice};
 use fs_erofs::{DataLayout, FileType, Filesystem, Inode, InodeVersion};
 
@@ -163,6 +163,20 @@ fn command() -> Cmd {
                     "Examples:\n  fs.erofs rootfs.erofs read /etc/hostname\n  \
                      fs.erofs rootfs.erofs read /var/log/syslog | grep -i error\n  \
                      fs.erofs rootfs.erofs read /backup.tar -o backup.tar",
+                ),
+        )
+        .subcommand(
+            Cmd::new("export")
+                .about("Copy a regular file out through the shared bounded transfer")
+                .args(transfer::export_args())
+                .after_help(
+                    "Examples:\n  fs.erofs rootfs.erofs export /backup.tar backup.tar\n  \
+                     fs.erofs rootfs.erofs export --replace /etc/hostname hostname\n  \
+                     fs.erofs rootfs.erofs export /backup.tar - | tar tf -\n\n\
+                     Files are copied in fixed chunks. A local destination is published only \
+                     when complete; an existing name is refused unless --replace is given. \
+                     The report includes the byte count and SHA-256; DEST - writes only raw \
+                     bytes to stdout. Directories, symlinks and special files are refused.",
                 ),
         )
         .subcommand(
@@ -370,6 +384,10 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         "ls" => ls(&open(target, offset)?, path_arg(sub)),
         "stat" => stat(&open(target, offset)?, path_arg(sub)),
         "read" => read(&open(target, offset)?, path_arg(sub), sub.get_one("output")),
+        "export" => {
+            let request = transfer::ExportRequest::from_matches(sub)?;
+            export(&open(target, offset)?, &request)
+        }
         "xattr" => xattr(&open(target, offset)?, path_arg(sub), sub),
         "get" | "info" => get(
             &open(target, offset)?,
@@ -824,6 +842,43 @@ fn read(fs: &Filesystem, path: &[u8], output: Option<&OsString>) -> Result<Outco
         }
     }
     Ok(Outcome::done())
+}
+
+/// EROFS provides exact positioned reads; core owns copying and publication.
+struct ExportSource<'a> {
+    fs: &'a Filesystem,
+    inode: Inode,
+    path: &'a [u8],
+}
+
+impl transfer::FileSource for ExportSource<'_> {
+    fn size(&self) -> u64 {
+        self.inode.size
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, CliError> {
+        self.fs
+            .read_file(&self.inode, offset, buf)
+            .map_err(|e| erofs_error(self.path, e))?;
+        Ok(buf.len())
+    }
+}
+
+fn export(fs: &Filesystem, request: &transfer::ExportRequest) -> Result<Outcome, CliError> {
+    let path = os_bytes(&request.path);
+    let inode = fs
+        .lookup_path_bytes(path)
+        .map_err(|e| erofs_error(path, e))?;
+    if inode.file_type() != FileType::RegularFile {
+        return Err(CliError::failed(format!(
+            "{}: not a regular file; directories, symlinks and special files cannot be exported",
+            show(path)
+        )));
+    }
+    // Export reads once in order: retaining decompressed clusters would
+    // keep earlier chunks alive after core has moved past them.
+    fs.set_pcluster_cache_capacity(0);
+    transfer::export(request, &mut ExportSource { fs, inode, path })
 }
 
 fn xattr(fs: &Filesystem, path: &[u8], sub: &ArgMatches) -> Result<Outcome, CliError> {

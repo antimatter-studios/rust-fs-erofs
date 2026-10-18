@@ -220,7 +220,8 @@ vars:
   #
   # v0.3.9 packages the tools for Windows when release.yml asks
   # (`windows: true`), and doctor finds a name as its .exe there (#185).
-  FS_CORE_REF: v0.3.13
+  # v0.3.14 supplies the shared bounded single-file export transfer.
+  FS_CORE_REF: v0.3.14
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
@@ -455,7 +456,8 @@ tasks:
     # tests/scripts/kernel-floor.sh fails if this falls below the number of
     # tests the tier holds.
       # cli_xattr_kernel.rs adds inline/shared/prefix attributes versus getfattr.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 14'
+      # cli_export_kernel.rs adds two tests against Linux and reference extraction.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 16'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
@@ -532,7 +534,7 @@ tasks:
         # shellcheck disable=SC2086  # the words are the point
         ../rust-fs-core/scripts/tier.sh test:vm vm 1150 60000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
-        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 520
+        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 522
 
   test:
     desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
@@ -581,7 +583,7 @@ tasks:
       # Android suite, whose fixture no machine here can be expected to
       # have.
       - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all)'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 520'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 522'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
@@ -624,7 +626,8 @@ tasks:
       # Mutation refusals add 358 checks: 58 calls x 5, one missing-image
       # check, four stdin checks, 14 usage cases x 3, seven help cases x 3.
       # test-xattr.sh adds 37 checks; execution remains CI-only.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 642'
+      # Generated documentation checks one additional export subcommand.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 643'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
