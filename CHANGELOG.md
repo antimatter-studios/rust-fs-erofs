@@ -9,6 +9,44 @@ pull request; a release gathers them into a section here.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-19
+
+### Added
+
+- `fs.erofs TARGET export PATH DEST [--replace]` exports regular files through the shared bounded transfer, reporting SHA-256 and publishing local files only when complete. (#226)
+
+- `fs.erofs export --recursive --preserve=links,times` recreates hard links using stable inode identity, copies opaque symlink targets without following them, and preserves available modification times. Extended inodes provide their stored time and compact inodes use the image build time. Reports identify unavailable access times, unpreserved symlink times and targets that escape the destination. (#241)
+
+- `fs.erofs TARGET import SOURCE PATH [--replace]` refuses with exit 3 and the existing EROFS read-only message before opening the image or source file or consuming stdin. (#228)
+
+- `fs.erofs ls --recursive` (`-R`) walks directories in byte-sorted depth-first order, with finite depth and entry bounds, symlink safety and repeated-directory detection. Bound and read failures retain a partial report and exit 1. (#219)
+
+- `fs.erofs` recognises `rm`, `rmdir`, `mv`, `ln` (including `-s`), `truncate`, `mkdir --parents` (`-p`) and `write --at`. Every mutation refuses with exit 3 and the existing "EROFS is read-only" message before opening the image or reading stdin; help, man pages and completions include the new forms. (#221)
+
+- `fs.erofs TARGET export --recursive PATH DEST` copies regular directory trees through core's shared tree transfer, with per-item reports, a depth bound, existing-directory merging and existing-file refusal unless `--replace` is given. Symlinks and special files are skipped without following them. (#237)
+- `fs.erofs export --verify` reads staged files back before publication. (#237)
+
+- `fs.erofs TARGET stat PATH` reports one path's identity, type, mode,
+  owner, link count, size, allocated bytes and effective mtime, with null
+  for unrecorded times. Symlinks are reported without following them and
+  devices include their major/minor numbers. Inode layout, data layout,
+  xattr count and raw flags appear under `erofs`. (#217)
+
+- `fs.erofs IMAGE xattr PATH [NAME]` lists extended attributes as JSON or text and reads raw values to stdout or `-o FILE`, preserving non-UTF-8 names and values across inline, shared and prefix-dictionary storage. (#222)
+
+### Changed
+
+- **rust-fs-core 0.3.15.** The crate builds against the core release that
+  carries the shared tree transfer (`TreeSource`, `TreeMetadata` and
+  `export_tree`), which recursive export will adapt; the release workflow,
+  branch reaping and the fuzz clone call that release. (#234)
+
+- A pull request runs a quick CI profile (unit, lint, the CI profile truth table and semver); the merge queue, main, tags and a manual run keep every full leg, including the fixture VM, the oracle and kernel tiers, arm64, the suite in the guest and the Linux and Windows CLI tiers. (#205)
+
+- Every rust-fs-core pin now names 0.3.14, which supplies the shared single-file transfer. (#226)
+
+- Recursive export without `--preserve=links` refuses each symlink with a preservation hint; special files remain skipped. (#241)
+
 ## [0.4.1] — 2026-10-11
 
 ### Added
@@ -427,6 +465,7 @@ pull request; a release gathers them into a section here.
 
 - Package renamed to `am-fs-erofs`; the lib name stays `fs_erofs`.
 
+[0.5.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.3.0...v0.3.1
