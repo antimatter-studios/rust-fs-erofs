@@ -1,3 +1,3 @@
 ## Interfaces
 
-| `fs.erofs` recursive export metadata preservation | Pending: opaque symlink targets, link/time preservation and additional depth, merging and image-offset oracle coverage | | #236 | Follow-up to basic recursive export |
+| `fs.erofs` recursive export metadata preservation | Supported: `--preserve=links,times` recreates hard links and opaque symlinks and sets recorded modification times; access times are unavailable and symlink times are not set | Unreleased (#241) | #239, #236 | `cli_export_tree_kernel.rs`, `cli_docs.rs` |
