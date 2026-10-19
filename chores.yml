@@ -469,7 +469,8 @@ tasks:
       # cli_export_kernel.rs adds two tests against Linux and reference extraction.
       # cli_export_tree_kernel.rs adds one case over plain and compressed 33-deep trees (#235).
       # #239 adds one declared case comparing compact and extended preservation with the kernel.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 18'
+      # #240 adds one declared case for depth, merge, refusal, offset and single-file commands.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 19'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
@@ -547,7 +548,8 @@ tasks:
         ../rust-fs-core/scripts/tier.sh test:vm vm 1150 60000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
         # #239 adds one declared preservation test to the 528-case floor (#235).
-        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 529
+        # #240 adds one declared export policy test.
+        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 530
 
   test:
     desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
@@ -604,7 +606,8 @@ tasks:
       # counts, and a failure still prints its name and output.
       - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all) -- --quiet'
       # #239 adds one declared preservation test to the 528-case floor (#235).
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 529'
+      # #240 adds one declared export policy test.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 530'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
