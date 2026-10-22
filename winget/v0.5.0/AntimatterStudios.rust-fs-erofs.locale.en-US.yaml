@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+PackageIdentifier: AntimatterStudios.rust-fs-erofs
+PackageVersion: 0.5.0
+PackageLocale: en-US
+Publisher: Antimatter Studios
+PublisherUrl: https://github.com/antimatter-studios
+PublisherSupportUrl: https://github.com/antimatter-studios/rust-fs-erofs/issues
+Author: Chris Thomas
+PackageName: rust-fs-erofs
+PackageUrl: https://github.com/antimatter-studios/rust-fs-erofs
+License: MIT
+LicenseUrl: https://github.com/antimatter-studios/rust-fs-erofs/blob/main/LICENSE
+Copyright: Copyright (c) 2026 Antimatter Studios
+ShortDescription: Read, list and extract files from EROFS images without mounting them.
+Description: |
+  fs.erofs reads EROFS (Enhanced Read-Only File System) images, such as
+  the system, vendor and product images of an Android ROM, without a
+  driver: info, ls, stat, read, get and recursive export of a whole tree.
+  It refuses every mutation, since EROFS is read-only. mkfs.erofs builds
+  an EROFS image from a directory. Both are names for rust-fs-erofs.exe,
+  a clean-room pure-Rust implementation.
+Moniker: fs.erofs
+Tags:
+  - erofs
+  - filesystem
+  - android
+  - rom
+  - extract
+  - image
+ReleaseNotesUrl: https://github.com/antimatter-studios/rust-fs-erofs/releases/tag/v0.5.0
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0
