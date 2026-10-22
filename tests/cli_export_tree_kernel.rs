@@ -2,10 +2,13 @@
 mod cli_support;
 
 use cli_support::*;
+use fs_core::FileDevice;
+use fs_erofs::{DataLayout, Filesystem, Inode};
 use fs_erofs_test_support::{
     assert_fsck_clean, guest_kernel_read, guest_kernel_report, mkfs_from_guest_tree, oracle,
     sha256_hex, ScratchDir,
 };
+use std::sync::Arc;
 
 const DEPTH: usize = 33;
 
@@ -538,5 +541,115 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
             before,
             "export changed its source"
         );
+    }
+}
+
+const DAMAGED_STAGE: &str = "mkdir -p tree/sub\nprintf 'first sibling\\n' > tree/a\n\
+     printf 'nested sibling\\n' > tree/sub/c\npython3 - <<'PY'\n\
+     with open('tree/big', 'wb') as f:\n    f.write(bytes(range(256)) * 12288 + b'!')\nPY\n";
+const DAMAGED_SIBLINGS: [&str; 2] = ["a", "sub/c"];
+
+/// Names in `dir`, sorted, so a leftover staging file cannot hide.
+fn names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn recursive_export_reports_a_damaged_file_failed_and_never_publishes_or_replaces_it() {
+    let dir = ScratchDir::new("cli-export-tree-damaged");
+    let image = dir.join("source.img");
+    let built = mkfs_from_guest_tree(&image, DAMAGED_STAGE, &["-b4096"]);
+    assert!(built.status.success(), "mkfs.erofs: {}", stderr(&built));
+    assert_fsck_clean(image.to_str().unwrap(), "damaged export source");
+    // Digests come from the kernel and the reference extractor before damage.
+    let kernel = guest_kernel_report(image.to_str().unwrap(), "damaged export reference");
+    let extracted = dir.join("extracted");
+    let reference = oracle("fsck.erofs")
+        .arg(format!("--extract={}", extracted.display()))
+        .arg(&image)
+        .output();
+    assert!(
+        reference.status.success(),
+        "fsck.erofs: {}",
+        stderr(&reference)
+    );
+    let want = |name: &str| {
+        let sum = kernel
+            .get(&("sha256".to_string(), format!("tree/{name}")))
+            .unwrap_or_else(|| panic!("kernel digested tree/{name}"))
+            .clone();
+        assert_eq!(
+            sha256_hex(&std::fs::read(extracted.join("tree").join(name)).unwrap()),
+            sum,
+            "{name}: reference extractor versus kernel"
+        );
+        sum
+    };
+    let siblings: Vec<_> = DAMAGED_SIBLINGS.iter().map(|name| want(name)).collect();
+    want("big");
+
+    let fs = Filesystem::open(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
+    let inode = fs.lookup_path("/tree/big").unwrap();
+    assert!(matches!(
+        inode.format.layout,
+        DataLayout::FlatPlain | DataLayout::FlatInline
+    ));
+    let at = Inode::iloc(fs.superblock(), inode.nid) as usize + 16;
+    let mut bytes = std::fs::read(&image).unwrap();
+    // Keep metadata intact, but make the file's data run beyond the image.
+    // One full shared-transfer chunk remains readable before the failure.
+    let block = u32::try_from(bytes.len() / 4096 - 257).unwrap();
+    bytes[at..at + 4].copy_from_slice(&block.to_le_bytes());
+    // The inode can share the superblock's block, so reseal its checksum.
+    if fs.superblock().feature_compat & 1 != 0 {
+        bytes[1028..1032].fill(0);
+        let end = 1024 + fs.superblock().checksum_span_len();
+        let checksum = crc32c::crc32c(&bytes[1024..end]) ^ u32::MAX;
+        bytes[1028..1032].copy_from_slice(&checksum.to_le_bytes());
+    }
+    std::fs::write(&image, bytes).unwrap();
+    let damaged = Filesystem::open(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
+    let inode = damaged.lookup_path("/tree/big").unwrap();
+    let mut chunk = vec![0; 1 << 20];
+    damaged.read_file(&inode, 0, &mut chunk).unwrap();
+    assert!(damaged.read_file(&inode, 1 << 20, &mut chunk).is_err());
+
+    let dest = dir.join("exported");
+    for replace in [false, true] {
+        let flags: &[&str] = if replace { &["--replace"] } else { &[] };
+        let out = export_tree(&image, &[], flags, &dest);
+        let report = stdout(&out);
+        assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+        assert_eq!(json_field(&report, "failed"), "1", "{report}");
+        let failed = item(&report, "/tree/big");
+        assert!(failed.contains("\"status\": \"failed\""), "{failed}");
+        for (name, sum) in DAMAGED_SIBLINGS.iter().zip(&siblings) {
+            let bytes = std::fs::read(dest.join(name)).unwrap();
+            assert_eq!(&sha256_hex(&bytes), sum, "{name}: exported versus kernel");
+            let entry = item(&report, &format!("/tree/{name}"));
+            assert!(entry.contains("\"status\": \"completed\""), "{entry}");
+            assert!(entry.contains(sum.as_str()), "{entry}");
+        }
+        if replace {
+            assert_eq!(
+                std::fs::read(dest.join("big")).unwrap(),
+                b"original destination",
+                "a failed replacement kept the original bytes"
+            );
+            assert_eq!(names(&dest), ["a", "big", "sub"]);
+        } else {
+            assert!(
+                std::fs::symlink_metadata(dest.join("big")).is_err(),
+                "an incomplete destination was published"
+            );
+            assert_eq!(names(&dest), ["a", "sub"]);
+            std::fs::write(dest.join("big"), b"original destination").unwrap();
+        }
+        assert_eq!(names(&dest.join("sub")), ["c"]);
     }
 }
