@@ -3342,7 +3342,9 @@ mod core_pin_parser {
 /// a commit nobody had finished testing. And GitHub keeps one pending run per
 /// concurrency group, so a third merge cancels a second one still queued even
 /// with cancelling switched off. So a push is a group of its own, keyed by its
-/// commit, and only a pull request's superseded run is cancelled.
+/// commit, and only an ordinary pull request's superseded run is cancelled.
+/// A `red:` run has its own commit group and survives the fix push;
+/// tests/scripts/test-red-runs-uncancelled.sh evaluates that for every event.
 #[test]
 fn ci_cancels_only_a_pull_requests_superseded_run() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
@@ -3368,8 +3370,8 @@ fn ci_cancels_only_a_pull_requests_superseded_run() {
     }
     assert_eq!(
         cancel.as_deref(),
-        Some("${{ github.event_name == 'pull_request' }}"),
-        "ci.yml cancels a run that is not a pull request's"
+        Some("${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, 'red:') }}"),
+        "ci.yml cancels a run that is not an ordinary pull request's"
     );
     let group = group.expect("ci.yml declares a concurrency group");
     assert!(
