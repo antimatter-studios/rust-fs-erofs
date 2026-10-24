@@ -497,8 +497,15 @@ fn open(target: &OsString, offset: u64) -> Result<Filesystem, CliError> {
         .map_err(|e| CliError::failed(format!("{name} is not a readable EROFS image: {e}")))
 }
 
+/// A library error about `what`. A name a directory lookup does not find
+/// is the CLI contract's `not_found` kind, still exit 1, which a script
+/// matches whatever the message says; every other error is a plain failure.
 fn erofs_error(what: &[u8], e: fs_erofs::Error) -> CliError {
-    CliError::failed(format!("{}: {e}", show(what)))
+    let message = format!("{}: {e}", show(what));
+    match e {
+        fs_erofs::Error::NotFound => CliError::not_found(message),
+        _ => CliError::failed(message),
+    }
 }
 
 fn type_name(t: FileType) -> &'static str {
