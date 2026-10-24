@@ -546,8 +546,11 @@ tasks:
           case "$arg" in --verbose|-v) continue ;; esac
           guest_args="$guest_args $arg"
         done
+        # BUDGET: merge-queue run 40054968238 printed 1151 lines / 57,950
+        # bytes once the CLI's own not_found unit cases joined (#251), one
+        # line over 1150; 1170 leaves room for the next case.
         # shellcheck disable=SC2086  # the words are the point
-        ../rust-fs-core/scripts/tier.sh test:vm vm 1150 60000 -- \
+        ../rust-fs-core/scripts/tier.sh test:vm vm 1170 60000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
         # #239 adds one declared preservation test to the 528-case floor (#235).
         # #240 adds one declared export policy test.
