@@ -63,7 +63,7 @@ PY
     fs.erofs "$img" stat /missing >"$SANDBOX/out" 2>"$SANDBOX/err"
     check "missing path exits 1" test $? -eq 1
     check "missing path stdout empty" test ! -s "$SANDBOX/out"
-    jq_check "missing path structured error" '.code==1 and (.error|test("not found"))' "$SANDBOX/err"
+    jq_check "missing path is the not_found kind" '.code==1 and .kind=="not_found"' "$SANDBOX/err"
     fs.erofs "$img" stat >"$SANDBOX/out" 2>"$SANDBOX/err"
     check "missing argument exits 2" test $? -eq 2
     check "usage stdout empty" test ! -s "$SANDBOX/out"
