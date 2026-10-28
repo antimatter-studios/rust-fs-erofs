@@ -3106,7 +3106,7 @@ overflow-checks = false
 /// A value that is not a literal version is not a declaration either: a
 /// clone of `--branch "$FS_CORE_REF"` names a variable declared
 /// elsewhere, not a second, independent pin.
-fn am_fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
+fn fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -3191,13 +3191,13 @@ const FILES_THAT_PIN_AM_FS_CORE: &[&str] = &[
 /// matching would otherwise report perfect agreement among nothing,
 /// which is the failure this whole file is written against.
 #[test]
-fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
+fn every_declaration_of_the_fs_core_pin_names_the_same_version() {
     let root = manifest_dir();
     let mut declared: Vec<(&str, String, String)> = Vec::new();
     let mut silent = Vec::new();
 
     for rel in FILES_THAT_PIN_AM_FS_CORE {
-        let found = am_fs_core_versions_declared(&read_or_panic(&root.join(rel)));
+        let found = fs_core_versions_declared(&read_or_panic(&root.join(rel)));
         if found.is_empty() {
             silent.push(*rel);
         }
@@ -3253,7 +3253,7 @@ const CORE_WITH_TREE_SOURCE: [u64; 3] = [0, 3, 15];
 #[test]
 fn the_rust_fs_core_pin_carries_the_shared_tree_transfer() {
     let root = manifest_dir();
-    let (_, pinned) = am_fs_core_versions_declared(&read_or_panic(&root.join("Cargo.toml")))
+    let (_, pinned) = fs_core_versions_declared(&read_or_panic(&root.join("Cargo.toml")))
         .into_iter()
         .next()
         .expect("Cargo.toml declares the rust-fs-core pin");
@@ -3269,14 +3269,14 @@ fn the_rust_fs_core_pin_carries_the_shared_tree_transfer() {
 }
 
 mod core_pin_parser {
-    use super::{am_fs_core_versions_declared, as_version};
+    use super::{as_version, fs_core_versions_declared};
 
     /// The real dependency line, in both manifests' shape.
     #[test]
     fn a_path_dependency_declares_its_version() {
         let toml = "rust-fs-core = { path = \"../../rust-fs-core\", version = \"0.2.10\" }\n";
         assert_eq!(
-            am_fs_core_versions_declared(toml),
+            fs_core_versions_declared(toml),
             vec![(
                 "the rust-fs-core dependency's `version`".to_string(),
                 "0.2.10".to_string()
@@ -3288,7 +3288,7 @@ mod core_pin_parser {
     #[test]
     fn the_ref_variable_declares_its_version() {
         assert_eq!(
-            am_fs_core_versions_declared("  FS_CORE_REF: v0.2.13\n"),
+            fs_core_versions_declared("  FS_CORE_REF: v0.2.13\n"),
             vec![("`FS_CORE_REF`".to_string(), "0.2.13".to_string())],
         );
     }
@@ -3299,7 +3299,7 @@ mod core_pin_parser {
         let line = "run: git clone --depth 1 --branch v0.2.10 \
                     https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core\n";
         assert_eq!(
-            am_fs_core_versions_declared(line),
+            fs_core_versions_declared(line),
             vec![(
                 "the `git clone --branch` ref".to_string(),
                 "0.2.10".to_string()
@@ -3313,7 +3313,7 @@ mod core_pin_parser {
     fn a_comment_naming_a_version_is_not_a_declaration() {
         let yaml = "  # v0.2.13: the release whose wrapper fails quietly.\n  \
                     # v0.2.11 and v0.2.12 satisfy the dependency but not this.\n";
-        assert!(am_fs_core_versions_declared(yaml).is_empty());
+        assert!(fs_core_versions_declared(yaml).is_empty());
     }
 
     /// A clone of `--branch "$FS_CORE_REF"` names the variable, not a
@@ -3322,7 +3322,7 @@ mod core_pin_parser {
     fn a_branch_that_is_a_variable_is_not_a_declaration() {
         let line = "run: git clone --depth 1 --branch \"$FS_CORE_REF\" \
                     https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core\n";
-        assert!(am_fs_core_versions_declared(line).is_empty());
+        assert!(fs_core_versions_declared(line).is_empty());
     }
 
     /// A branch name is not a version. A pin moved to `main` is a pin

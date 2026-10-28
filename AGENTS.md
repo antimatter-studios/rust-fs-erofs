@@ -304,7 +304,7 @@ where a 4 KiB block is meant. A missing tool **fails** the job; it does not skip
 `Cargo.toml`, `fuzz/Cargo.toml`, `chores.yml` (`FS_CORE_REF`) and `fuzz.yml`
 (the `git clone --branch` ref) each name the core release this crate builds
 against. A bump moves all four;
-`every_declaration_of_the_am_fs_core_pin_names_the_same_version` in
+`every_declaration_of_the_fs_core_pin_names_the_same_version` in
 `tests/ci_profile.rs` fails, naming the file left behind, when one is missed
 (#144). The nightly fuzz run was red from the 22nd to the 26th of September on
 a `CachingDevice` overflow core had already fixed, because its clone lagged the

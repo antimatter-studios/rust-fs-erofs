@@ -43,7 +43,7 @@ rust-fs-erofs = "0.4"
 
 ```toml
 [dependencies]
-fs-erofs = { path = "../rust-fs-erofs" }
+rust-fs-erofs = { path = "../rust-fs-erofs" }
 rust-fs-core = { path = "../rust-fs-core" }
 ```
 
