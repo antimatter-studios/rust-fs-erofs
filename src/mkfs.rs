@@ -10,18 +10,21 @@
 //! Layout (general shape, exact addresses computed by the planner):
 //!
 //! ```text
-//! block 0 .. meta_blkaddr-1: SB area (zeros + 128-byte SB at offset 1024)
-//! meta_blkaddr ..:           metadata area: 32-byte inode slots,
-//!                            optional inline xattrs, optional inline
-//!                            FLAT_INLINE tail, optional inline chunkmap.
-//! data area:                 dir blocks, file blocks, symlink target
-//!                            blocks, chunked-file chunk blocks.
+//! block 0 ..:        SB area (zeros + 128-byte SB at offset 1024, then
+//!                    the COMPR_CFGS blob and the xattr prefix dictionary)
+//! data area:         shared xattrs, file blocks, symlink target blocks,
+//!                    chunked-file chunk blocks, compressed pclusters.
+//! meta_blkaddr ..:   metadata area: 32-byte inode slots, optional inline
+//!                    xattrs, optional inline FLAT_INLINE tail, optional
+//!                    inline chunkmap or compression index.
+//! after it:          directory blocks.
 //! ```
 //!
-//! Returns a single `Vec<u8>` because the writer needs every block
-//! address up-front (`raw_blkaddr` inside each inode points at the data
-//! area). Streaming the output isn't compatible with that constraint
-//! without a second pass.
+//! The data comes first so that it can be written in one pass, as each
+//! file is read: an inode records where its data is, and the shape of a
+//! compressed inode is not known until its data has been compressed. The
+//! metadata area follows, once every address is known; NIDs count from
+//! `meta_blkaddr`, so the root is still NID 0. See [`build_image_to`].
 //!
 //! Independent implementation: written from `linux/fs/erofs/erofs_fs.h`
 //! (struct definitions only) plus
@@ -486,23 +489,30 @@ pub fn build_image(root: Node, blkszbits: u8) -> Result<Vec<u8>> {
 /// blob immediately after the 128-byte SB, sets
 /// `EROFS_FEATURE_INCOMPAT_COMPR_CFGS`, and advertises the included
 /// codecs in the SB's `available_compr_algs` (`u1`) field.
+pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Result<Vec<u8>> {
+    let mut image = std::io::Cursor::new(Vec::new());
+    build_image_to(root, blkszbits, options, &mut image)?;
+    Ok(image.into_inner())
+}
+
 /// Build an EROFS image into `sink`, and return its length in bytes.
 ///
-/// The sink is written from its start; anything already past the
-/// image's end is left as it was.
+/// The one implementation of the layout: [`build_image_with`] is this
+/// writing into a `Vec`. File data is written first, from the block after
+/// the superblock, as each file's [`Content`] is read; the metadata area
+/// and the directories follow it, and the superblock is written last. So
+/// the sink is written out of order, which is what `Seek` is for, and
+/// memory holds the tree's metadata -- inodes, xattrs, inline tails,
+/// compression indexes, directory entries -- but never its file data.
+///
+/// The sink is written from its start; anything already past the image's
+/// end is left as it was. The same tree and options give the same bytes.
 pub fn build_image_to<W: Write + Seek>(
     root: Node,
     blkszbits: u8,
     options: BuildOptions,
     sink: &mut W,
 ) -> Result<u64> {
-    let image = build_image_with(root, blkszbits, options)?;
-    sink.rewind().map_err(io_error)?;
-    sink.write_all(&image).map_err(io_error)?;
-    Ok(image.len() as u64)
-}
-
-pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Result<Vec<u8>> {
     if !crate::superblock::is_valid_blkszbits(blkszbits) {
         return Err(Error::BadSuperblock("blkszbits out of range"));
     }
@@ -573,15 +583,107 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         bodies.push(body);
     }
 
-    // Pass 2: lay out the metadata area. Each inode body + its trailers
-    // (xattrs, inline tail, chunkmap, zmap) consumes contiguous bytes;
-    // `plan_meta_layout` owns the placement rules and is the single walk
-    // of that area. The NIDs below and the write addresses used by the
-    // emission loop further down are both read out of the same slots.
-    let meta_blkaddr: u32 = SB_AREA_END
-        .div_ceil(bs)
-        .try_into()
-        .map_err(|_| Error::BadSuperblock("meta_blkaddr overflow"))?;
+    // Pass 2: the data area, streamed. It starts at the first block past
+    // the superblock area, and every file's bytes go to the sink as they
+    // are read, so nothing holds more than one copy buffer of them. The
+    // block(s) before it are zeroed now and written last, once the
+    // superblock knows where everything went.
+    let data_start = SB_AREA_END.div_ceil(bs);
+    let mut out = ImageSink::new(sink, bs);
+    out.write_blocks(0, &[], data_start)?;
+    let mut next_data_block = data_start;
+    // The shared xattr area leads the data area: it is addressed by
+    // block, and its entries by 4-byte offsets into it.
+    let xattr_blkaddr: u32 = if shared.area.is_empty() {
+        0
+    } else {
+        let at = block_addr(next_data_block)?;
+        let blocks = (shared.area.len() as u64).div_ceil(bs);
+        out.write_blocks(next_data_block, &shared.area, blocks)?;
+        next_data_block += blocks;
+        at
+    };
+    let mut placements: Vec<Placement> = Vec::with_capacity(plan.len());
+    let mut any_compressed = false;
+    for n in plan.iter_mut() {
+        let mut place = Placement::default();
+        match &mut n.kind {
+            PlanKind::File {
+                content,
+                size,
+                layout: FileLayout::FlatPlain,
+            } if *size > 0 => {
+                let content = content.take().expect("a file's content is read once");
+                place.blkaddr = next_data_block;
+                out.write_content(next_data_block, content)?;
+                next_data_block += size.div_ceil(bs);
+            }
+            PlanKind::File { content, .. } => {
+                // An empty file still opens its content, to refuse a
+                // reader with bytes behind a size of zero.
+                if let Some(content) = content.take() {
+                    content.read_all()?;
+                }
+            }
+            PlanKind::Symlink { target } => {
+                if target.len() as u64 > bs {
+                    return Err(Error::BadInode("symlink target longer than one block"));
+                }
+                place.blkaddr = next_data_block;
+                out.write_blocks(next_data_block, target, 1)?;
+                next_data_block += 1;
+            }
+            PlanKind::Chunked { chunks, .. } => {
+                for c in chunks.iter() {
+                    match c {
+                        None => place.chunk_addrs.push(EROFS_NULL_ADDR),
+                        Some(buf) => {
+                            let blocks = (buf.len() as u64).div_ceil(bs).max(1);
+                            place.chunk_addrs.push(block_addr(next_data_block)?);
+                            out.write_blocks(next_data_block, buf, blocks)?;
+                            next_data_block += blocks;
+                        }
+                    }
+                }
+            }
+            PlanKind::Compressed { pclusters, .. } => {
+                any_compressed = true;
+                for pc in pclusters.iter_mut() {
+                    // For ztailpacked pclusters (block_count == 0) we
+                    // still record next_data_block as the entry's
+                    // blkaddr. The reader resolves this via the per-
+                    // pack base arithmetic but uses the inline-tail
+                    // offset/size for actual reads (gated on
+                    // `is_last_pcluster && has_inline_tail`), so the
+                    // recorded address is a "shadow" that keeps
+                    // compacted-2B per-pack base math consistent for
+                    // non-tail entries in the same pack.
+                    place.pcluster_addrs.push(block_addr(next_data_block)?);
+                    let blocks = pc.pcluster_block_count as u64;
+                    if blocks > 0 {
+                        out.write_blocks(
+                            next_data_block,
+                            &std::mem::take(&mut pc.block_bytes),
+                            blocks,
+                        )?;
+                    }
+                    next_data_block += blocks;
+                }
+            }
+            PlanKind::Dir { .. } | PlanKind::Device { .. } | PlanKind::Special => {}
+        }
+        placements.push(place);
+    }
+
+    // Pass 3: lay out the metadata area, right after the data. Each inode
+    // body + its trailers (xattrs, inline tail, chunkmap, zmap) consumes
+    // contiguous bytes; `plan_meta_layout` owns the placement rules and is
+    // the single walk of that area. The NIDs below and the write addresses
+    // used by the emission loop further down are both read out of the same
+    // slots. NIDs count from `meta_blkaddr`, so the root, planned first,
+    // is NID 0 however much data precedes it.
+    let meta_blkaddr =
+        block_addr(next_data_block).map_err(|_| Error::BadSuperblock("meta_blkaddr overflow"))?;
     let meta_byte_base = meta_blkaddr as u64 * bs;
 
     let meta_slots = plan_meta_layout(&bodies, bs);
@@ -593,107 +695,23 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         * COMPACT_INODE_SIZE;
     let meta_blocks = meta_total_bytes.div_ceil(bs);
 
-    // Pass 3: pack each directory's entries into block-sized chunks. The
-    // child-NID lookup uses the `nids` map computed above, so this can
-    // only run after pass 2.
-    let data_area_start = meta_blkaddr as u64 + meta_blocks;
-    let mut dir_blocks: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
-    let mut dir_block_for_nid: BTreeMap<u64, u64> = BTreeMap::new();
-    let mut dir_size_for_nid: BTreeMap<u64, u64> = BTreeMap::new();
-    let mut next_data_block = data_area_start;
-    // The shared xattr area leads the data area: it is addressed by
-    // block, and its entries by 4-byte offsets into it.
-    let xattr_blkaddr: u32 = if shared.area.is_empty() {
-        0
-    } else {
-        let at = u32::try_from(next_data_block)
-            .map_err(|_| Error::BadSuperblock("xattr_blkaddr overflow"))?;
-        next_data_block += (shared.area.len() as u64).div_ceil(bs);
-        at
-    };
+    // Pass 4: each directory's entries, packed into blocks after the
+    // metadata area and written as they are packed. The child-NID lookup
+    // uses the `nids` map computed above, so this can only run after
+    // pass 3; the directory inodes that point here are encoded after it.
+    let mut next_block = meta_blkaddr as u64 + meta_blocks;
     for (i, n) in plan.iter().enumerate() {
         if let PlanKind::Dir { children } = &n.kind {
             let blocks = encode_dir_blocks(i, children, &plan, &nids, bs)?;
-            dir_size_for_nid.insert(nids[i], blocks.len() as u64 * bs);
-            dir_block_for_nid.insert(nids[i], next_data_block);
-            next_data_block += blocks.len() as u64;
-            dir_blocks.insert(nids[i], blocks);
+            placements[i].blkaddr = next_block;
+            placements[i].dir_size = blocks.len() as u64 * bs;
+            for buf in &blocks {
+                out.write_blocks(next_block, buf, 1)?;
+                next_block += 1;
+            }
         }
     }
-
-    // Pass 4: file/symlink data + chunked-file chunk blocks +
-    // compressed-file pcluster blocks. FLAT_INLINE files don't take a
-    // data block (entire payload is in the metadata area).
-    let mut data_block_for_nid: BTreeMap<u64, u64> = BTreeMap::new();
-    let mut chunk_addrs_for_nid: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-    let mut pcluster_addrs_for_nid: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-    let mut any_compressed = false;
-    for (i, n) in plan.iter().enumerate() {
-        let nid = nids[i];
-        match &n.kind {
-            PlanKind::File { data, layout, .. } => match layout {
-                FileLayout::FlatPlain => {
-                    if data.is_empty() {
-                        data_block_for_nid.insert(nid, 0);
-                    } else {
-                        let blocks = (data.len() as u64).div_ceil(bs);
-                        data_block_for_nid.insert(nid, next_data_block);
-                        next_data_block += blocks;
-                    }
-                }
-                FileLayout::FlatInline => {
-                    data_block_for_nid.insert(nid, 0);
-                }
-            },
-            PlanKind::Symlink { target } => {
-                if target.len() as u64 > bs {
-                    return Err(Error::BadInode("symlink target longer than one block"));
-                }
-                data_block_for_nid.insert(nid, next_data_block);
-                next_data_block += 1;
-            }
-            PlanKind::Chunked { chunks, .. } => {
-                let mut addrs = Vec::with_capacity(chunks.len());
-                for c in chunks {
-                    match c {
-                        None => addrs.push(EROFS_NULL_ADDR),
-                        Some(buf) => {
-                            let blocks = (buf.len() as u64).div_ceil(bs).max(1);
-                            if next_data_block > u32::MAX as u64 {
-                                return Err(Error::BadSuperblock("data block address > u32::MAX"));
-                            }
-                            addrs.push(next_data_block as u32);
-                            next_data_block += blocks;
-                        }
-                    }
-                }
-                chunk_addrs_for_nid.insert(nid, addrs);
-            }
-            PlanKind::Compressed { pclusters, .. } => {
-                any_compressed = true;
-                let mut addrs: Vec<u32> = Vec::with_capacity(pclusters.len());
-                for pc in pclusters {
-                    if next_data_block > u32::MAX as u64 {
-                        return Err(Error::BadSuperblock("data block address > u32::MAX"));
-                    }
-                    // For ztailpacked pclusters (block_count == 0) we
-                    // still record next_data_block as the entry's
-                    // blkaddr. The reader resolves this via the per-
-                    // pack base arithmetic but uses the inline-tail
-                    // offset/size for actual reads (gated on
-                    // `is_last_pcluster && has_inline_tail`), so the
-                    // recorded address is a "shadow" that keeps
-                    // compacted-2B per-pack base math consistent for
-                    // non-tail entries in the same pack.
-                    addrs.push(next_data_block as u32);
-                    next_data_block += pc.pcluster_block_count as u64;
-                }
-                pcluster_addrs_for_nid.insert(nid, addrs);
-            }
-            PlanKind::Dir { .. } | PlanKind::Device { .. } | PlanKind::Special => {}
-        }
-    }
-    let total_blocks = next_data_block.max(data_area_start);
+    let total_blocks = next_block;
 
     if total_blocks < 2 {
         return Err(Error::BadSuperblock("image too small"));
@@ -702,9 +720,9 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         return Err(Error::BadSuperblock("FS too large for u32 block count"));
     }
 
-    // Pass 5: write image bytes.
-    let img_size = total_blocks * bs;
-    let mut img = vec![0u8; img_size as usize];
+    // Pass 5: the superblock area -- everything before the data -- and
+    // the metadata area, both built in memory and written once.
+    let mut img = vec![0u8; (data_start * bs) as usize];
     let mut feature_incompat = if any_compressed {
         // Modern fsck.erofs (>= 1.6) requires LZ4_0PADDING for any
         // compressed inode. Setting the bit unconditionally when the
@@ -840,7 +858,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     if !compr_cfgs_bytes.is_empty() {
         let off = gap_cursor as usize;
         let end = off + compr_cfgs_bytes.len();
-        if end as u64 > meta_blkaddr as u64 * bs {
+        if end as u64 > data_start * bs {
             return Err(Error::BadSuperblock(
                 "COMPR_CFGS blob overflows pre-meta gap",
             ));
@@ -858,7 +876,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         xattr_prefix_start_div4 = (dict_byte_off / 4) as u32;
         let off = dict_byte_off as usize;
         let end = off + xattr_prefix_bytes.len();
-        if end as u64 > meta_blkaddr as u64 * bs {
+        if end as u64 > data_start * bs {
             return Err(Error::BadXattr(
                 "xattr prefix dictionary overflows pre-meta gap",
             ));
@@ -879,65 +897,53 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         xattr_blkaddr,
         &options,
     );
-    if xattr_blkaddr != 0 {
-        let off = xattr_blkaddr as usize * bs as usize;
-        img[off..off + shared.area.len()].copy_from_slice(&shared.area);
-    }
+    out.write_at(0, &img)?;
 
     // Inodes + their inline trailers. Every address here comes out of
     // the pass-2 layout, so an inode's bytes land at exactly the address
     // its recorded NID names — there is no second cursor walk that could
     // fall out of step with the first.
+    let mut meta = vec![0u8; (meta_blocks * bs) as usize];
     for (i, (body, slot)) in bodies.iter().zip(&meta_slots).enumerate() {
         let nid = slot.nid();
         let mut meta_cursor = slot.start;
-        let inode_off = (meta_byte_base + meta_cursor) as usize;
-        let inode_buf = encode_inode(
-            &plan[i],
-            i,
-            nid,
-            body,
-            &nlinks,
-            &dir_size_for_nid,
-            &dir_block_for_nid,
-            &data_block_for_nid,
-            bs,
-        );
-        img[inode_off..inode_off + body.body_size as usize].copy_from_slice(&inode_buf);
+        let inode_off = meta_cursor as usize;
+        let inode_buf = encode_inode(&plan[i], nid, body, nlinks[i], &placements[i], bs);
+        meta[inode_off..inode_off + body.body_size as usize].copy_from_slice(&inode_buf);
         meta_cursor += body.body_size;
 
         if !body.xattr_bytes.is_empty() {
-            let off = (meta_byte_base + meta_cursor) as usize;
-            img[off..off + body.xattr_bytes.len()].copy_from_slice(&body.xattr_bytes);
+            let off = meta_cursor as usize;
+            meta[off..off + body.xattr_bytes.len()].copy_from_slice(&body.xattr_bytes);
             meta_cursor += body.xattr_bytes.len() as u64;
         }
         if !body.inline_tail.is_empty() {
-            let off = (meta_byte_base + meta_cursor) as usize;
-            img[off..off + body.inline_tail.len()].copy_from_slice(&body.inline_tail);
+            let off = meta_cursor as usize;
+            meta[off..off + body.inline_tail.len()].copy_from_slice(&body.inline_tail);
             meta_cursor += body.inline_tail.len() as u64;
         }
         if body.chunkmap_bytes > 0 {
-            let off = (meta_byte_base + meta_cursor) as usize;
-            let map_buf = encode_chunkmap(&plan[i], &chunk_addrs_for_nid, nid);
+            let off = meta_cursor as usize;
+            let map_buf = encode_chunkmap(&plan[i], &placements[i].chunk_addrs);
             if map_buf.len() as u64 != body.chunkmap_bytes {
                 return Err(Error::BadInode(
                     "emitted chunkmap length disagrees with the planned trailer size",
                 ));
             }
-            img[off..off + map_buf.len()].copy_from_slice(&map_buf);
+            meta[off..off + map_buf.len()].copy_from_slice(&map_buf);
             meta_cursor += body.chunkmap_bytes;
         }
         if body.zmap_bytes > 0 {
-            let off = (meta_byte_base + meta_cursor) as usize;
+            let off = meta_cursor as usize;
             let body_end = meta_byte_base + meta_cursor;
             let zmap_buf =
-                encode_zmap_trailer(&plan[i], &pcluster_addrs_for_nid, nid, body_end, blkszbits);
+                encode_zmap_trailer(&plan[i], &placements[i].pcluster_addrs, body_end, blkszbits);
             if zmap_buf.len() as u64 != body.zmap_bytes {
                 return Err(Error::BadInode(
                     "emitted zmap trailer length disagrees with the planned trailer size",
                 ));
             }
-            img[off..off + zmap_buf.len()].copy_from_slice(&zmap_buf);
+            meta[off..off + zmap_buf.len()].copy_from_slice(&zmap_buf);
             meta_cursor += body.zmap_bytes;
         }
 
@@ -953,66 +959,104 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
             ));
         }
     }
+    out.write_at(meta_byte_base, &meta)?;
 
-    // Directory blocks.
-    for (nid, blocks) in &dir_blocks {
-        for (blk, buf) in (dir_block_for_nid[nid]..).zip(blocks.iter()) {
-            let off = (blk * bs) as usize;
-            img[off..off + bs as usize].copy_from_slice(buf);
-        }
+    Ok(total_blocks * bs)
+}
+
+/// Where one inode's data went in the image. Recorded while the data is
+/// written, before NIDs exist, and read when the inode is encoded.
+#[derive(Debug, Default)]
+struct Placement {
+    /// First block of a FLAT_PLAIN file, a symlink or a directory; zero
+    /// for an inode with no data blocks.
+    blkaddr: u64,
+    /// A directory's size: its blocks, in bytes.
+    dir_size: u64,
+    /// A chunked file's chunks, each its block or the hole sentinel.
+    chunk_addrs: Vec<u32>,
+    /// A compressed file's pclusters, each its first block.
+    pcluster_addrs: Vec<u32>,
+}
+
+/// A block number, as the 32 bits every on-disk block address has.
+fn block_addr(block: u64) -> Result<u32> {
+    u32::try_from(block).map_err(|_| Error::BadSuperblock("data block address > u32::MAX"))
+}
+
+/// The bytes a file's content is copied through on its way to the sink:
+/// the only file data in memory at once.
+const COPY_BUFFER: usize = 128 << 10;
+
+/// The sink an image is written to, addressed in blocks.
+struct ImageSink<'a, W: Write + Seek> {
+    out: &'a mut W,
+    bs: u64,
+}
+
+impl<'a, W: Write + Seek> ImageSink<'a, W> {
+    fn new(out: &'a mut W, bs: u64) -> Self {
+        Self { out, bs }
     }
 
-    // File / symlink / chunked-file data.
-    for (i, n) in plan.iter().enumerate() {
-        let nid = nids[i];
-        match &n.kind {
-            PlanKind::File { data, layout, .. } => match layout {
-                FileLayout::FlatPlain => {
-                    if data.is_empty() {
-                        continue;
-                    }
-                    let blk = data_block_for_nid[&nid];
-                    let off = (blk * bs) as usize;
-                    img[off..off + data.len()].copy_from_slice(data);
-                }
-                FileLayout::FlatInline => {
-                    // Already written into the metadata area as the
-                    // inline tail.
-                }
-            },
-            PlanKind::Symlink { target } => {
-                let blk = data_block_for_nid[&nid];
-                let off = (blk * bs) as usize;
-                img[off..off + target.len()].copy_from_slice(target);
-            }
-            PlanKind::Chunked { chunks, .. } => {
-                let addrs = &chunk_addrs_for_nid[&nid];
-                for (chunk_idx, c) in chunks.iter().enumerate() {
-                    if let Some(buf) = c {
-                        let blk = addrs[chunk_idx] as u64;
-                        let off = (blk * bs) as usize;
-                        img[off..off + buf.len()].copy_from_slice(buf);
-                    }
-                }
-            }
-            PlanKind::Compressed { pclusters, .. } => {
-                let addrs = &pcluster_addrs_for_nid[&nid];
-                for (pc_idx, pc) in pclusters.iter().enumerate() {
-                    if pc.pcluster_block_count == 0 {
-                        // ztailpacked pcluster: bytes are inlined in
-                        // the metadata area, not in a data block.
-                        continue;
-                    }
-                    let blk = addrs[pc_idx] as u64;
-                    let off = (blk * bs) as usize;
-                    img[off..off + pc.block_bytes.len()].copy_from_slice(&pc.block_bytes);
-                }
-            }
-            PlanKind::Dir { .. } | PlanKind::Device { .. } | PlanKind::Special => {}
-        }
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.out
+            .seek(std::io::SeekFrom::Start(offset))
+            .map_err(io_error)?;
+        self.out.write_all(bytes).map_err(io_error)
     }
 
-    Ok(img)
+    /// Write `bytes` at block `blkaddr`, then zeros to the end of
+    /// `blocks` blocks, so every block the image claims is written.
+    fn write_blocks(&mut self, blkaddr: u64, bytes: &[u8], blocks: u64) -> Result<()> {
+        let span = blocks * self.bs;
+        if bytes.len() as u64 > span {
+            return Err(Error::BadInode(
+                "data longer than the blocks planned for it",
+            ));
+        }
+        self.write_at(blkaddr * self.bs, bytes)?;
+        self.write_zeros(span - bytes.len() as u64)
+    }
+
+    /// Zeros at the current position.
+    fn write_zeros(&mut self, mut len: u64) -> Result<()> {
+        const ZEROS: [u8; 4096] = [0; 4096];
+        while len > 0 {
+            let n = len.min(ZEROS.len() as u64) as usize;
+            self.out.write_all(&ZEROS[..n]).map_err(io_error)?;
+            len -= n as u64;
+        }
+        Ok(())
+    }
+
+    /// Copy a file's content to block `blkaddr`, through one bounded
+    /// buffer, and pad its last block. Content that ends before its size,
+    /// or goes on past it, is refused.
+    fn write_content(&mut self, blkaddr: u64, content: Content) -> Result<()> {
+        let size = content.size;
+        let mut reader = (content.open)().map_err(io_error)?;
+        self.out
+            .seek(std::io::SeekFrom::Start(blkaddr * self.bs))
+            .map_err(io_error)?;
+        let mut buf = vec![0u8; COPY_BUFFER.min(size as usize)];
+        let mut left = size;
+        while left > 0 {
+            let want = left.min(buf.len() as u64) as usize;
+            let n = match reader.read(&mut buf[..want]) {
+                Ok(0) => return Err(Error::BadInode("file content is shorter than its size")),
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io_error(e)),
+            };
+            self.out.write_all(&buf[..n]).map_err(io_error)?;
+            left -= n as u64;
+        }
+        if reader.read(&mut [0u8; 1]).map_err(io_error)? != 0 {
+            return Err(Error::BadInode("file content is longer than its size"));
+        }
+        self.write_zeros(size.next_multiple_of(self.bs) - size)
+    }
 }
 
 // --- compression helpers (W2a) -----------------------------------------
@@ -1751,7 +1795,10 @@ struct PlanNode {
 #[derive(Debug)]
 enum PlanKind {
     File {
-        data: Vec<u8>,
+        /// Taken when the bytes are read: into the inline tail while
+        /// planning, or straight into the data area.
+        content: Option<Content>,
+        size: u64,
         layout: FileLayout,
     },
     Dir {
@@ -1970,7 +2017,8 @@ fn flatten(
             plan[idx as usize].meta = meta;
             plan[idx as usize].xattrs = xattrs;
             plan[idx as usize].kind = PlanKind::File {
-                data,
+                size: data.len() as u64,
+                content: Some(Content::from_bytes(data)),
                 layout: FileLayout::FlatPlain,
             };
         }
@@ -2113,7 +2161,8 @@ fn flatten(
             plan[idx as usize].meta = meta;
             plan[idx as usize].xattrs = xattrs;
             plan[idx as usize].kind = PlanKind::File {
-                data: content.read_all()?,
+                size: content.size(),
+                content: Some(content),
                 layout: FileLayout::FlatPlain,
             };
         }
@@ -2214,7 +2263,7 @@ fn plan_body(
     // 0 here since it doesn't affect compact-vs-extended choice -- a
     // directory never exceeds 4 GiB in our writer).
     let size = match &n.kind {
-        PlanKind::File { data, .. } => data.len() as u64,
+        PlanKind::File { size, .. } => *size,
         PlanKind::Symlink { target } => target.len() as u64,
         PlanKind::Dir { .. } => 0,
         PlanKind::Device { .. } | PlanKind::Special => 0,
@@ -2247,11 +2296,19 @@ fn plan_body(
         COMPACT_INODE_SIZE
     };
     let mut inline_tail: Vec<u8> = Vec::new();
-    if let PlanKind::File { data, layout } = &mut n.kind {
+    if let PlanKind::File {
+        content,
+        size,
+        layout,
+    } = &mut n.kind
+    {
         let tail_room = bs.saturating_sub(body_size_now + xattr_bytes.len() as u64);
-        if !data.is_empty() && (data.len() as u64) < bs && (data.len() as u64) <= tail_room {
+        if *size > 0 && *size < bs && *size <= tail_room {
             *layout = FileLayout::FlatInline;
-            inline_tail = data.clone();
+            inline_tail = content
+                .take()
+                .expect("a file's content is read once")
+                .read_all()?;
         }
     }
 
@@ -2641,14 +2698,11 @@ fn write_superblock(
 #[allow(clippy::too_many_arguments)]
 fn encode_inode(
     n: &PlanNode,
-    idx: usize,
     nid: u64,
     body: &InodeBody,
-    nlinks: &[u32],
-    dir_size_for_nid: &BTreeMap<u64, u64>,
-    dir_block_for_nid: &BTreeMap<u64, u64>,
-    data_block_for_nid: &BTreeMap<u64, u64>,
-    _bs: u64,
+    nlink: u32,
+    place: &Placement,
+    bs: u64,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; body.body_size as usize];
 
@@ -2660,24 +2714,22 @@ fn encode_inode(
     buf[ci::XATTR_ICOUNT].copy_from_slice(&body.xattr_icount.to_le_bytes());
     buf[ci::MODE].copy_from_slice(&n.mode.to_le_bytes());
 
-    let raw_u = inode_raw_u(n, nid, dir_block_for_nid, data_block_for_nid);
+    let raw_u = inode_raw_u(n, place);
     buf[ci::RAW_U].copy_from_slice(&raw_u.to_le_bytes());
 
     let size = match &n.kind {
-        PlanKind::Dir { .. } => *dir_size_for_nid.get(&nid).unwrap_or(&0),
-        PlanKind::File { data, .. } => data.len() as u64,
+        PlanKind::Dir { .. } => place.dir_size,
+        PlanKind::File { size, .. } => *size,
         PlanKind::Symlink { target } => target.len() as u64,
         PlanKind::Device { .. } | PlanKind::Special => 0,
         PlanKind::Chunked {
             chunks, chunk_bits, ..
-        } => total_chunked_size(chunks, *chunk_bits, _bs).unwrap_or(0),
+        } => total_chunked_size(chunks, *chunk_bits, bs).unwrap_or(0),
         // Compressed: i_size is the ORIGINAL (uncompressed) source
         // length. The reader uses it to bound the last pcluster's
         // decompressed-source span.
         PlanKind::Compressed { src, .. } => src.len() as u64,
     };
-
-    let nlink = nlinks[idx];
 
     if body.is_extended {
         buf[xi::SIZE].copy_from_slice(&size.to_le_bytes());
@@ -2734,19 +2786,13 @@ fn inode_layout_and_flags(kind: &PlanKind) -> (DataLayout, u16) {
     }
 }
 
-fn inode_raw_u(
-    n: &PlanNode,
-    nid: u64,
-    dir_block_for_nid: &BTreeMap<u64, u64>,
-    data_block_for_nid: &BTreeMap<u64, u64>,
-) -> u32 {
+fn inode_raw_u(n: &PlanNode, place: &Placement) -> u32 {
     match &n.kind {
         PlanKind::File { layout, .. } => match layout {
-            FileLayout::FlatPlain => data_block_for_nid.get(&nid).copied().unwrap_or(0) as u32,
+            FileLayout::FlatPlain => place.blkaddr as u32,
             FileLayout::FlatInline => 0,
         },
-        PlanKind::Dir { .. } => dir_block_for_nid[&nid] as u32,
-        PlanKind::Symlink { .. } => data_block_for_nid[&nid] as u32,
+        PlanKind::Dir { .. } | PlanKind::Symlink { .. } => place.blkaddr as u32,
         PlanKind::Device { rdev } => *rdev,
         PlanKind::Special => 0,
         PlanKind::Chunked {
@@ -2922,13 +2968,7 @@ fn file_type_byte(n: &PlanNode) -> u8 {
 /// (<https://erofs.docs.kernel.org/en/latest/design.html#compressed-data>).
 /// Independent implementation. Not derived from any GPL'd EROFS
 /// codebase.
-fn encode_zmap_trailer(
-    n: &PlanNode,
-    pcluster_addrs_for_nid: &BTreeMap<u64, Vec<u32>>,
-    nid: u64,
-    body_end: u64,
-    blkszbits: u8,
-) -> Vec<u8> {
+fn encode_zmap_trailer(n: &PlanNode, addrs: &[u32], body_end: u64, blkszbits: u8) -> Vec<u8> {
     let PlanKind::Compressed {
         algo,
         lclusterbits,
@@ -2946,10 +2986,6 @@ fn encode_zmap_trailer(
         CompressedAlgo::Lzma => 1,
         CompressedAlgo::Deflate => 2,
     };
-    let addrs = pcluster_addrs_for_nid
-        .get(&nid)
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
     debug_assert_eq!(addrs.len(), pclusters.len());
 
     let has_inline = ztailpacking_inline.is_some();
@@ -3085,18 +3121,13 @@ fn encode_zmap_trailer(
 ///
 /// Spec: `linux/fs/erofs/erofs_fs.h::erofs_inode_chunk_index` (8 bytes
 /// indexed) or bare `__le32` (4 bytes compact). Independent implementation.
-fn encode_chunkmap(
-    n: &PlanNode,
-    chunk_addrs_for_nid: &BTreeMap<u64, Vec<u32>>,
-    nid: u64,
-) -> Vec<u8> {
+fn encode_chunkmap(n: &PlanNode, addrs: &[u32]) -> Vec<u8> {
     let PlanKind::Chunked {
         use_indexed_format, ..
     } = &n.kind
     else {
         return Vec::new();
     };
-    let addrs = &chunk_addrs_for_nid[&nid];
     if *use_indexed_format {
         let mut buf = Vec::with_capacity(addrs.len() * 8);
         for a in addrs {
