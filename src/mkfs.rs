@@ -319,6 +319,13 @@ pub struct BuildOptions {
     /// `build_time` the same tree then builds to the same bytes, and
     /// every inode that needs nothing wider is compact.
     pub mtime_is_build_time: bool,
+
+    /// When `true`, an xattr -- the same namespace, name and value -- that
+    /// two or more inodes carry is written once, in the shared xattr area,
+    /// and each of those inodes holds a 4-byte reference to it in place
+    /// of the entry. `mkfs.erofs` shares repeated xattrs the same way; an
+    /// SELinux label carried by thousands of inodes costs four bytes each.
+    pub share_xattrs: bool,
 }
 
 /// Per-codec configuration to surface in the COMPR_CFGS blob.
@@ -4521,5 +4528,67 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    fn file_with_xattrs(data: &[u8], xattrs: Vec<XattrSpec>) -> Node {
+        Node::File {
+            mode: DEFAULT_FILE_MODE,
+            data: data.to_vec(),
+            meta: NodeMeta::default(),
+            xattrs,
+        }
+    }
+
+    /// A label three inodes carry is written once and referenced from
+    /// each; a value only one inode has stays inline. Every inode reads
+    /// back the full set it was given.
+    #[test]
+    fn repeated_xattrs_are_shared_and_every_inode_reads_its_own_set() {
+        use crate::xattr::{ns, read_inline_xattrs};
+        let label = || {
+            XattrSpec::new(
+                ns::SECURITY,
+                b"selinux".to_vec(),
+                b"u:object_r:system_file:s0\0".to_vec(),
+            )
+        };
+        let cap = XattrSpec::new(
+            ns::SECURITY,
+            b"capability".to_vec(),
+            vec![1, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        let tree = dir(vec![
+            ("a", file_with_xattrs(b"a", vec![label()])),
+            ("b", file_with_xattrs(b"b", vec![label(), cap])),
+            ("c", file_with_xattrs(b"c", vec![label()])),
+            ("d", file(b"d")),
+        ]);
+        let options = BuildOptions {
+            share_xattrs: true,
+            ..BuildOptions::default()
+        };
+        let img = build_image_with(tree, 12, options).unwrap();
+        let dev = MemDev::new(img.clone());
+        let fs = open(img);
+        assert_ne!(fs.superblock().xattr_blkaddr, 0, "a shared xattr area");
+
+        let label_pair = (
+            b"security.selinux".to_vec(),
+            b"u:object_r:system_file:s0\0".to_vec(),
+        );
+        for (path, inline) in [("/a", 0), ("/b", 1), ("/c", 0)] {
+            let inode = fs.lookup_path(path).unwrap();
+            let (shared, entries) = read_inline_xattrs(&dev, fs.superblock(), &inode).unwrap();
+            assert_eq!(shared.len(), 1, "{path}: the label is a reference");
+            assert_eq!(entries.len(), inline, "{path}: inline entries");
+            let mut got = fs.xattrs(&inode).unwrap();
+            got.sort();
+            assert!(got.contains(&label_pair), "{path}: {got:?}");
+            assert_eq!(got.len(), 1 + inline, "{path}");
+        }
+        assert!(fs
+            .xattrs(&fs.lookup_path("/d").unwrap())
+            .unwrap()
+            .is_empty());
     }
 }
