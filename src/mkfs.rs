@@ -4863,4 +4863,62 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+
+    /// The compression map header sits at the first 8-byte boundary after
+    /// the inode body and its xattrs, as the kernel reads it
+    /// (`ALIGN(iloc + inode_isize + xattr_isize, 8)`). One small inline
+    /// xattr makes that area 20 bytes, so a compact inode ends 4 bytes
+    /// past a boundary.
+    #[test]
+    fn a_compression_map_after_xattrs_ending_off_8_bytes_starts_at_the_next_8() {
+        use crate::zmap::Z_EROFS_ADVISE_INLINE_PCLUSTER;
+        let data: Vec<u8> = (0..20_000u32)
+            .flat_map(|i| format!("{} ", i % 300).into_bytes())
+            .take(20_000)
+            .collect();
+        for (index_format, ztailpacking) in [
+            (CompressedIndexFormat::Legacy, false),
+            (CompressedIndexFormat::Legacy, true),
+            (CompressedIndexFormat::Compacted2B, false),
+            (CompressedIndexFormat::Compacted2B, true),
+        ] {
+            let label = format!("{index_format:?}, ztailpacking {ztailpacking}");
+            let node = Node::CompressedFile(CompressedFileSpec {
+                mode: DEFAULT_FILE_MODE,
+                data: data.clone(),
+                algo: CompressedAlgo::Lz4,
+                lclusterbits: 0,
+                meta: NodeMeta::default(),
+                xattrs: vec![XattrSpec::new(
+                    crate::xattr::ns::USER,
+                    b"a".to_vec(),
+                    b"b".to_vec(),
+                )],
+                index_format,
+                ztailpacking,
+                target_pcluster_blocks: 1,
+            });
+            let img = build_image(dir(vec![("f", node)]), 12).unwrap();
+            let fs = open(img.clone());
+            let inode = fs.lookup_path("/f").unwrap();
+            let end = inode.body_end(fs.superblock());
+            assert_eq!(
+                end % 8,
+                4,
+                "{label}: the fixture no longer ends off a boundary"
+            );
+            let mut buf = vec![0u8; data.len()];
+            fs.read_file(&inode, 0, &mut buf).unwrap();
+            assert!(buf == data, "{label}: reads back other bytes");
+            if ztailpacking {
+                let header = (end.next_multiple_of(8)) as usize;
+                let advise = u16::from_le_bytes([img[header + 4], img[header + 5]]);
+                assert_ne!(
+                    advise & Z_EROFS_ADVISE_INLINE_PCLUSTER,
+                    0,
+                    "{label}: no header at {header}"
+                );
+            }
+        }
+    }
 }
