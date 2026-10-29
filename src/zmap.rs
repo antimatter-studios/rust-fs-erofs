@@ -661,7 +661,12 @@ impl<'a> ZMap<'a> {
     ) -> Result<Self> {
         #[cfg(test)]
         OPENS.with(|n| n.set(n.get() + 1));
-        let header_off = inode.body_end(sb);
+        // The header sits at the first 8-byte boundary after the inode
+        // body and its xattrs (`ALIGN(iloc + inode_isize + xattr_isize,
+        // 8)` in the kernel). An xattr area can leave that end 4 bytes
+        // off a boundary; reading the header at the end itself read the
+        // padding and half the header.
+        let header_off = inode.body_end(sb).next_multiple_of(COMPACT_MAP_EBASE_ALIGN);
         let mut h = [0u8; 8];
         dev.read_at(header_off, &mut h)?;
         let header = ZMapHeader {
@@ -703,8 +708,7 @@ impl<'a> ZMap<'a> {
         // compact this is the start of pack 0; for legacy we add
         // another 8-byte gap to land at the first lcluster_index entry
         // (per Z_EROFS_FULL_INDEX_START).
-        let ebase = header_off.next_multiple_of(COMPACT_MAP_EBASE_ALIGN);
-        let ebase = ebase + Z_EROFS_COMPACT_MAP_HEADER_SIZE;
+        let ebase = header_off + Z_EROFS_COMPACT_MAP_HEADER_SIZE;
         let index_start_offset = match format {
             IndexFormat::Legacy => ebase + 8,
             IndexFormat::Compact => ebase,
