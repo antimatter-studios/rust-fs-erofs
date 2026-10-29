@@ -1008,3 +1008,73 @@ PY"#,
         "this crate and the kernel read different xattrs"
     );
 }
+
+/// Every kind of inode the writer makes, with the data area before the
+/// metadata area as the streaming writer lays it out, built into a sink
+/// by `build_image_to`: `fsck.erofs` must accept it, and must find every
+/// file's bytes where the inodes say they are.
+#[test]
+fn fsck_passes_on_every_inode_kind_streamed_into_a_sink() {
+    use fs_erofs::xattr::ns;
+    let label = || {
+        mkfs::XattrSpec::new(
+            ns::SECURITY,
+            b"selinux".to_vec(),
+            b"u:object_r:a:s0\0".to_vec(),
+        )
+    };
+    let streamed = |bytes: Vec<u8>| mkfs::Node::StreamedFile {
+        mode: mkfs::DEFAULT_FILE_MODE,
+        content: mkfs::Content::from_bytes(bytes),
+        meta: mkfs::NodeMeta::default(),
+        xattrs: vec![label()],
+    };
+    let big: Vec<u8> = (0..300_001u32).map(|i| (i % 251) as u8).collect();
+    let tree = dir(vec![
+        ("inline", streamed(b"inline bytes".to_vec())),
+        ("big", streamed(big.clone())),
+        (
+            "big-link",
+            mkfs::Node::HardLink {
+                target: "big".to_string(),
+            },
+        ),
+        ("compressed", compressed_lz4(&vec![b'z'; 70_000])),
+        (
+            "sym",
+            mkfs::Node::Symlink {
+                mode: mkfs::DEFAULT_SYMLINK_MODE,
+                target: "big".to_string(),
+                meta: mkfs::NodeMeta::default(),
+                xattrs: vec![label()],
+            },
+        ),
+        (
+            "chunked",
+            mkfs::Node::ChunkedFile {
+                mode: mkfs::DEFAULT_FILE_MODE,
+                chunk_bits: 0,
+                chunks: vec![Some(vec![1u8; 4096]), None, Some(vec![2u8; 100])],
+                use_indexed_format: false,
+                meta: mkfs::NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+        ),
+        ("sub", dir(vec![("deep", streamed(big[..5000].to_vec()))])),
+    ]);
+    let options = mkfs::BuildOptions {
+        share_xattrs: true,
+        build_time: 1_230_768_000,
+        mtime_is_build_time: true,
+        ..mkfs::BuildOptions::default()
+    };
+    let mut sink = std::io::Cursor::new(Vec::new());
+    mkfs::build_image_to(tree, 12, options, &mut sink).unwrap();
+    let (path, _guard) = stage_image(&sink.into_inner());
+    let (code, stdout, stderr) = run_fsck(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}

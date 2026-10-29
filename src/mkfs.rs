@@ -52,6 +52,7 @@ use crate::zmap::{
     Z_EROFS_LEGACY_MAP_HEADER_SIZE,
 };
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, Write};
 
 // --- public API --------------------------------------------------------
 
@@ -135,6 +136,88 @@ pub enum Node {
     /// name. The target must not be a directory or another link -- a
     /// tar link entry names the file it links to, never a link.
     HardLink { target: String },
+    /// A regular file whose bytes come from a reader, opened when the
+    /// writer reaches it and read once, straight into the image. Laid out
+    /// exactly as a [`Node::File`] holding the same bytes would be.
+    StreamedFile {
+        mode: u16,
+        content: Content,
+        meta: NodeMeta,
+        xattrs: Vec<XattrSpec>,
+    },
+}
+
+/// A regular file's content: its size, known up front, and a way to open
+/// a reader over it.
+///
+/// The writer calls `open` once, when it reaches the file, and reads
+/// exactly `size` bytes; a reader that ends early, or has more to give,
+/// fails the build rather than writing a file of the wrong length. The
+/// file's bytes go to the image as they are read, so content opened
+/// lazily -- from another image, or a file on disk -- is never all in
+/// memory at once.
+pub struct Content {
+    size: u64,
+    open: Box<dyn FnOnce() -> std::io::Result<Box<dyn Read + Send>> + Send>,
+}
+
+impl Content {
+    /// Content of `size` bytes, read from what `open` returns.
+    pub fn new<R, F>(size: u64, open: F) -> Self
+    where
+        R: Read + Send + 'static,
+        F: FnOnce() -> std::io::Result<R> + Send + 'static,
+    {
+        Self {
+            size,
+            open: Box::new(move || open().map(|r| Box::new(r) as Box<dyn Read + Send>)),
+        }
+    }
+
+    /// Content already in memory.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        let size = bytes.len() as u64;
+        Self::new(size, move || Ok(std::io::Cursor::new(bytes)))
+    }
+
+    /// The content's length in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Every byte, in memory. Refuses content that is not exactly
+    /// `size` bytes long.
+    fn read_all(self) -> Result<Vec<u8>> {
+        let size = self.size;
+        let mut reader = (self.open)().map_err(io_error)?;
+        let len = usize::try_from(size).map_err(|_| Error::BadInode("file content too large"))?;
+        let mut bytes = vec![0u8; len];
+        reader.read_exact(&mut bytes).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                Error::BadInode("file content is shorter than its size")
+            } else {
+                io_error(e)
+            }
+        })?;
+        if reader.read(&mut [0u8; 1]).map_err(io_error)? != 0 {
+            return Err(Error::BadInode("file content is longer than its size"));
+        }
+        Ok(bytes)
+    }
+}
+
+impl std::fmt::Debug for Content {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Content")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An I/O error from a content reader or the image sink, as this crate's
+/// error.
+fn io_error(e: std::io::Error) -> Error {
+    Error::Block(fs_core::Error::Io(e))
 }
 
 /// Compression algorithm selector for [`Node::CompressedFile`].
@@ -403,6 +486,22 @@ pub fn build_image(root: Node, blkszbits: u8) -> Result<Vec<u8>> {
 /// blob immediately after the 128-byte SB, sets
 /// `EROFS_FEATURE_INCOMPAT_COMPR_CFGS`, and advertises the included
 /// codecs in the SB's `available_compr_algs` (`u1`) field.
+/// Build an EROFS image into `sink`, and return its length in bytes.
+///
+/// The sink is written from its start; anything already past the
+/// image's end is left as it was.
+pub fn build_image_to<W: Write + Seek>(
+    root: Node,
+    blkszbits: u8,
+    options: BuildOptions,
+    sink: &mut W,
+) -> Result<u64> {
+    let image = build_image_with(root, blkszbits, options)?;
+    sink.rewind().map_err(io_error)?;
+    sink.write_all(&image).map_err(io_error)?;
+    Ok(image.len() as u64)
+}
+
 pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Result<Vec<u8>> {
     if !crate::superblock::is_valid_blkszbits(blkszbits) {
         return Err(Error::BadSuperblock("blkszbits out of range"));
@@ -2001,6 +2100,23 @@ fn flatten(
             };
         }
         Node::HardLink { .. } => return Err(Error::BadInode("the root is a hard link")),
+        Node::StreamedFile {
+            mode,
+            content,
+            meta,
+            xattrs,
+        } => {
+            if (mode & 0xF000) != S_IFREG {
+                return Err(Error::BadInode("StreamedFile mode missing S_IFREG"));
+            }
+            plan[idx as usize].mode = mode;
+            plan[idx as usize].meta = meta;
+            plan[idx as usize].xattrs = xattrs;
+            plan[idx as usize].kind = PlanKind::File {
+                data: content.read_all()?,
+                layout: FileLayout::FlatPlain,
+            };
+        }
     }
     Ok(idx)
 }
