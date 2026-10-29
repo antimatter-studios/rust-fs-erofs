@@ -2419,23 +2419,19 @@ fn plan_body(
             }
         };
 
-        // Header byte size: legacy = 16 (8 struct + 8 reserved gap);
-        // compact = 8 + alignment-up to 8 from body_end. The reader
-        // reads the 8-byte header from `body_end` directly and rounds
-        // ebase up to 8. Our writer mirrors that: at write time we
-        // place the header at `meta_cursor`, then advance to the next
-        // 8-aligned offset relative to body_end (== align body_end +
-        // 8, the header end, up to 8 — the header is 8 bytes so this
-        // means an extra 0-or-4 bytes of padding before the index).
-        let header_plus_pad = match *index_format {
-            CompressedIndexFormat::Legacy => Z_EROFS_LEGACY_MAP_HEADER_SIZE,
-            CompressedIndexFormat::Compacted2B => {
-                // compact_header (8) + pad to 8-align body_end. body_end
-                // mod 8 = body_end_mod_32 % 8.
-                let pad_before_index = (8 - (body_end_mod_32 % 8)) % 8;
-                Z_EROFS_COMPACT_MAP_HEADER_SIZE + pad_before_index
-            }
-        };
+        // Header byte size, with the padding in front of it: the header
+        // sits at the first 8-byte boundary after body_end, where the
+        // kernel reads it (`ALIGN(iloc + inode_isize + xattr_isize,
+        // 8)`), so an xattr area that ends 4 bytes past a boundary is
+        // followed by 4 bytes of zeros. Then legacy = 16 (8 struct + 8
+        // reserved gap) and compact = 8. body_end mod 8 =
+        // body_end_mod_32 % 8.
+        let pad_before_header = (8 - (body_end_mod_32 % 8)) % 8;
+        let header_plus_pad = pad_before_header
+            + match *index_format {
+                CompressedIndexFormat::Legacy => Z_EROFS_LEGACY_MAP_HEADER_SIZE,
+                CompressedIndexFormat::Compacted2B => Z_EROFS_COMPACT_MAP_HEADER_SIZE,
+            };
 
         // Decide ztailpacking: inline the LAST PCLUSTER's compressed
         // bytes if requested AND there's enough room left in the
@@ -3044,7 +3040,9 @@ fn encode_zmap_trailer(n: &PlanNode, addrs: &[u32], body_end: u64, blkszbits: u8
                 let frag_or_idata = (idata_size as u32) << 16;
                 header[0x00..0x04].copy_from_slice(&frag_or_idata.to_le_bytes());
             }
-            let mut out = Vec::with_capacity(
+            // Zeros up to the 8-byte boundary the header sits on.
+            let mut out = vec![0u8; ((8 - (body_end % 8)) % 8) as usize];
+            out.reserve(
                 Z_EROFS_LEGACY_MAP_HEADER_SIZE as usize
                     + lcluster_entries.len() * Z_EROFS_LCLUSTER_INDEX_SIZE as usize
                     + idata_size as usize,
@@ -3133,14 +3131,14 @@ fn encode_zmap_trailer(n: &PlanNode, addrs: &[u32], body_end: u64, blkszbits: u8
             // and ebase = ALIGN(body_end, 8) + 8. So the padding is
             // (8 - body_end % 8) mod 8 bytes, inserted BETWEEN the
             // 8-byte header and the index area.
-            let pad_before_index = ((8 - (body_end % 8)) % 8) as usize;
+            // Zeros up to the 8-byte boundary the header sits on.
+            let pad_before_header = ((8 - (body_end % 8)) % 8) as usize;
 
             let index_bytes = encode_compact2b_index(&geom, &entries, lobits);
 
-            let mut out =
-                Vec::with_capacity(8 + pad_before_index + index_bytes.len() + idata_size as usize);
+            let mut out = vec![0u8; pad_before_header];
+            out.reserve(8 + index_bytes.len() + idata_size as usize);
             out.extend_from_slice(&header);
-            out.resize(out.len() + pad_before_index, 0u8);
             out.extend_from_slice(&index_bytes);
             if let Some(t) = ztailpacking_inline {
                 out.extend_from_slice(&t.bytes);
