@@ -418,6 +418,11 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     plan[0].parent_idx = 0;
     resolve_hard_links(&mut plan, links)?;
     let nlinks = link_counts(&plan);
+    let shared = if options.share_xattrs {
+        share_repeated_xattrs(&mut plan)?
+    } else {
+        SharedXattrs::none(plan.len())
+    };
     if options.mtime_is_build_time {
         for node in &mut plan {
             node.meta.mtime = options.build_time;
@@ -464,8 +469,8 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         });
 
     let mut bodies: Vec<InodeBody> = Vec::with_capacity(plan.len());
-    for (node, &nlink) in plan.iter_mut().zip(&nlinks) {
-        let body = plan_body(node, nlink, bs, lzma_dict_size_override, &options)?;
+    for ((node, &nlink), refs) in plan.iter_mut().zip(&nlinks).zip(&shared.refs) {
+        let body = plan_body(node, nlink, refs, bs, lzma_dict_size_override, &options)?;
         bodies.push(body);
     }
 
@@ -497,6 +502,16 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     let mut dir_block_for_nid: BTreeMap<u64, u64> = BTreeMap::new();
     let mut dir_size_for_nid: BTreeMap<u64, u64> = BTreeMap::new();
     let mut next_data_block = data_area_start;
+    // The shared xattr area leads the data area: it is addressed by
+    // block, and its entries by 4-byte offsets into it.
+    let xattr_blkaddr: u32 = if shared.area.is_empty() {
+        0
+    } else {
+        let at = u32::try_from(next_data_block)
+            .map_err(|_| Error::BadSuperblock("xattr_blkaddr overflow"))?;
+        next_data_block += (shared.area.len() as u64).div_ceil(bs);
+        at
+    };
     for (i, n) in plan.iter().enumerate() {
         if let PlanKind::Dir { children } = &n.kind {
             let blocks = encode_dir_blocks(i, children, &plan, &nids, bs)?;
@@ -762,8 +777,13 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         sb_u1,
         xattr_prefix_count,
         xattr_prefix_start_div4,
+        xattr_blkaddr,
         &options,
     );
+    if xattr_blkaddr != 0 {
+        let off = xattr_blkaddr as usize * bs as usize;
+        img[off..off + shared.area.len()].copy_from_slice(&shared.area);
+    }
 
     // Inodes + their inline trailers. Every address here comes out of
     // the pass-2 layout, so an inode's bytes land at exactly the address
@@ -2066,11 +2086,12 @@ fn link_counts(plan: &[PlanNode]) -> Vec<u32> {
 fn plan_body(
     n: &mut PlanNode,
     nlink: u32,
+    shared_xattrs: &[u32],
     bs: u64,
     lzma_dict_size_override: Option<u32>,
     options: &BuildOptions,
 ) -> Result<InodeBody> {
-    let (xattr_bytes, xattr_icount) = encode_inline_xattrs(&n.xattrs)?;
+    let (xattr_bytes, xattr_icount) = encode_inline_xattrs(&n.xattrs, shared_xattrs)?;
 
     // Compute the file-size field that ends up in i_size. For dirs the
     // size depends on dir-block count and is filled in later (we report
@@ -2317,30 +2338,99 @@ fn total_chunked_size(chunks: &[Option<Vec<u8>>], chunk_bits: u8, bs: u64) -> Re
 ///
 /// Spec: `linux/fs/erofs/xattr.h::erofs_xattr_ibody_size()`. Independent
 /// implementation.
-fn encode_inline_xattrs(xattrs: &[XattrSpec]) -> Result<(Vec<u8>, u16)> {
-    if xattrs.is_empty() {
+/// The shared xattr area and, by plan index, the references each inode
+/// holds into it.
+struct SharedXattrs {
+    /// The entries, each 4-byte aligned, as they sit at `xattr_blkaddr`.
+    area: Vec<u8>,
+    /// Each inode's shared references: an entry's byte offset into
+    /// `area`, divided by 4.
+    refs: Vec<Vec<u32>>,
+}
+
+impl SharedXattrs {
+    fn none(inodes: usize) -> Self {
+        Self {
+            area: Vec::new(),
+            refs: vec![Vec::new(); inodes],
+        }
+    }
+}
+
+/// Move every xattr that two or more inodes carry into the shared area,
+/// leaving each inode the ones only it has. Entries are placed in the
+/// order the plan first meets them, so the same tree gives the same area.
+fn share_repeated_xattrs(plan: &mut [PlanNode]) -> Result<SharedXattrs> {
+    type Key = (u8, Vec<u8>, Vec<u8>);
+    let key = |x: &XattrSpec| -> Key { (x.name_index, x.name.clone(), x.value.clone()) };
+    let mut seen: BTreeMap<Key, (u32, Option<u32>)> = BTreeMap::new();
+    for node in plan.iter() {
+        for x in &node.xattrs {
+            seen.entry(key(x)).or_insert((0, None)).0 += 1;
+        }
+    }
+    let mut shared = SharedXattrs::none(plan.len());
+    for (node, refs) in plan.iter_mut().zip(&mut shared.refs) {
+        let mut inline = Vec::new();
+        for x in std::mem::take(&mut node.xattrs) {
+            let (count, id) = seen.get_mut(&key(&x)).expect("counted above");
+            if *count < 2 {
+                inline.push(x);
+                continue;
+            }
+            let id = match id {
+                Some(id) => *id,
+                None => {
+                    let at = u32::try_from(shared.area.len() / XATTR_ENTRY_ALIGN as usize)
+                        .map_err(|_| Error::BadXattr("shared xattr area too large"))?;
+                    push_xattr_entry(&mut shared.area, &x)?;
+                    *id = Some(at);
+                    at
+                }
+            };
+            refs.push(id);
+        }
+        node.xattrs = inline;
+    }
+    Ok(shared)
+}
+
+/// Append one `erofs_xattr_entry` -- name length, namespace index, value
+/// size, name, value -- padded to the 4-byte entry alignment. The inline
+/// area and the shared area hold entries in the same form.
+fn push_xattr_entry(buf: &mut Vec<u8>, x: &XattrSpec) -> Result<()> {
+    if x.name.len() > u8::MAX as usize {
+        return Err(Error::BadXattr("xattr name length > 255"));
+    }
+    if x.value.len() > u16::MAX as usize {
+        return Err(Error::BadXattr("xattr value length > 65535"));
+    }
+    buf.push(x.name.len() as u8);
+    buf.push(x.name_index);
+    buf.extend_from_slice(&(x.value.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&x.name);
+    buf.extend_from_slice(&x.value);
+    while !(buf.len() as u64).is_multiple_of(XATTR_ENTRY_ALIGN) {
+        buf.push(0);
+    }
+    Ok(())
+}
+
+fn encode_inline_xattrs(xattrs: &[XattrSpec], shared: &[u32]) -> Result<(Vec<u8>, u16)> {
+    if xattrs.is_empty() && shared.is_empty() {
         return Ok((Vec::new(), 0));
     }
     // 12-byte erofs_xattr_ibody_header: 4-byte name_filter (zero --
-    // unused hash filter) + 1-byte h_shared_count + 7 bytes reserved.
+    // unused hash filter) + 1-byte h_shared_count + 7 bytes reserved,
+    // then the shared references, then the inline entries.
     let mut buf = vec![0u8; XATTR_HEADER_SIZE];
-    buf[4] = 0; // h_shared_count: no shared xattrs from the writer.
-
+    buf[4] = u8::try_from(shared.len())
+        .map_err(|_| Error::BadXattr("more than 255 shared xattrs on one inode"))?;
+    for id in shared {
+        buf.extend_from_slice(&id.to_le_bytes());
+    }
     for x in xattrs {
-        if x.name.len() > u8::MAX as usize {
-            return Err(Error::BadXattr("xattr name length > 255"));
-        }
-        if x.value.len() > u16::MAX as usize {
-            return Err(Error::BadXattr("xattr value length > 65535"));
-        }
-        buf.push(x.name.len() as u8);
-        buf.push(x.name_index);
-        buf.extend_from_slice(&(x.value.len() as u16).to_le_bytes());
-        buf.extend_from_slice(&x.name);
-        buf.extend_from_slice(&x.value);
-        while !(buf.len() as u64).is_multiple_of(XATTR_ENTRY_ALIGN) {
-            buf.push(0);
-        }
+        push_xattr_entry(&mut buf, x)?;
     }
     debug_assert_eq!((buf.len() - XATTR_HEADER_SIZE) % 4, 0);
     let icount_minus_one = (buf.len() - XATTR_HEADER_SIZE) / 4;
@@ -2361,6 +2451,7 @@ fn write_superblock(
     u1: u16,
     xattr_prefix_count: u8,
     xattr_prefix_start: u32,
+    xattr_blkaddr: u32,
     options: &BuildOptions,
 ) {
     // Every field below is placed through `superblock::offsets`, the
@@ -2377,6 +2468,7 @@ fn write_superblock(
     put(img, sb::INOS, &n_inodes.to_le_bytes());
     put(img, sb::BLOCKS, &total_blocks.to_le_bytes());
     put(img, sb::META_BLKADDR, &meta_blkaddr.to_le_bytes());
+    put(img, sb::XATTR_BLKADDR, &xattr_blkaddr.to_le_bytes());
     put(img, sb::BUILD_TIME, &options.build_time.to_le_bytes());
     put(
         img,
