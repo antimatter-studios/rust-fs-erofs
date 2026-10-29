@@ -297,6 +297,22 @@ pub struct BuildOptions {
     /// `EROFS_FEATURE_INCOMPAT_COMPR_CFGS` bit. Reader decoders consult
     /// this for non-default codec props (today: LZMA `dict_size`).
     pub compr_cfgs: Option<ComprCfgsConfig>,
+
+    /// The superblock's 16-byte volume UUID. All zeros by default, which
+    /// tools read as "no UUID".
+    pub uuid: [u8; 16],
+
+    /// The superblock's `build_time`, in seconds since the epoch, and
+    /// its nanoseconds. A compact inode has no mtime of its own and
+    /// reads as this, so an inode whose mtime equals it stays compact.
+    pub build_time: u64,
+    pub build_time_nsec: u32,
+
+    /// When `true`, every inode's mtime is `build_time` whatever its
+    /// [`NodeMeta`] says -- what `mkfs.erofs -T` does. With a fixed
+    /// `build_time` the same tree then builds to the same bytes, and
+    /// every inode that needs nothing wider is compact.
+    pub mtime_is_build_time: bool,
 }
 
 /// Per-codec configuration to surface in the COMPR_CFGS blob.
@@ -4208,6 +4224,118 @@ mod tests {
         assert!(
             block_aligned >= 2,
             "fixture no longer forces metadata-block skips ({block_aligned} aligned inodes)"
+        );
+    }
+
+    fn with_mtime(node: Node, mtime: u64) -> Node {
+        let meta = NodeMeta {
+            mtime,
+            ..NodeMeta::default()
+        };
+        match node {
+            Node::File {
+                mode, data, xattrs, ..
+            } => Node::File {
+                mode,
+                data,
+                meta,
+                xattrs,
+            },
+            Node::Dir {
+                mode,
+                entries,
+                xattrs,
+                ..
+            } => Node::Dir {
+                mode,
+                entries,
+                meta,
+                xattrs,
+            },
+            other => other,
+        }
+    }
+
+    const EPOCH: u64 = 1_230_768_000;
+
+    #[test]
+    fn the_superblock_carries_the_requested_uuid_and_build_time() {
+        let uuid = *b"\x01\x23\x45\x67\x89\xab\xcd\xef\xfe\xdc\xba\x98\x76\x54\x32\x10";
+        let options = BuildOptions {
+            uuid,
+            build_time: EPOCH,
+            build_time_nsec: 7,
+            ..BuildOptions::default()
+        };
+        let fs = open(build_image_with(dir(vec![]), 12, options).unwrap());
+        let sb = fs.superblock();
+        assert_eq!(sb.uuid, uuid);
+        assert_eq!(sb.build_time, EPOCH);
+        assert_eq!(sb.build_time_nsec, 7);
+    }
+
+    /// `-T`: every inode takes the build time as its mtime, whatever the
+    /// tree said, and so every one of them fits a compact inode.
+    #[test]
+    fn mtime_is_build_time_makes_every_inode_compact_with_that_mtime() {
+        let options = BuildOptions {
+            build_time: EPOCH,
+            mtime_is_build_time: true,
+            ..BuildOptions::default()
+        };
+        let tree = with_mtime(
+            dir(vec![
+                ("a", with_mtime(file(b"one"), 5)),
+                ("sub", with_mtime(dir(vec![("b", file(&[7u8; 9000]))]), 6)),
+            ]),
+            4,
+        );
+        let fs = open(build_image_with(tree, 12, options).unwrap());
+        for path in ["/", "/a", "/sub", "/sub/b"] {
+            let inode = fs.lookup_path(path).unwrap();
+            assert_eq!(inode.on_disk_size as u64, COMPACT_INODE_SIZE, "{path}");
+            assert_eq!(inode.mtime, EPOCH, "{path} mtime");
+        }
+    }
+
+    /// A compact inode's mtime is the superblock's build time: an inode
+    /// whose own mtime matches it needs no extended body to say so.
+    #[test]
+    fn an_mtime_equal_to_the_build_time_is_written_compact() {
+        let options = BuildOptions {
+            build_time: EPOCH,
+            ..BuildOptions::default()
+        };
+        let tree = dir(vec![
+            ("same", with_mtime(file(b"x"), EPOCH)),
+            ("other", with_mtime(file(b"y"), EPOCH + 1)),
+        ]);
+        let fs = open(build_image_with(tree, 12, options).unwrap());
+        let same = fs.lookup_path("/same").unwrap();
+        assert_eq!(same.on_disk_size as u64, COMPACT_INODE_SIZE);
+        assert_eq!(same.mtime, EPOCH);
+        let other = fs.lookup_path("/other").unwrap();
+        assert_eq!(other.on_disk_size as u64, EXTENDED_INODE_SIZE);
+        assert_eq!(other.mtime, EPOCH + 1);
+    }
+
+    #[test]
+    fn the_same_tree_and_options_build_the_same_bytes() {
+        let options = || BuildOptions {
+            uuid: [9; 16],
+            build_time: EPOCH,
+            mtime_is_build_time: true,
+            ..BuildOptions::default()
+        };
+        let tree = || {
+            dir(vec![
+                ("a", file(b"one")),
+                ("sub", dir(vec![("b", file(&[7u8; 9000]))])),
+            ])
+        };
+        assert_eq!(
+            build_image_with(tree(), 12, options()).unwrap(),
+            build_image_with(tree(), 12, options()).unwrap()
         );
     }
 }
