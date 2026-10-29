@@ -406,8 +406,11 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     // chunkmap). Mutates the tree in place to record FlatInline vs FlatPlain
     // file layout.
     let mut plan: Vec<PlanNode> = Vec::new();
-    flatten(root, 0, &mut plan)?;
+    let mut links: Vec<PendingLink> = Vec::new();
+    flatten(root, 0, &mut plan, &mut links)?;
     plan[0].parent_idx = 0;
+    resolve_hard_links(&mut plan, links)?;
+    let nlinks = link_counts(&plan);
     if options.mtime_is_build_time {
         for node in &mut plan {
             node.meta.mtime = options.build_time;
@@ -454,8 +457,8 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         });
 
     let mut bodies: Vec<InodeBody> = Vec::with_capacity(plan.len());
-    for node in &mut plan {
-        let body = plan_body(node, bs, lzma_dict_size_override, &options)?;
+    for (node, &nlink) in plan.iter_mut().zip(&nlinks) {
+        let body = plan_body(node, nlink, bs, lzma_dict_size_override, &options)?;
         bodies.push(body);
     }
 
@@ -768,8 +771,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
             i,
             nid,
             body,
-            &nids,
-            &plan,
+            &nlinks,
             &dir_size_for_nid,
             &dir_block_for_nid,
             &data_block_for_nid,
@@ -1805,7 +1807,21 @@ fn plan_meta_layout(bodies: &[InodeBody], bs: u64) -> Vec<MetaSlot> {
     slots
 }
 
-fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64> {
+/// A [`Node::HardLink`] met while flattening: the directory it sits in,
+/// its name there, and the path it names. Resolved once the whole tree is
+/// in the plan, since the target may come later in the walk.
+struct PendingLink {
+    dir_idx: u64,
+    name: String,
+    target: String,
+}
+
+fn flatten(
+    node: Node,
+    parent_idx: u64,
+    plan: &mut Vec<PlanNode>,
+    links: &mut Vec<PendingLink>,
+) -> Result<u64> {
     let idx = plan.len() as u64;
     plan.push(PlanNode {
         parent_idx,
@@ -1849,7 +1865,15 @@ fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64>
                 if name.len() > u16::MAX as usize {
                     return Err(Error::BadDirent("name length > 65535"));
                 }
-                let child_idx = flatten(child, idx, plan)?;
+                if let Node::HardLink { target } = child {
+                    links.push(PendingLink {
+                        dir_idx: idx,
+                        name,
+                        target,
+                    });
+                    continue;
+                }
+                let child_idx = flatten(child, idx, plan, links)?;
                 children.push((name, child_idx));
             }
             plan[idx as usize].mode = mode;
@@ -1949,9 +1973,79 @@ fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64>
                 target_pcluster_blocks: spec.target_pcluster_blocks,
             };
         }
-        Node::HardLink { .. } => return Err(Error::BadInode("hard links are not supported")),
+        Node::HardLink { .. } => return Err(Error::BadInode("the root is a hard link")),
     }
     Ok(idx)
+}
+
+/// Give every [`PendingLink`] its directory entry, naming the plan node
+/// its target path reaches from the root. Links are not in any
+/// directory's children yet, so a link to a link finds nothing and is
+/// refused, as is a link to a directory, which would give the tree a
+/// cycle and the directory a second parent.
+fn resolve_hard_links(plan: &mut [PlanNode], links: Vec<PendingLink>) -> Result<()> {
+    let mut resolved = Vec::with_capacity(links.len());
+    for link in &links {
+        let mut idx = 0usize;
+        for component in link.target.split('/').filter(|c| !c.is_empty()) {
+            let PlanKind::Dir { children } = &plan[idx].kind else {
+                return Err(Error::BadInode(
+                    "hard link target runs through a non-directory",
+                ));
+            };
+            // `children` is in `BTreeMap` order, which is byte order.
+            let at = children
+                .binary_search_by(|(name, _)| name.as_bytes().cmp(component.as_bytes()))
+                .map_err(|_| Error::BadInode("hard link target not found"))?;
+            idx = children[at].1 as usize;
+        }
+        if let PlanKind::Dir { .. } = plan[idx].kind {
+            return Err(Error::BadInode("hard link target is a directory"));
+        }
+        resolved.push(idx as u64);
+    }
+    for (link, target_idx) in links.into_iter().zip(resolved) {
+        if let PlanKind::Dir { children } = &mut plan[link.dir_idx as usize].kind {
+            children.push((link.name, target_idx));
+        }
+    }
+    Ok(())
+}
+
+/// Every inode's link count, by plan index. A directory has one for
+/// itself, one for its "." and one for each subdirectory's ".."; anything
+/// else has one per directory entry that names it, and at least one, for
+/// a root that is not a directory.
+fn link_counts(plan: &[PlanNode]) -> Vec<u32> {
+    let mut nlinks = vec![0u32; plan.len()];
+    for node in plan {
+        if let PlanKind::Dir { children } = &node.kind {
+            for (_, child_idx) in children {
+                let child = &mut nlinks[*child_idx as usize];
+                *child = child.saturating_add(1);
+            }
+        }
+    }
+    for (count, node) in nlinks.iter_mut().zip(plan) {
+        *count = match &node.kind {
+            // Spec: a directory's nlink = 2 (for "." and "..") + the
+            // number of subdirectories (each subdir's ".." link counts
+            // toward this dir's nlink). Files and other non-directories
+            // among the children do not contribute. This matches the
+            // canonical Unix directory-nlink semantics that `ls -l`
+            // displays.
+            //
+            // Spec source: POSIX `<sys/stat.h>` directory link-count
+            // convention (referenced by the EROFS read-side tools and by
+            // every other Unix filesystem). Independent implementation.
+            PlanKind::Dir { children } => children
+                .iter()
+                .filter(|(_, c)| matches!(plan[*c as usize].kind, PlanKind::Dir { .. }))
+                .fold(2u32, |n, _| n.saturating_add(1)),
+            _ => (*count).max(1),
+        };
+    }
+    nlinks
 }
 
 /// Decide compact-vs-extended, build the inline-xattr blob, FLAT_INLINE
@@ -1964,6 +2058,7 @@ fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64>
 /// LZMA1 header to match. `None` keeps the lzma-rs default (8 MiB).
 fn plan_body(
     n: &mut PlanNode,
+    nlink: u32,
     bs: u64,
     lzma_dict_size_override: Option<u32>,
     options: &BuildOptions,
@@ -1986,6 +2081,7 @@ fn plan_body(
     };
 
     let is_extended = size > u32::MAX as u64
+        || nlink > u16::MAX as u32
         || n.meta.uid > u16::MAX as u32
         || n.meta.gid > u16::MAX as u32
         // A compact inode has no mtime field: it reads as the
@@ -2333,8 +2429,7 @@ fn encode_inode(
     idx: usize,
     nid: u64,
     body: &InodeBody,
-    nids: &[u64],
-    plan: &[PlanNode],
+    nlinks: &[u32],
     dir_size_for_nid: &BTreeMap<u64, u64>,
     dir_block_for_nid: &BTreeMap<u64, u64>,
     data_block_for_nid: &BTreeMap<u64, u64>,
@@ -2367,7 +2462,7 @@ fn encode_inode(
         PlanKind::Compressed { src, .. } => src.len() as u64,
     };
 
-    let nlink = inode_nlink(n, idx, plan);
+    let nlink = nlinks[idx];
 
     if body.is_extended {
         buf[xi::SIZE].copy_from_slice(&size.to_le_bytes());
@@ -2385,7 +2480,6 @@ fn encode_inode(
         buf[ci::GID].copy_from_slice(&(n.meta.gid as u16).to_le_bytes());
     }
 
-    let _ = nids; // reserved for future: hardlink-aware nlink computation.
     buf
 }
 
@@ -2466,33 +2560,6 @@ fn inode_raw_u(
             total_compressed_blocks,
             ..
         } => *total_compressed_blocks,
-    }
-}
-
-fn inode_nlink(n: &PlanNode, _idx: usize, plan: &[PlanNode]) -> u32 {
-    match &n.kind {
-        // Spec: a directory's nlink = 2 (for "." and "..") + the number
-        // of subdirectories (each subdir's ".." link counts toward this
-        // dir's nlink). Empty dir => nlink == 2; one-subdir dir => 3;
-        // two-subdir dir => 4; etc. Files / non-directories among the
-        // children DO NOT contribute. This matches the canonical Unix
-        // directory-nlink semantics that `ls -l` displays.
-        //
-        // Spec source: POSIX `<sys/stat.h>` directory link-count
-        // convention (referenced by the EROFS read-side tools and by
-        // every other Unix filesystem). Independent implementation.
-        PlanKind::Dir { children } => {
-            let mut nlink: u32 = 2;
-            for (_, child_idx) in children {
-                if let PlanKind::Dir { .. } = &plan[*child_idx as usize].kind {
-                    nlink = nlink.saturating_add(1);
-                }
-            }
-            nlink
-        }
-        // Files/symlinks/specials have nlink=1 (no hardlink dedup
-        // support today; per-Node-distinct-inode policy unchanged).
-        _ => 1,
     }
 }
 
@@ -4397,7 +4464,7 @@ mod tests {
         let fs = open(build_image(tree, 12).unwrap());
         assert_eq!(
             fs.superblock().inos,
-            6,
+            5,
             "root, a, d, d/lone, sym and nothing else"
         );
 
