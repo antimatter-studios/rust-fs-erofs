@@ -412,6 +412,39 @@ pub struct BuildOptions {
     /// of the entry. `mkfs.erofs` shares repeated xattrs the same way; an
     /// SELinux label carried by thousands of inodes costs four bytes each.
     pub share_xattrs: bool,
+
+    /// When `Some`, every regular file -- [`Node::File`] and
+    /// [`Node::StreamedFile`] -- is compressed as `mkfs.erofs
+    /// -zlz4hc,LEVEL -C BYTES` compresses it. `None` stores them as they
+    /// are. [`Node::CompressedFile`] keeps the codec and shape its own
+    /// spec names either way.
+    pub compression: Option<Compression>,
+}
+
+/// How [`BuildOptions::compression`] compresses regular files.
+///
+/// Each physical cluster holds as much of the file as LZ4HC can fit in
+/// `max_pcluster_bytes` -- a big pcluster when that is more than one
+/// block -- and the logical clusters are one block each. A pcluster that
+/// would save no block is stored as it is, one block of the file in one
+/// block of the image; a file where that is true of every pcluster is
+/// stored uncompressed, as a file that was never compressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compression {
+    /// The LZ4HC level, 1..=12, as `-zlz4hc,LEVEL`. 12 is the highest
+    /// ratio LZ4 reaches. Every level writes standard LZ4 blocks.
+    pub lz4hc_level: u8,
+    /// The most compressed bytes one pcluster holds, as `-C`: a
+    /// multiple of the block size, at most 64 blocks.
+    pub max_pcluster_bytes: u32,
+}
+
+impl Compression {
+    /// `-zlz4hc,12 -C 32768`.
+    pub const LZ4HC_12_32K: Compression = Compression {
+        lz4hc_level: 12,
+        max_pcluster_bytes: 32 << 10,
+    };
 }
 
 /// Per-codec configuration to surface in the COMPR_CFGS blob.
