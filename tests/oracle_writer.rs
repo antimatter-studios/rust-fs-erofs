@@ -1078,3 +1078,70 @@ fn fsck_passes_on_every_inode_kind_streamed_into_a_sink() {
         "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
+
+/// A compressed inode whose xattrs end 4 bytes past an 8-byte boundary,
+/// in each index format: the map header belongs at the next boundary,
+/// where `fsck.erofs` and the kernel look for it, and every file must
+/// decompress to what went in.
+#[test]
+fn a_compression_map_after_xattrs_ending_off_8_bytes_is_where_fsck_and_the_kernel_read_it() {
+    use fs_erofs::xattr::ns;
+    use fs_erofs_test_support::{guest_kernel_read, sha256_hex};
+    let data: Vec<u8> = (0..20_000u32)
+        .flat_map(|i| format!("{} ", i % 300).into_bytes())
+        .take(20_000)
+        .collect();
+    let node = |index_format, ztailpacking| {
+        mkfs::Node::CompressedFile(mkfs::CompressedFileSpec {
+            mode: mkfs::DEFAULT_FILE_MODE,
+            data: data.clone(),
+            algo: mkfs::CompressedAlgo::Lz4,
+            lclusterbits: 0,
+            meta: mkfs::NodeMeta::default(),
+            xattrs: vec![mkfs::XattrSpec::new(ns::USER, b"a".to_vec(), b"b".to_vec())],
+            index_format,
+            ztailpacking,
+            target_pcluster_blocks: 1,
+        })
+    };
+    let img = mkfs::build_image(
+        dir(vec![
+            ("legacy", node(mkfs::CompressedIndexFormat::Legacy, false)),
+            (
+                "legacy-tail",
+                node(mkfs::CompressedIndexFormat::Legacy, true),
+            ),
+            (
+                "compact",
+                node(mkfs::CompressedIndexFormat::Compacted2B, false),
+            ),
+            (
+                "compact-tail",
+                node(mkfs::CompressedIndexFormat::Compacted2B, true),
+            ),
+        ]),
+        12,
+    )
+    .unwrap();
+    let (path, _guard) = stage_image(&img);
+    let (code, stdout, stderr) = run_fsck(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let out = guest_kernel_read(path.to_str().unwrap(), r#"cd "$MNT" && sha256sum -- *"#);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let kernel = String::from_utf8(out.stdout).unwrap();
+    let want = sha256_hex(&data);
+    for name in ["legacy", "legacy-tail", "compact", "compact-tail"] {
+        assert!(
+            kernel.lines().any(|l| l == format!("{want}  {name}")),
+            "the kernel read {name} as something else:\n{kernel}"
+        );
+    }
+}
