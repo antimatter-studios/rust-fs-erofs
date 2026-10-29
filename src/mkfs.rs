@@ -129,6 +129,12 @@ pub enum Node {
     /// no BIG_PCLUSTER. Multi-lcluster collation (one frame spanning
     /// many lclusters) is still future work.
     CompressedFile(CompressedFileSpec),
+    /// Another name for a node elsewhere in the tree: a hard link. The
+    /// directory entry names the same inode as `target`, a path from the
+    /// root (`a/b` or `/a/b`), and that inode's `nlink` counts every
+    /// name. The target must not be a directory or another link -- a
+    /// tar link entry names the file it links to, never a link.
+    HardLink { target: String },
 }
 
 /// Compression algorithm selector for [`Node::CompressedFile`].
@@ -1943,6 +1949,7 @@ fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64>
                 target_pcluster_blocks: spec.target_pcluster_blocks,
             };
         }
+        Node::HardLink { .. } => return Err(Error::BadInode("hard links are not supported")),
     }
     Ok(idx)
 }
@@ -4360,5 +4367,92 @@ mod tests {
             build_image_with(tree(), 12, options()).unwrap(),
             build_image_with(tree(), 12, options()).unwrap()
         );
+    }
+
+    fn link(target: &str) -> Node {
+        Node::HardLink {
+            target: target.to_string(),
+        }
+    }
+
+    /// Three names for one file across two directories, and two for a
+    /// symlink: each set is one inode, counted once per name.
+    #[test]
+    fn hard_links_name_one_inode_and_count_every_name() {
+        let tree = dir(vec![
+            ("a", file(b"shared\n")),
+            ("b", link("a")),
+            ("d", dir(vec![("c", link("/a")), ("lone", file(b"x"))])),
+            (
+                "sym",
+                Node::Symlink {
+                    mode: DEFAULT_SYMLINK_MODE,
+                    target: "a".to_string(),
+                    meta: NodeMeta::default(),
+                    xattrs: Vec::new(),
+                },
+            ),
+            ("sym-link", link("sym")),
+        ]);
+        let fs = open(build_image(tree, 12).unwrap());
+        assert_eq!(
+            fs.superblock().inos,
+            6,
+            "root, a, d, d/lone, sym and nothing else"
+        );
+
+        let a = fs.lookup_path("/a").unwrap();
+        for path in ["/b", "/d/c"] {
+            let other = fs.lookup_path(path).unwrap();
+            assert_eq!(other.nid, a.nid, "{path} names a's inode");
+        }
+        assert_eq!(a.nlink, 3);
+        let mut buf = vec![0u8; a.size as usize];
+        fs.read_file(&fs.lookup_path("/d/c").unwrap(), 0, &mut buf)
+            .unwrap();
+        assert_eq!(buf, b"shared\n");
+
+        assert_eq!(fs.lookup_path("/sym").unwrap().nlink, 2);
+        assert_eq!(
+            fs.lookup_path("/sym-link").unwrap().nid,
+            fs.lookup_path("/sym").unwrap().nid
+        );
+        assert_eq!(fs.lookup_path("/d/lone").unwrap().nlink, 1);
+        // A link adds no subdirectory: the root's count is "." , ".." and d.
+        assert_eq!(fs.root_inode().unwrap().nlink, 3);
+    }
+
+    /// A compact inode's link count is 16 bits; one more name than that
+    /// holds needs the extended inode, and must still read back exactly.
+    #[test]
+    fn more_names_than_a_compact_inode_counts_make_it_extended() {
+        let names: Vec<String> = (0..=u16::MAX as u32).map(|i| i.to_string()).collect();
+        let links = dir(names.iter().map(|n| (n.as_str(), link("/f"))).collect());
+        let tree = dir(vec![("f", file(b"many")), ("links", links)]);
+        let fs = open(build_image(tree, 12).unwrap());
+        let f = fs.lookup_path("/f").unwrap();
+        assert_eq!(f.nlink, u16::MAX as u32 + 2);
+        assert_eq!(f.on_disk_size as u64, EXTENDED_INODE_SIZE);
+    }
+
+    #[test]
+    fn a_hard_link_to_nothing_a_directory_or_a_link_is_refused() {
+        for (label, tree) in [
+            ("missing", dir(vec![("b", link("nope"))])),
+            ("directory", dir(vec![("d", dir(vec![])), ("b", link("d"))])),
+            (
+                "link",
+                dir(vec![("a", file(b"x")), ("b", link("a")), ("c", link("b"))]),
+            ),
+            (
+                "through a file",
+                dir(vec![("a", file(b"x")), ("b", link("a/x"))]),
+            ),
+        ] {
+            assert!(
+                matches!(build_image(tree, 12), Err(Error::BadInode(_))),
+                "{label}"
+            );
+        }
     }
 }
