@@ -402,6 +402,12 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     let mut plan: Vec<PlanNode> = Vec::new();
     flatten(root, 0, &mut plan)?;
     plan[0].parent_idx = 0;
+    if options.mtime_is_build_time {
+        for node in &mut plan {
+            node.meta.mtime = options.build_time;
+            node.meta.mtime_nsec = options.build_time_nsec;
+        }
+    }
 
     // Detect which non-LZ4 codecs the tree actually uses. LZ4
     // (algorithmtype 0) is the implicit default and needs no
@@ -443,7 +449,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
 
     let mut bodies: Vec<InodeBody> = Vec::with_capacity(plan.len());
     for node in &mut plan {
-        let body = plan_body(node, bs, lzma_dict_size_override)?;
+        let body = plan_body(node, bs, lzma_dict_size_override, &options)?;
         bodies.push(body);
     }
 
@@ -740,6 +746,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         sb_u1,
         xattr_prefix_count,
         xattr_prefix_start_div4,
+        &options,
     );
 
     // Inodes + their inline trailers. Every address here comes out of
@@ -1948,7 +1955,12 @@ fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64>
 /// planning compressed inodes — it lets the writer advertise a
 /// non-default dict in the COMPR_CFGS blob and patch the in-stream
 /// LZMA1 header to match. `None` keeps the lzma-rs default (8 MiB).
-fn plan_body(n: &mut PlanNode, bs: u64, lzma_dict_size_override: Option<u32>) -> Result<InodeBody> {
+fn plan_body(
+    n: &mut PlanNode,
+    bs: u64,
+    lzma_dict_size_override: Option<u32>,
+    options: &BuildOptions,
+) -> Result<InodeBody> {
     let (xattr_bytes, xattr_icount) = encode_inline_xattrs(&n.xattrs)?;
 
     // Compute the file-size field that ends up in i_size. For dirs the
@@ -1969,8 +1981,11 @@ fn plan_body(n: &mut PlanNode, bs: u64, lzma_dict_size_override: Option<u32>) ->
     let is_extended = size > u32::MAX as u64
         || n.meta.uid > u16::MAX as u32
         || n.meta.gid > u16::MAX as u32
-        || n.meta.mtime != 0
-        || n.meta.mtime_nsec != 0;
+        // A compact inode has no mtime field: it reads as the
+        // superblock's build time, so only a different mtime needs the
+        // extended body.
+        || n.meta.mtime != options.build_time
+        || n.meta.mtime_nsec != options.build_time_nsec;
 
     // FLAT_INLINE for regular files whose entire payload fits in one
     // metadata block AFTER the body+xattrs. The block-fit invariant is
@@ -2236,6 +2251,7 @@ fn write_superblock(
     u1: u16,
     xattr_prefix_count: u8,
     xattr_prefix_start: u32,
+    options: &BuildOptions,
 ) {
     // Every field below is placed through `superblock::offsets`, the
     // same table the parser reads — so a field cannot move on the write
@@ -2251,6 +2267,13 @@ fn write_superblock(
     put(img, sb::INOS, &n_inodes.to_le_bytes());
     put(img, sb::BLOCKS, &total_blocks.to_le_bytes());
     put(img, sb::META_BLKADDR, &meta_blkaddr.to_le_bytes());
+    put(img, sb::BUILD_TIME, &options.build_time.to_le_bytes());
+    put(
+        img,
+        sb::BUILD_TIME_NSEC,
+        &options.build_time_nsec.to_le_bytes(),
+    );
+    put(img, sb::UUID, &options.uuid);
     let label = b"rsmkfs";
     img[off + sb::VOLUME_NAME.start..off + sb::VOLUME_NAME.start + label.len()]
         .copy_from_slice(label);
