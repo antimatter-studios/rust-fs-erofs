@@ -1,13 +1,13 @@
 # rust-fs-erofs
 
-A pure-Rust, clean-room implementation of the **EROFS** (Enhanced Read-Only File System) on-disk format. Reads and writes images that the Linux kernel's EROFS driver and `erofs-utils` toolchain accept byte-for-byte.
+A Rust, clean-room implementation of the **EROFS** (Enhanced Read-Only File System) on-disk format. Reads and writes images that the Linux kernel's EROFS driver and `erofs-utils` toolchain accept byte-for-byte.
 
 The repository ships one library crate (published on crates.io as `rust-fs-erofs`, library name `fs_erofs`) plus its command-line tools: one multi-call binary, `rust-fs-erofs`, also installed as `mkfs.erofs` and `fs.erofs`.
 
 - **Reader**: every EROFS feature emitted by `mkfs.erofs` 1.9 + AOSP build systems
-- **Writer (`mkfs.erofs`)**: produces images `fsck.erofs` accepts as valid
+- **Writer (`mkfs.erofs`)**: produces images `fsck.erofs` accepts as valid, streamed into a `Write + Seek` sink with memory bounded by the tree's metadata, LZ4HC-compressed to within half a percent of `mkfs.erofs -zlz4hc,12 -C 32768`
 - **Cross-platform**: builds + runs on Linux, macOS, Windows
-- **License**: MIT, fully permissive deps tree (no GPL/LGPL anywhere)
+- **License**: MIT, fully permissive deps tree (no GPL/LGPL anywhere). The reader is pure Rust; the builder's LZ4HC is liblz4 itself (BSD-2), built from C by `lz4-sys`, so building the crate needs a C compiler
 
 ## Status
 
@@ -15,8 +15,10 @@ Reads every layout, index and codec erofs-utils writes (LZ4, LZMA, DEFLATE,
 ZSTD), with big, fragmented, interlaced and inline pclusters, deduplicated
 images, multi-device images, extended attributes and ACLs; 48-bit addressing,
 the metabox and any other unknown incompatible bit are refused by name. The
-library builds LZ4, LZMA and DEFLATE images the kernel mounts; the
-`mkfs.erofs` tool builds uncompressed ones. Each is checked against
+library builds LZ4, LZ4HC (into big pclusters), LZMA and DEFLATE images the
+kernel mounts, streaming file content from readers into any `Write + Seek`
+sink, with hard links, shared xattrs and inline tails; the `mkfs.erofs` tool
+builds uncompressed ones. Each is checked against
 `mkfs.erofs`, `fsck.erofs`, `dump.erofs` and the kernel in the harness VM.
 **[docs/features.md](docs/features.md) is the full list**: every feature, its
 state (supported, partial, refused, not supported, upcoming or unobservable),
@@ -124,6 +126,57 @@ for slot in fs.read_device_table()? {
     println!("tag={tag:?} blocks={}", slot.blocks);
 }
 ```
+
+### Building an image
+
+`build_image_to` writes an image into any `Write + Seek` sink. Each file's
+content is a `Content`: its size, and a reader opened once, when the builder
+reaches the file, and read straight into the image. The builder holds the
+tree's metadata in memory -- inodes, xattrs, inline tails, compression
+indexes, directory entries -- and never its file data, and the same tree and
+options build the same bytes.
+
+```rust
+use std::collections::BTreeMap;
+use fs_erofs::mkfs::{self, BuildOptions, Compression, Content, Node, NodeMeta, XattrSpec};
+use fs_erofs::xattr::ns;
+
+let meta = NodeMeta { uid: 0, gid: 2000, ..NodeMeta::default() };
+let label = XattrSpec::new(ns::SECURITY, "selinux", b"u:object_r:system_file:s0\0".to_vec());
+
+let mut bin = BTreeMap::new();
+bin.insert("toybox".to_string(), Node::StreamedFile {
+    mode: 0o100755,
+    // Opened lazily, when the builder reaches this file.
+    content: Content::new(size, || std::fs::File::open("out/toybox")),
+    meta,
+    xattrs: vec![label.clone()],
+});
+// Another name for the same inode; its nlink counts both.
+bin.insert("sh".to_string(), Node::HardLink { target: "/bin/toybox".to_string() });
+bin.insert("ls".to_string(), Node::Symlink {
+    mode: 0o120777, target: "toybox".to_string(), meta, xattrs: vec![label.clone()],
+});
+
+let mut root = BTreeMap::new();
+root.insert("bin".to_string(), Node::Dir { mode: 0o040755, entries: bin, meta, xattrs: vec![label.clone()] });
+let tree = Node::Dir { mode: 0o040755, entries: root, meta, xattrs: vec![label] };
+
+let options = BuildOptions {
+    uuid: *uuid.as_bytes(),                         // -U
+    build_time: 1_230_768_000,                      // -T: the build time ...
+    mtime_is_build_time: true,                      // ... and every inode's mtime
+    share_xattrs: true,                             // each repeated label written once
+    compression: Some(Compression::LZ4HC_12_32K),   // -zlz4hc,12 -C 32768
+    ..BuildOptions::default()
+};
+let mut sink = std::fs::File::create("system.img")?;
+let bytes = mkfs::build_image_to(tree, 12, options, &mut sink)?;  // 12: 4 KiB blocks
+```
+
+`Node::File { data: Vec<u8>, .. }` is the same file with its bytes in
+memory, and `build_image` / `build_image_with` are `build_image_to` writing
+into a `Vec`.
 
 ## Command-line tools
 
