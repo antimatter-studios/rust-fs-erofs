@@ -57,7 +57,7 @@ impl Read for Generated {
     }
 }
 
-fn generated(seed: u64, size: u64) -> Node {
+fn generated(seed: u64, size: u64) -> Node<'static> {
     Node::StreamedFile {
         mode: DEFAULT_FILE_MODE,
         content: Content::new(size, move || {
@@ -71,7 +71,7 @@ fn generated(seed: u64, size: u64) -> Node {
     }
 }
 
-fn directory(entries: BTreeMap<String, Node>) -> Node {
+fn directory(entries: BTreeMap<String, Node<'static>>) -> Node<'static> {
     Node::Dir {
         mode: DEFAULT_DIR_MODE,
         entries,
@@ -86,7 +86,7 @@ const SMALL_FILES: u64 = 10_000;
 /// The bound on the build's peak heap: an eighth of the file data.
 const PEAK_LIMIT: usize = 24 << 20;
 
-fn tree() -> Node {
+fn tree() -> Node<'static> {
     let mut root = BTreeMap::new();
     for d in 0..100u64 {
         let mut entries = BTreeMap::new();

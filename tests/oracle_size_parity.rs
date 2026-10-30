@@ -61,7 +61,7 @@ fn binary(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-fn tree() -> Node {
+fn tree() -> Node<'static> {
     let mut top: Vec<(String, Node)> = Vec::new();
     for d in 0..40u64 {
         let mut entries: Vec<(String, Node)> = Vec::new();
@@ -105,7 +105,7 @@ fn tree() -> Node {
 
 /// `Node` holds its file content by value and is not `Clone`; the
 /// fixtures here are all directories, files and symlinks.
-fn clone(node: &Node) -> Node {
+fn clone(node: &Node<'static>) -> Node<'static> {
     match node {
         Node::Dir {
             mode,

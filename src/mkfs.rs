@@ -64,8 +64,11 @@ use std::io::{Read, Seek, Write};
 /// In-memory representation of a tree to format. `BTreeMap` for
 /// `Dir::entries` so the produced image is deterministic given the same
 /// input.
+///
+/// `'a` is how long the tree's [`Content`] may borrow for: `Node<'static>`
+/// for a tree that owns everything, as every tree did before it had one.
 #[derive(Debug)]
-pub enum Node {
+pub enum Node<'a> {
     File {
         mode: u16,
         data: Vec<u8>,
@@ -74,7 +77,7 @@ pub enum Node {
     },
     Dir {
         mode: u16,
-        entries: BTreeMap<String, Node>,
+        entries: BTreeMap<String, Node<'a>>,
         meta: NodeMeta,
         xattrs: Vec<XattrSpec>,
     },
@@ -146,7 +149,7 @@ pub enum Node {
     /// exactly as a [`Node::File`] holding the same bytes would be.
     StreamedFile {
         mode: u16,
-        content: Content,
+        content: Content<'a>,
         meta: NodeMeta,
         xattrs: Vec<XattrSpec>,
     },
@@ -161,21 +164,25 @@ pub enum Node {
 /// file's bytes go to the image as they are read, so content opened
 /// lazily -- from another image, or a file on disk -- is never all in
 /// memory at once.
-pub struct Content {
+///
+/// The opener and the reader may borrow for `'a` -- a file read out of
+/// another open image, say -- since content is only ever read on the
+/// thread that builds the image.
+pub struct Content<'a> {
     size: u64,
-    open: Box<dyn FnOnce() -> std::io::Result<Box<dyn Read + Send>> + Send>,
+    open: Box<dyn FnOnce() -> std::io::Result<Box<dyn Read + 'a>> + 'a>,
 }
 
-impl Content {
+impl<'a> Content<'a> {
     /// Content of `size` bytes, read from what `open` returns.
     pub fn new<R, F>(size: u64, open: F) -> Self
     where
-        R: Read + Send + 'static,
-        F: FnOnce() -> std::io::Result<R> + Send + 'static,
+        R: Read + 'a,
+        F: FnOnce() -> std::io::Result<R> + 'a,
     {
         Self {
             size,
-            open: Box::new(move || open().map(|r| Box::new(r) as Box<dyn Read + Send>)),
+            open: Box::new(move || open().map(|r| Box::new(r) as Box<dyn Read + 'a>)),
         }
     }
 
@@ -211,7 +218,7 @@ impl Content {
     }
 }
 
-impl std::fmt::Debug for Content {
+impl std::fmt::Debug for Content<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Content")
             .field("size", &self.size)
@@ -548,7 +555,7 @@ pub fn encode_posix_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
 /// Calls [`build_image_with`] with `BuildOptions::default()`. Output is
 /// byte-identical to pre-`BuildOptions` callers — no behaviour change
 /// for tests and consumers that don't supply options.
-pub fn build_image(root: Node, blkszbits: u8) -> Result<Vec<u8>> {
+pub fn build_image(root: Node<'_>, blkszbits: u8) -> Result<Vec<u8>> {
     build_image_with(root, blkszbits, BuildOptions::default())
 }
 
@@ -562,7 +569,7 @@ pub fn build_image(root: Node, blkszbits: u8) -> Result<Vec<u8>> {
 /// blob immediately after the 128-byte SB, sets
 /// `EROFS_FEATURE_INCOMPAT_COMPR_CFGS`, and advertises the included
 /// codecs in the SB's `available_compr_algs` (`u1`) field.
-pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Result<Vec<u8>> {
+pub fn build_image_with(root: Node<'_>, blkszbits: u8, options: BuildOptions) -> Result<Vec<u8>> {
     let mut image = std::io::Cursor::new(Vec::new());
     build_image_to(root, blkszbits, options, &mut image)?;
     Ok(image.into_inner())
@@ -2468,20 +2475,20 @@ fn pad_pcluster_block(
 /// the index in the plan list, NOT a NID -- those aren't assigned until
 /// the second pass. We translate idx->NID via the `nids` map.
 #[derive(Debug)]
-struct PlanNode {
+struct PlanNode<'a> {
     parent_idx: u64,
     mode: u16,
     meta: NodeMeta,
     xattrs: Vec<XattrSpec>,
-    kind: PlanKind,
+    kind: PlanKind<'a>,
 }
 
 #[derive(Debug)]
-enum PlanKind {
+enum PlanKind<'a> {
     File {
         /// Taken when the bytes are read: into the inline tail while
         /// planning, or straight into the data area.
-        content: Option<Content>,
+        content: Option<Content<'a>>,
         size: u64,
         layout: FileLayout,
     },
@@ -2707,10 +2714,10 @@ struct PendingLink {
     target: String,
 }
 
-fn flatten(
-    node: Node,
+fn flatten<'a>(
+    node: Node<'a>,
     parent_idx: u64,
-    plan: &mut Vec<PlanNode>,
+    plan: &mut Vec<PlanNode<'a>>,
     links: &mut Vec<PendingLink>,
 ) -> Result<u64> {
     let idx = plan.len() as u64;
@@ -3894,7 +3901,7 @@ mod tests {
     use fs_core::BlockRead;
     use std::sync::Arc;
 
-    fn dir(entries: Vec<(&str, Node)>) -> Node {
+    fn dir(entries: Vec<(&str, Node<'static>)>) -> Node<'static> {
         let mut m = BTreeMap::new();
         for (k, v) in entries {
             m.insert(k.to_string(), v);
@@ -3906,7 +3913,7 @@ mod tests {
             xattrs: Vec::new(),
         }
     }
-    fn file(data: &[u8]) -> Node {
+    fn file(data: &[u8]) -> Node<'static> {
         Node::File {
             mode: DEFAULT_FILE_MODE,
             data: data.to_vec(),
@@ -4022,7 +4029,7 @@ mod tests {
 
     // --- W2a: LZ4 compressed-file round-trip tests -----------------------
 
-    fn compressed(data: &[u8]) -> Node {
+    fn compressed(data: &[u8]) -> Node<'static> {
         Node::CompressedFile(CompressedFileSpec {
             mode: DEFAULT_FILE_MODE,
             data: data.to_vec(),
@@ -4038,7 +4045,7 @@ mod tests {
 
     /// Helper that builds a [`Node::CompressedFile`] with the modern
     /// compacted-2B index format. Used by the W2b tests below.
-    fn compressed_compacted2b(data: &[u8], ztailpacking: bool) -> Node {
+    fn compressed_compacted2b(data: &[u8], ztailpacking: bool) -> Node<'static> {
         Node::CompressedFile(CompressedFileSpec {
             mode: DEFAULT_FILE_MODE,
             data: data.to_vec(),
@@ -4331,7 +4338,7 @@ mod tests {
 
     /// Helper: compressed-file Node with the requested codec, legacy
     /// index format, default lclusterbits.
-    fn compressed_with(algo: CompressedAlgo, data: &[u8]) -> Node {
+    fn compressed_with(algo: CompressedAlgo, data: &[u8]) -> Node<'static> {
         Node::CompressedFile(CompressedFileSpec {
             mode: DEFAULT_FILE_MODE,
             data: data.to_vec(),
@@ -4481,7 +4488,7 @@ mod tests {
         data: &[u8],
         target_pcluster_blocks: u32,
         index_format: CompressedIndexFormat,
-    ) -> Node {
+    ) -> Node<'static> {
         Node::CompressedFile(CompressedFileSpec {
             mode: DEFAULT_FILE_MODE,
             data: data.to_vec(),
@@ -5312,7 +5319,7 @@ mod tests {
         );
     }
 
-    fn with_mtime(node: Node, mtime: u64) -> Node {
+    fn with_mtime(node: Node<'static>, mtime: u64) -> Node<'static> {
         let meta = NodeMeta {
             mtime,
             ..NodeMeta::default()
@@ -5424,7 +5431,7 @@ mod tests {
         );
     }
 
-    fn link(target: &str) -> Node {
+    fn link(target: &str) -> Node<'static> {
         Node::HardLink {
             target: target.to_string(),
         }
@@ -5511,7 +5518,7 @@ mod tests {
         }
     }
 
-    fn file_with_xattrs(data: &[u8], xattrs: Vec<XattrSpec>) -> Node {
+    fn file_with_xattrs(data: &[u8], xattrs: Vec<XattrSpec>) -> Node<'static> {
         Node::File {
             mode: DEFAULT_FILE_MODE,
             data: data.to_vec(),

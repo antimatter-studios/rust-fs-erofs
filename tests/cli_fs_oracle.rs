@@ -22,7 +22,7 @@ use fs_erofs_test_support::oracle;
 
 /// The source: every size boundary a 4 KiB block has, a MiB of noise, a
 /// long name, deep nesting, a directory that spans blocks, and symlinks.
-fn source() -> (fs_erofs::mkfs::Node, Vec<(String, Vec<u8>)>) {
+fn source() -> (fs_erofs::mkfs::Node<'static>, Vec<(String, Vec<u8>)>) {
     let long = "n".repeat(255);
     let mut files: Vec<(String, Vec<u8>)> = vec![
         ("empty".into(), Vec::new()),
