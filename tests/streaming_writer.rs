@@ -159,7 +159,8 @@ fn the_metadata_area_follows_the_file_data() {
     let img = mkfs::build_image(dir(vec![("big", file(&pattern(300_001, 3)))]), 12).unwrap();
     let fs = open_image(img);
     let big = fs.lookup_path("/big").unwrap();
-    let data_blocks = big.size.div_ceil(4096) as u32;
+    // Its whole blocks; the last partial one is inline, after the inode.
+    let data_blocks = (big.size / 4096) as u32;
     assert_eq!(
         big.raw_u, 1,
         "the data starts at the first block after the superblock"

@@ -424,28 +424,32 @@ fn dir_open_on_the_empty_path_lists_the_root() {
 
 #[test]
 fn dir_open_reports_a_corrupt_directory_as_eio() {
-    // Scribble over the root's dirent block so `read_dir` fails after
+    // Scribble over the root's first dirent so `read_dir` fails after
     // the inode itself parsed fine. A structurally broken directory is
     // neither "missing" nor "not a directory" -- it is a damaged
     // volume, which is the EIO bucket.
     let mut bytes = capi_fixture_image();
-    let root_data_off = {
+    let first_dirent = {
         let fs = common::open_image(bytes.clone());
         let root = fs.root_inode().unwrap();
-        // Dirent block 0: `nameoff` of the first entry lives at byte 8
-        // of the block. Point it past the end of the block to force
-        // `BadDirent` rather than a plausible-looking listing.
-        fs_erofs::inode::Inode::iloc(fs.superblock(), root.nid) as usize
+        let bs = fs.superblock().block_size();
+        // The root's entries are in its first block, or after the inode
+        // when that one block is inline.
+        if root.format.layout == fs_erofs::DataLayout::FlatInline && root.size < bs {
+            root.body_end(fs.superblock()) as usize
+        } else {
+            (root.raw_u as u64 * bs) as usize
+        }
     };
-    // Corrupt the root inode's raw_u (data pointer, inode offset 0x10)
-    // so its dirent blocks resolve to garbage well past the image end.
-    bytes[root_data_off + 0x10..root_data_off + 0x14]
-        .copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+    // `nameoff` of the first entry, at byte 8 of the dirent: point it past
+    // the end of the block to force `BadDirent` rather than a
+    // plausible-looking listing.
+    bytes[first_dirent + 8..first_dirent + 10].copy_from_slice(&0xFFFFu16.to_le_bytes());
     let img = temp_image(&bytes);
     let fs = unsafe { fs_erofs_mount(img.path.as_ptr()) };
     assert!(!fs.is_null(), "{}", capi_last_error());
     let iter = open_dir(fs, "/");
-    assert!(iter.is_null(), "a directory pointing off-image must fail");
+    assert!(iter.is_null(), "a damaged directory must fail");
     assert_eq!(fs_erofs_last_errno(), EIO);
     assert!(!capi_last_error().is_empty());
     unsafe { fs_erofs_umount(fs) };
