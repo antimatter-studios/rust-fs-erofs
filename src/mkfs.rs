@@ -5320,4 +5320,25 @@ mod tests {
             assert!(fs.lookup_path(&format!("/{name}")).is_ok(), "{name}");
         }
     }
+
+    /// Tails that cannot share a block with each other leave room that
+    /// later, smaller ones fit in: 100 bodies with 2100-byte tails take a
+    /// block each and leave 1964 bytes, and 100 with 1900-byte tails
+    /// belong in those gaps, not in 50 blocks of their own. The root,
+    /// planned first, stays at NID 0, the only NID a 16-bit `root_nid`
+    /// is sure to reach.
+    #[test]
+    fn meta_layout_fills_the_room_earlier_blocks_left() {
+        let bs = 4096u64;
+        let mut bodies = vec![meta_body(COMPACT_INODE_SIZE, 0)];
+        bodies.extend((0..100).map(|_| meta_body(COMPACT_INODE_SIZE, 2100)));
+        bodies.extend((0..100).map(|_| meta_body(COMPACT_INODE_SIZE, 1900)));
+        let slots = plan_meta_layout(&bodies, bs);
+        assert_eq!(slots[0].start, 0);
+        let blocks = slots.iter().map(MetaSlot::end).max().unwrap().div_ceil(bs);
+        assert!(
+            blocks <= 101,
+            "{blocks} metadata blocks for 200 tails two to a block"
+        );
+    }
 }
