@@ -367,8 +367,8 @@ impl XattrSpec {
     /// A name with no known prefix is refused with `BadXattr`, rather
     /// than kept whole under the raw namespace, which no kernel reads.
     pub fn from_full_name(full_name: impl AsRef<[u8]>, value: impl Into<Vec<u8>>) -> Result<Self> {
-        let _ = (full_name.as_ref(), value.into());
-        Err(Error::BadXattr("xattr name has no known namespace prefix"))
+        let (name_index, name) = crate::xattr::split_full_name(full_name.as_ref())?;
+        Ok(Self::new(name_index, name, value))
     }
 }
 
