@@ -137,3 +137,36 @@ fn a_tree_of_small_inodes_takes_a_block_per_files_whole_block_and_little_else() 
         b"../target"
     );
 }
+
+/// Small files whose inline tails cannot share a block with each other
+/// leave room in their blocks that later, smaller tails fill, as
+/// `mkfs.erofs` fills it: 100 files of 2100 bytes and 100 of 1900 take
+/// about 100 metadata blocks, not 150.
+#[test]
+fn inline_tails_fill_the_room_earlier_metadata_blocks_left() {
+    let names: Vec<String> = (0..200).map(|i| format!("f{i:03}")).collect();
+    let tree = dir(names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                n.as_str(),
+                file(&noise(if i < 100 { 2100 } else { 1900 }, i as u64)),
+            )
+        })
+        .collect());
+    let img = mkfs::build_image(tree, 12).unwrap();
+    let blocks = img.len() / 4096;
+    assert!(blocks <= 104, "{blocks} blocks");
+    let fs = open_image(img);
+    for (i, n) in names.iter().enumerate() {
+        let inode = fs.lookup_path(&format!("/{n}")).unwrap();
+        let mut buf = vec![0u8; inode.size as usize];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            noise(if i < 100 { 2100 } else { 1900 }, i as u64),
+            "{n}"
+        );
+    }
+}
