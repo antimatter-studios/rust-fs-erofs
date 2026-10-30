@@ -1201,3 +1201,41 @@ fn inline_directory_symlink_and_file_tails_are_read_by_fsck_and_the_kernel() {
         "{kernel}"
     );
 }
+
+/// Names that sort before "." byte-wise sit before it in the block:
+/// `fsck.erofs` checks the order, and the kernel, which binary-searches a
+/// directory block, finds every one of them by name.
+#[test]
+fn names_sorting_before_dot_are_found_by_fsck_and_the_kernel() {
+    use fs_erofs_test_support::guest_kernel_read;
+    let names = ["+plus", "-minus", ",comma", "a", "zz"];
+    let img = mkfs::build_image(
+        dir(names.iter().map(|n| (*n, file(n.as_bytes()))).collect()),
+        12,
+    )
+    .unwrap();
+    let (path, _guard) = stage_image(&img);
+    let (code, stdout, stderr) = run_fsck(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let script = names
+        .iter()
+        .map(|n| format!("cat -- \"$MNT/{n}\"; echo"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let out = guest_kernel_read(path.to_str().unwrap(), &script);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let read: Vec<String> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(read, names);
+}

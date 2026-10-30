@@ -5284,4 +5284,40 @@ mod tests {
             }
         }
     }
+
+    /// "." and ".." are names like any other: a name that sorts before
+    /// them byte-wise -- `+x`, `-x`, `,x` and the like, which an Android
+    /// tree has -- must come before them in the block, or the block is
+    /// out of the order the kernel's binary search and `fsck.erofs` need.
+    #[test]
+    fn names_sorting_before_dot_come_before_dot_in_the_block() {
+        let tree = dir(vec![
+            ("+plus", file(b"+")),
+            ("-minus", file(b"-")),
+            (",comma", file(b",")),
+            ("a", file(b"a")),
+        ]);
+        let fs = open(build_image(tree, 12).unwrap());
+        let root = fs.root_inode().unwrap();
+        let names: Vec<Vec<u8>> = fs
+            .read_dir(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names,
+            sorted,
+            "{:?}",
+            names
+                .iter()
+                .map(|n| String::from_utf8_lossy(n))
+                .collect::<Vec<_>>()
+        );
+        for name in ["+plus", "-minus", ",comma", "a"] {
+            assert!(fs.lookup_path(&format!("/{name}")).is_ok(), "{name}");
+        }
+    }
 }
