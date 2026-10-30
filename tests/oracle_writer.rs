@@ -1145,3 +1145,59 @@ fn a_compression_map_after_xattrs_ending_off_8_bytes_is_where_fsck_and_the_kerne
         );
     }
 }
+
+/// Directories, symlinks and file tails inline in the metadata area:
+/// `fsck.erofs` accepts them, and the kernel lists every directory, reads
+/// every link and hashes every file as they went in.
+#[test]
+fn inline_directory_symlink_and_file_tails_are_read_by_fsck_and_the_kernel() {
+    use fs_erofs_test_support::{guest_kernel_read, sha256_hex};
+    let names: Vec<String> = (0..600).map(|i| format!("entry-number-{i:04}")).collect();
+    let tail: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let tree = dir(vec![
+        (
+            "big",
+            dir(names
+                .iter()
+                .map(|n| (n.as_str(), file(n.as_bytes())))
+                .collect()),
+        ),
+        ("small", dir(vec![("a", file(b"a"))])),
+        ("empty", dir(vec![])),
+        (
+            "link",
+            mkfs::Node::Symlink {
+                mode: mkfs::DEFAULT_SYMLINK_MODE,
+                target: "/system/bin/toybox".to_string(),
+                meta: mkfs::NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+        ),
+        ("tail", file(&tail)),
+    ]);
+    let img = mkfs::build_image(tree, 12).unwrap();
+    let (path, _guard) = stage_image(&img);
+    let (code, stdout, stderr) = run_fsck(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let out = guest_kernel_read(
+        path.to_str().unwrap(),
+        r#"cd "$MNT" && ls big | wc -l && ls small empty && readlink link && sha256sum tail"#,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let kernel = String::from_utf8(out.stdout).unwrap();
+    assert!(kernel.lines().any(|l| l.trim() == "600"), "{kernel}");
+    assert!(kernel.contains("/system/bin/toybox"), "{kernel}");
+    assert!(
+        kernel.contains(&format!("{}  tail", sha256_hex(&tail))),
+        "{kernel}"
+    );
+}
