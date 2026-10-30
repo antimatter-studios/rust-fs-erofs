@@ -368,3 +368,82 @@ fn the_index_holds_what_the_kernel_requires_of_it() {
         }
     }
 }
+
+/// A file is compressed in 4 MiB segments, each starting a fresh pcluster
+/// at a block boundary, so they can be compressed on any thread and the
+/// image does not depend on how many there were: the lcluster at every
+/// 4 MiB of the file is a head, at offset 0.
+#[test]
+fn pclusters_restart_at_every_4_mib_so_threads_cannot_change_the_output() {
+    use fs_erofs::zmap::Z_EROFS_LCLUSTER_TYPE_NONHEAD as NONHEAD;
+    let data = text(10 << 20, 12);
+    let img = mkfs::build_image_with(dir(vec![("f", file(&data))]), 12, options()).unwrap();
+    let dev = common::MemDev::new(img.clone());
+    let fs = open_image(img);
+    assert_eq!(read_back(&fs, "/f"), data);
+    let inode = fs.lookup_path("/f").unwrap();
+    let zmap = ZMap::open(&dev as &dyn BlockRead, fs.superblock(), &inode).unwrap();
+    for segment in [1u64, 2] {
+        let lcn = (segment << 20) * 4 / 4096;
+        let e = zmap.read_lcluster(&dev as &dyn BlockRead, lcn).unwrap();
+        assert!(
+            e.cluster_type != NONHEAD && e.clusterofs == 0,
+            "lcluster {lcn}, at {segment} x 4 MiB: {e:?}"
+        );
+    }
+}
+
+/// One thread or many, the same tree builds to the same bytes.
+#[test]
+fn any_thread_count_builds_the_same_bytes() {
+    let tree = || {
+        let mut big = text(9 << 20, 13);
+        big.extend(noise(3 << 20, 14));
+        let names: Vec<String> = (0..40).map(|i| format!("f{i:02}")).collect();
+        let mut entries: Vec<(String, Node)> = names
+            .iter()
+            .map(|n| {
+                (
+                    n.clone(),
+                    file(&text(5000 + n.len() * 40_000, n.len() as u64)),
+                )
+            })
+            .collect();
+        entries.push(("big".to_string(), file(&big)));
+        dir(entries
+            .iter()
+            .map(|(n, e)| (n.as_str(), clone_file(e)))
+            .collect())
+    };
+    let build = |threads| {
+        let options = BuildOptions {
+            threads,
+            ..options()
+        };
+        mkfs::build_image_with(tree(), 12, options).unwrap()
+    };
+    let one = build(1);
+    for threads in [2, 7, 0] {
+        assert!(
+            build(threads) == one,
+            "{threads} threads built other bytes than one"
+        );
+    }
+}
+
+fn clone_file(node: &Node) -> Node {
+    match node {
+        Node::File {
+            mode,
+            data,
+            meta,
+            xattrs,
+        } => Node::File {
+            mode: *mode,
+            data: data.clone(),
+            meta: *meta,
+            xattrs: xattrs.clone(),
+        },
+        _ => unreachable!(),
+    }
+}

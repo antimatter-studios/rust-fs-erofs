@@ -421,6 +421,12 @@ pub struct BuildOptions {
     /// are. [`Node::CompressedFile`] keeps the codec and shape its own
     /// spec names either way.
     pub compression: Option<Compression>,
+
+    /// Threads that compress, when [`Self::compression`] is set; 0 means
+    /// one per core. Each file is compressed in 4 MiB segments that start
+    /// fresh pclusters, so segments compress independently, and they are
+    /// written in order: any thread count builds the same bytes.
+    pub threads: usize,
 }
 
 /// How [`BuildOptions::compression`] compresses regular files.
