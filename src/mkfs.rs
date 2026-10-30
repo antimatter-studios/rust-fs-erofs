@@ -425,7 +425,10 @@ pub struct BuildOptions {
     /// Threads that compress, when [`Self::compression`] is set; 0 means
     /// one per core. Each file is compressed in 4 MiB segments that start
     /// fresh pclusters, so segments compress independently, and they are
-    /// written in order: any thread count builds the same bytes.
+    /// written in order: any thread count builds the same bytes. Up to one
+    /// segment more than the threads is in flight at once, each holding
+    /// its 4 MiB of input and its output; with one thread nothing is
+    /// spawned.
     pub threads: usize,
 }
 
@@ -660,156 +663,155 @@ pub fn build_image_to<W: Write + Seek>(
         next_data_block += blocks;
         at
     };
-    let mut placements: Vec<Placement> = Vec::with_capacity(plan.len());
+    let compression = options
+        .compression
+        .map(|c| c.validate(bs).map(|()| c))
+        .transpose()?;
+    let threads = match options.threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    };
+    let mut placements: Vec<Placement> = (0..plan.len()).map(|_| Placement::default()).collect();
     let mut any_compressed = false;
     let mut any_streamed_compressed = false;
-    let mut lz4hc = options
-        .compression
-        .map(|c| c.validate(bs).map(|()| (Lz4Hc::new(c.lz4hc_level), c)))
-        .transpose()?;
-    for (n, body) in plan.iter_mut().zip(bodies.iter_mut()) {
-        let mut place = Placement::default();
-        let mut compressed: Option<PlanKind> = None;
-        match &mut n.kind {
-            PlanKind::File {
-                content,
-                size,
-                layout,
-            } if *layout == FileLayout::FlatPlain && *size > 0 => {
-                let content = content.take().expect("a file's content is read once");
-                let start = next_data_block;
-                // The last partial block goes inline when it fits after
-                // the inode, and the file takes only its whole blocks.
-                let tail = *size % bs;
-                let inline = tail > 0 && tail <= tail_room(body, bs);
-                // A file of a block or less cannot be stored in fewer
-                // blocks, so it is never compressed.
-                let streamed = match &mut lz4hc {
-                    Some((encoder, compression)) if *size > bs => compress_streamed(
+    std::thread::scope(|scope| -> Result<()> {
+        let mut pipeline = compression.map(|c| Pipeline::new(scope, c, threads, bs));
+        for i in 0..plan.len() {
+            // A file of more than a block goes to the compressors; a file
+            // of a block or less cannot be stored in fewer blocks, so it
+            // is never compressed.
+            let compressed = pipeline.is_some()
+                && matches!(
+                    &plan[i].kind,
+                    PlanKind::File { size, layout: FileLayout::FlatPlain, .. } if *size > bs
+                );
+            // Anything else that writes data writes it after every segment
+            // in flight, which is what gives it its address.
+            if !compressed && writes_data(&plan[i], &bodies[i], bs) {
+                if let Some(pipeline) = &mut pipeline {
+                    pipeline.drain(
                         &mut out,
-                        encoder,
-                        content,
-                        start,
-                        compression.max_pcluster_bytes as usize,
-                    )?,
-                    _ => Streamed::Stored {
-                        last: out.write_content(start, content, if inline { tail } else { 0 })?,
-                    },
-                };
-                match streamed {
-                    Streamed::Stored { last } => {
-                        place.blkaddr = start;
-                        if inline {
-                            // A stored file's last partial block was written
-                            // to the sink; the next data overwrites it.
-                            *layout = FileLayout::FlatInline;
-                            body.inline_tail = last;
-                            next_data_block += *size / bs;
-                        } else {
-                            next_data_block += size.div_ceil(bs);
-                        }
-                    }
-                    Streamed::Compressed {
-                        pclusters,
-                        entries,
-                        addrs,
-                        blocks,
-                    } => {
-                        any_compressed = true;
-                        any_streamed_compressed = true;
-                        let (_, compression) = lz4hc.as_ref().expect("compressed with it");
-                        // The legacy map header sits at the 8-byte boundary
-                        // after the inode body and its xattrs; every slot
-                        // starts 32-byte aligned, so that boundary is known
-                        // from their sizes alone.
-                        let end = body.body_size + body.xattr_bytes.len() as u64;
-                        body.zmap_bytes = end.next_multiple_of(8) - end
-                            + Z_EROFS_LEGACY_MAP_HEADER_SIZE
-                            + entries.len() as u64 * Z_EROFS_LCLUSTER_INDEX_SIZE;
-                        place.pcluster_addrs = addrs;
-                        next_data_block += blocks;
-                        compressed = Some(PlanKind::Compressed {
-                            src: Vec::new(),
-                            size: *size,
-                            big_pcluster: compression.max_pcluster_bytes as u64 > bs,
-                            algo: CompressedAlgo::Lz4,
-                            lclusterbits: 0,
-                            pclusters,
-                            lcluster_entries: entries,
-                            total_compressed_blocks: u32::try_from(blocks)
-                                .map_err(|_| Error::BadInode("compressed blocks overflow u32"))?,
-                            index_format: CompressedIndexFormat::Legacy,
-                            ztailpacking_requested: false,
-                            ztailpacking_inline: None,
-                            target_pcluster_blocks: (compression.max_pcluster_bytes as u64 / bs)
-                                as u32,
-                        });
-                    }
+                        &mut plan,
+                        &mut bodies,
+                        &mut placements,
+                        &mut next_data_block,
+                    )?;
                 }
             }
-            PlanKind::File { content, .. } => {
-                // An empty file still opens its content, to refuse a
-                // reader with bytes behind a size of zero.
-                if let Some(content) = content.take() {
-                    content.read_all()?;
+            let body = &mut bodies[i];
+            let mut place = std::mem::take(&mut placements[i]);
+            let mut to_compress: Option<Content> = None;
+            match &mut plan[i].kind {
+                PlanKind::File { content, .. } if compressed => {
+                    to_compress = content.take();
                 }
-            }
-            PlanKind::Symlink { target } => {
-                if target.len() as u64 > bs {
-                    return Err(Error::BadInode("symlink target longer than one block"));
-                }
-                if !target.is_empty() && target.len() as u64 <= tail_room(body, bs) {
-                    body.inline_tail = target.clone();
-                } else {
+                PlanKind::File {
+                    content,
+                    size,
+                    layout,
+                } if *layout == FileLayout::FlatPlain && *size > 0 => {
+                    let content = content.take().expect("a file's content is read once");
+                    // The last partial block goes inline when it fits
+                    // after the inode, and the file takes only its whole
+                    // blocks.
+                    let tail = *size % bs;
+                    let inline = tail > 0 && tail <= tail_room(body, bs);
                     place.blkaddr = next_data_block;
-                    out.write_blocks(next_data_block, target, 1)?;
-                    next_data_block += 1;
+                    let last =
+                        out.write_content(next_data_block, content, if inline { tail } else { 0 })?;
+                    if inline {
+                        *layout = FileLayout::FlatInline;
+                        body.inline_tail = last;
+                        next_data_block += *size / bs;
+                    } else {
+                        next_data_block += size.div_ceil(bs);
+                    }
                 }
-            }
-            PlanKind::Chunked { chunks, .. } => {
-                for c in chunks.iter() {
-                    match c {
-                        None => place.chunk_addrs.push(EROFS_NULL_ADDR),
-                        Some(buf) => {
-                            let blocks = (buf.len() as u64).div_ceil(bs).max(1);
-                            place.chunk_addrs.push(block_addr(next_data_block)?);
-                            out.write_blocks(next_data_block, buf, blocks)?;
-                            next_data_block += blocks;
+                PlanKind::File { content, .. } => {
+                    // An empty file still opens its content, to refuse a
+                    // reader with bytes behind a size of zero.
+                    if let Some(content) = content.take() {
+                        content.read_all()?;
+                    }
+                }
+                PlanKind::Symlink { target } => {
+                    if target.len() as u64 > bs {
+                        return Err(Error::BadInode("symlink target longer than one block"));
+                    }
+                    if !target.is_empty() && target.len() as u64 <= tail_room(body, bs) {
+                        body.inline_tail = target.clone();
+                    } else {
+                        place.blkaddr = next_data_block;
+                        out.write_blocks(next_data_block, target, 1)?;
+                        next_data_block += 1;
+                    }
+                }
+                PlanKind::Chunked { chunks, .. } => {
+                    for c in chunks.iter() {
+                        match c {
+                            None => place.chunk_addrs.push(EROFS_NULL_ADDR),
+                            Some(buf) => {
+                                let blocks = (buf.len() as u64).div_ceil(bs).max(1);
+                                place.chunk_addrs.push(block_addr(next_data_block)?);
+                                out.write_blocks(next_data_block, buf, blocks)?;
+                                next_data_block += blocks;
+                            }
                         }
                     }
                 }
-            }
-            PlanKind::Compressed { pclusters, .. } => {
-                any_compressed = true;
-                for pc in pclusters.iter_mut() {
-                    // For ztailpacked pclusters (block_count == 0) we
-                    // still record next_data_block as the entry's
-                    // blkaddr. The reader resolves this via the per-
-                    // pack base arithmetic but uses the inline-tail
-                    // offset/size for actual reads (gated on
-                    // `is_last_pcluster && has_inline_tail`), so the
-                    // recorded address is a "shadow" that keeps
-                    // compacted-2B per-pack base math consistent for
-                    // non-tail entries in the same pack.
-                    place.pcluster_addrs.push(block_addr(next_data_block)?);
-                    let blocks = pc.pcluster_block_count as u64;
-                    if blocks > 0 {
-                        out.write_blocks(
-                            next_data_block,
-                            &std::mem::take(&mut pc.block_bytes),
-                            blocks,
-                        )?;
+                PlanKind::Compressed { pclusters, .. } => {
+                    any_compressed = true;
+                    for pc in pclusters.iter_mut() {
+                        // For ztailpacked pclusters (block_count == 0) we
+                        // still record next_data_block as the entry's
+                        // blkaddr. The reader resolves this via the per-
+                        // pack base arithmetic but uses the inline-tail
+                        // offset/size for actual reads (gated on
+                        // `is_last_pcluster && has_inline_tail`), so the
+                        // recorded address is a "shadow" that keeps
+                        // compacted-2B per-pack base math consistent for
+                        // non-tail entries in the same pack.
+                        place.pcluster_addrs.push(block_addr(next_data_block)?);
+                        let blocks = pc.pcluster_block_count as u64;
+                        if blocks > 0 {
+                            out.write_blocks(
+                                next_data_block,
+                                &std::mem::take(&mut pc.block_bytes),
+                                blocks,
+                            )?;
+                        }
+                        next_data_block += blocks;
                     }
-                    next_data_block += blocks;
                 }
+                PlanKind::Dir { .. } | PlanKind::Device { .. } | PlanKind::Special => {}
             }
-            PlanKind::Dir { .. } | PlanKind::Device { .. } | PlanKind::Special => {}
+            placements[i] = place;
+            if let (Some(content), Some(pipeline)) = (to_compress, &mut pipeline) {
+                pipeline.add_file(
+                    i,
+                    content,
+                    &mut out,
+                    &mut plan,
+                    &mut bodies,
+                    &mut placements,
+                    &mut next_data_block,
+                )?;
+            }
         }
-        if let Some(kind) = compressed {
-            n.kind = kind;
+        if let Some(mut pipeline) = pipeline {
+            pipeline.drain(
+                &mut out,
+                &mut plan,
+                &mut bodies,
+                &mut placements,
+                &mut next_data_block,
+            )?;
+            pipeline.finish();
+            any_compressed |= pipeline.any_compressed;
+            any_streamed_compressed |= pipeline.any_compressed;
         }
-        placements.push(place);
-    }
+        Ok(())
+    })?;
 
     // A directory's last block goes inline when it fits after the inode.
     // Which entries fill which block depends only on their names, so the
@@ -1149,96 +1151,64 @@ struct Placement {
     pcluster_addrs: Vec<u32>,
 }
 
-/// What compressing one file as it was read came to.
-enum Streamed {
-    /// Nothing in it was worth compressing: its bytes are in the image as
-    /// they were read, from its first block on, as a FLAT_PLAIN file's
-    /// are. `last` is its last partial block, if it ends in one, for an
-    /// inline tail.
-    Stored { last: Vec<u8> },
-    /// Its pclusters, one index entry per lcluster, each pcluster's first
-    /// block, and the blocks they fill.
-    Compressed {
-        pclusters: Vec<PclusterPlan>,
-        entries: Vec<LclusterIndexEntry>,
-        addrs: Vec<u32>,
-        blocks: u64,
-    },
-}
-
 /// The most of a file LZ4HC is shown at once. A pcluster holds what
 /// compresses into it from the start of this, so it bounds how much one
 /// pcluster can hold; at 1 MiB a block of the image still holds a whole
 /// pcluster of a file's zeros.
 const COMPRESS_WINDOW: usize = 1 << 20;
 
-/// Compress a file as it is read, into pclusters written from block
-/// `first_block` on, as `mkfs.erofs -zlz4hc -C` does.
+/// A file is compressed in segments of this many bytes, each starting a
+/// fresh pcluster at a block boundary, so that segments can be compressed
+/// on different threads and the image is the same whatever their number.
+/// A boundary costs at most part of a block, once every 4 MiB.
+const COMPRESS_SEGMENT: usize = 4 << 20;
+
+/// One pcluster a segment was cut into.
+struct Piece {
+    /// `Z_EROFS_LCLUSTER_TYPE_HEAD1` or `Z_EROFS_LCLUSTER_TYPE_PLAIN`.
+    cluster_type: u8,
+    /// Bytes of the file it holds.
+    len: usize,
+    /// Blocks it fills in the image.
+    blocks: u64,
+    /// What goes in those blocks: a compressed frame, already padded at
+    /// the front to whole blocks (`EROFS_FEATURE_INCOMPAT_ZERO_PADDING`),
+    /// or the stored bytes, which the sink pads at the back.
+    bytes: Vec<u8>,
+}
+
+/// Compress one segment of a file into pclusters, as `mkfs.erofs
+/// -zlz4hc -C` does. `segment` starts at a block boundary of the file.
 ///
-/// Each pcluster takes as much of the file as LZ4HC fits in
-/// `max_pcluster_bytes`, padded at the front to whole blocks
-/// (`EROFS_FEATURE_INCOMPAT_ZERO_PADDING`) -- unless that saves no block
-/// over the bytes it took, when one block of the file is stored as it is
-/// (a PLAIN pcluster) instead. Pclusters need not start on a block, so a
-/// head lcluster records where in it its pcluster starts. Logical clusters
-/// are one block each.
-///
-/// When every pcluster is PLAIN, each one holds the next block of the file
-/// from offset 0, so the file is in the image exactly as an uncompressed
-/// file is: [`Streamed::Stored`] says to describe it as one, and nothing
-/// is read twice.
-fn compress_streamed<W: Write + Seek>(
-    out: &mut ImageSink<'_, W>,
+/// Each pcluster takes as much of the segment as LZ4HC fits in
+/// `max_pcluster_bytes` -- unless that saves no block over the bytes it
+/// took, when one block of the file is stored as it is (a PLAIN pcluster)
+/// instead. Pclusters need not start on a block, so a head lcluster
+/// records where in it its pcluster starts. Logical clusters are one
+/// block each.
+fn compress_segment(
     encoder: &mut Lz4Hc,
-    content: Content,
-    first_block: u64,
+    segment: &[u8],
+    bs: u64,
     max_pcluster_bytes: usize,
-) -> Result<Streamed> {
-    let bs = out.bs;
-    let size = content.size;
-    let mut reader = (content.open)().map_err(io_error)?;
-    let window = COMPRESS_WINDOW.max(2 * max_pcluster_bytes);
-    let mut buf: Vec<u8> = Vec::with_capacity(window);
-    // `buf[start..]` is what has been read and not yet put in a pcluster;
-    // it begins at file offset `pos`.
-    let mut start = 0usize;
-    let mut pos = 0u64;
-    let mut unread = size;
+) -> Vec<Piece> {
     let mut dst = vec![0u8; max_pcluster_bytes];
-    let mut frame: Vec<u8> = Vec::with_capacity(max_pcluster_bytes);
-    let mut block = first_block;
-    // Each pcluster: where in the file it starts, and its plan.
-    let mut pclusters: Vec<(u64, PclusterPlan)> = Vec::new();
-    let mut addrs: Vec<u32> = Vec::new();
-    let mut last: Vec<u8> = Vec::new();
-    while pos < size {
-        // Refill once less than half a window is left, moving what is
-        // left to the front first: each byte moves at most once.
-        if unread > 0 && buf.len() - start < window / 2 {
-            buf.drain(..start);
-            start = 0;
-            let want = ((window - buf.len()) as u64).min(unread) as usize;
-            let old = buf.len();
-            buf.resize(old + want, 0);
-            reader.read_exact(&mut buf[old..]).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    Error::BadInode("file content is shorter than its size")
-                } else {
-                    io_error(e)
-                }
-            })?;
-            unread -= want as u64;
-        }
-        let avail = &buf[start..];
-        let (taken, written) = encoder.compress_dest_size(avail, &mut dst);
+    let mut pieces = Vec::new();
+    let mut pos = 0usize;
+    while pos < segment.len() {
+        let rest = &segment[pos..];
+        let window = &rest[..rest.len().min(COMPRESS_WINDOW)];
+        let (taken, written) = encoder.compress_dest_size(window, &mut dst);
         let cblks = (written as u64).div_ceil(bs);
-        addrs.push(block_addr(block)?);
-        let (len, blocks, cluster_type) = if taken > 0 && cblks < (taken as u64).div_ceil(bs) {
-            frame.clear();
-            frame.resize((cblks * bs) as usize - written, 0);
-            frame.extend_from_slice(&dst[..written]);
-            out.write_blocks(block, &frame, cblks)?;
-            (taken, cblks, Z_EROFS_LCLUSTER_TYPE_HEAD1)
+        let piece = if taken > 0 && cblks < (taken as u64).div_ceil(bs) {
+            let mut bytes = vec![0u8; (cblks * bs) as usize - written];
+            bytes.extend_from_slice(&dst[..written]);
+            Piece {
+                cluster_type: Z_EROFS_LCLUSTER_TYPE_HEAD1,
+                len: taken,
+                blocks: cblks,
+                bytes,
+            }
         } else {
             // One block of the file, stored as it is. The kernel maps a
             // stored pcluster to one block of the file at most, from its
@@ -1246,49 +1216,38 @@ fn compress_streamed<W: Write + Seek>(
             // the end of the lcluster the file ends in. So the last one,
             // if it starts inside a block and would run on into the next,
             // stops at the boundary and leaves the rest to a pcluster of
-            // its own there.
-            let into = (pos % bs) as usize;
-            let len = if avail.len() > bs as usize || into == 0 {
-                (bs as usize).min(avail.len())
+            // its own there. (A segment ends on a block boundary, so this
+            // only ever shortens the last pcluster of a file.)
+            let into = pos % bs as usize;
+            let len = if rest.len() > bs as usize || into == 0 {
+                (bs as usize).min(rest.len())
             } else {
-                avail.len().min(bs as usize - into)
+                rest.len().min(bs as usize - into)
             };
-            out.write_blocks(block, &avail[..len], 1)?;
-            if len < bs as usize {
-                last = avail[..len].to_vec();
+            Piece {
+                cluster_type: Z_EROFS_LCLUSTER_TYPE_PLAIN,
+                len,
+                blocks: 1,
+                bytes: rest[..len].to_vec(),
             }
-            (len, 1, Z_EROFS_LCLUSTER_TYPE_PLAIN)
         };
-        pclusters.push((
-            pos,
-            PclusterPlan {
-                block_bytes: Vec::new(),
-                cluster_type,
-                pcluster_block_count: blocks as u32,
-                raw_compressed: Vec::new(),
-                head_lcluster_idx: (pos / bs) as u32,
-                n_lclusters: 0,
-            },
-        ));
-        pos += len as u64;
-        start += len;
-        block += blocks;
+        pos += piece.len;
+        pieces.push(piece);
     }
-    if reader.read(&mut [0u8; 1]).map_err(io_error)? != 0 {
-        return Err(Error::BadInode("file content is longer than its size"));
-    }
-    if pclusters
-        .iter()
-        .all(|(_, p)| p.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN)
-    {
-        return Ok(Streamed::Stored { last });
-    }
+    pieces
+}
 
-    // One index entry per block of the file. A pcluster's head is the
-    // lcluster it starts in, recording where in it; every lcluster no
-    // pcluster starts in belongs to the last one that started before it.
-    // Each pcluster takes more than a block of the file but the last, so
-    // no two start in one lcluster.
+/// One index entry per block of a file whose pclusters start at the given
+/// file offsets. A pcluster's head is the lcluster it starts in, recording
+/// where in it; every lcluster no pcluster starts in belongs to the last
+/// one that started before it. Each pcluster takes more than a block of
+/// the file but the last of a segment, which ends on a block boundary, so
+/// no two start in one lcluster.
+fn index_pclusters(
+    pclusters: &[(u64, PclusterPlan)],
+    size: u64,
+    bs: u64,
+) -> Result<Vec<LclusterIndexEntry>> {
     let n_lclusters = size.div_ceil(bs) as usize;
     let mut heads: Vec<Option<LclusterIndexEntry>> = vec![None; n_lclusters];
     for (idx, (at, p)) in pclusters.iter().enumerate() {
@@ -1318,12 +1277,344 @@ fn compress_streamed<W: Write + Seek>(
             }),
         }
     }
-    Ok(Streamed::Compressed {
-        pclusters: pclusters.into_iter().map(|(_, p)| p).collect(),
-        entries,
-        addrs,
-        blocks: block - first_block,
-    })
+    Ok(entries)
+}
+
+/// A segment handed to the compressors and not yet written.
+struct InFlight {
+    node: usize,
+    /// Where in the file it starts.
+    offset: u64,
+    id: u64,
+    /// The file's last segment: once it is written, the inode is known.
+    last: bool,
+}
+
+/// A file whose segments are being compressed: what has been written of
+/// it so far.
+struct FileInFlight {
+    size: u64,
+    /// Its first block.
+    start: u64,
+    /// Each pcluster: where in the file it starts, and its plan.
+    pclusters: Vec<(u64, PclusterPlan)>,
+    addrs: Vec<u32>,
+    /// Its last partial block, if it ends in a stored one, for an inline
+    /// tail should every pcluster be stored.
+    last: Vec<u8>,
+}
+
+/// Where segments are compressed: on this thread, or on a pool of them.
+enum Compressors {
+    Here(Lz4Hc),
+    Pool {
+        jobs: Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>)>>,
+        results: std::sync::mpsc::Receiver<(u64, Vec<Piece>)>,
+    },
+}
+
+/// Files compressed as they are read, a segment at a time, on as many
+/// threads as there are, and written to the image in the order they were
+/// read -- which is what gives each pcluster its address, and why the
+/// image does not depend on the number of threads.
+///
+/// At most `max_in_flight` segments are read and not yet written: the
+/// memory compression adds is that many segments and their output.
+struct Pipeline {
+    compression: Compression,
+    bs: u64,
+    compressors: Compressors,
+    max_in_flight: usize,
+    queue: std::collections::VecDeque<InFlight>,
+    done: std::collections::HashMap<u64, Vec<Piece>>,
+    files: std::collections::HashMap<usize, FileInFlight>,
+    next_id: u64,
+    /// Some file came out compressed.
+    any_compressed: bool,
+}
+
+impl Pipeline {
+    fn new<'scope>(
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        compression: Compression,
+        threads: usize,
+        bs: u64,
+    ) -> Self {
+        let max = compression.max_pcluster_bytes as usize;
+        let compressors = if threads <= 1 {
+            Compressors::Here(Lz4Hc::new(compression.lz4hc_level))
+        } else {
+            let (jobs, job_queue) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(threads);
+            let job_queue = std::sync::Arc::new(std::sync::Mutex::new(job_queue));
+            let (done, results) = std::sync::mpsc::channel();
+            for _ in 0..threads {
+                let (job_queue, done) = (job_queue.clone(), done.clone());
+                scope.spawn(move || {
+                    let mut encoder = Lz4Hc::new(compression.lz4hc_level);
+                    loop {
+                        let job = job_queue.lock().map(|q| q.recv());
+                        let Ok(Ok((id, segment))) = job else { break };
+                        let pieces = compress_segment(&mut encoder, &segment, bs, max);
+                        if done.send((id, pieces)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            Compressors::Pool {
+                jobs: Some(jobs),
+                results,
+            }
+        };
+        Self {
+            compression,
+            bs,
+            compressors,
+            max_in_flight: threads.max(1) + 1,
+            queue: std::collections::VecDeque::new(),
+            done: std::collections::HashMap::new(),
+            files: std::collections::HashMap::new(),
+            next_id: 0,
+            any_compressed: false,
+        }
+    }
+
+    /// Read a file, a segment at a time, and hand each to the
+    /// compressors; writing whatever earlier segments are done whenever
+    /// too many are in flight. Content that ends before its size, or goes
+    /// on past it, is refused.
+    #[allow(clippy::too_many_arguments)]
+    fn add_file<W: Write + Seek>(
+        &mut self,
+        node: usize,
+        content: Content,
+        out: &mut ImageSink<'_, W>,
+        plan: &mut [PlanNode],
+        bodies: &mut [InodeBody],
+        placements: &mut [Placement],
+        next_data_block: &mut u64,
+    ) -> Result<()> {
+        let size = content.size;
+        let mut reader = (content.open)().map_err(io_error)?;
+        self.files.insert(
+            node,
+            FileInFlight {
+                size,
+                start: 0,
+                pclusters: Vec::new(),
+                addrs: Vec::new(),
+                last: Vec::new(),
+            },
+        );
+        let mut offset = 0u64;
+        while offset < size {
+            let len = (size - offset).min(COMPRESS_SEGMENT as u64) as usize;
+            let mut segment = vec![0u8; len];
+            reader.read_exact(&mut segment).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Error::BadInode("file content is shorter than its size")
+                } else {
+                    io_error(e)
+                }
+            })?;
+            while self.queue.len() >= self.max_in_flight {
+                self.retire_one(out, plan, bodies, placements, next_data_block)?;
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            match &mut self.compressors {
+                Compressors::Here(encoder) => {
+                    let max = self.compression.max_pcluster_bytes as usize;
+                    let pieces = compress_segment(encoder, &segment, self.bs, max);
+                    self.done.insert(id, pieces);
+                }
+                Compressors::Pool { jobs, .. } => {
+                    let jobs = jobs.as_ref().expect("open until finish");
+                    jobs.send((id, segment))
+                        .map_err(|_| Error::BadInode("a compressing thread stopped"))?;
+                }
+            }
+            offset += len as u64;
+            self.queue.push_back(InFlight {
+                node,
+                offset: offset - len as u64,
+                id,
+                last: offset == size,
+            });
+        }
+        if reader.read(&mut [0u8; 1]).map_err(io_error)? != 0 {
+            return Err(Error::BadInode("file content is longer than its size"));
+        }
+        Ok(())
+    }
+
+    /// Write every segment still in flight, in order.
+    fn drain<W: Write + Seek>(
+        &mut self,
+        out: &mut ImageSink<'_, W>,
+        plan: &mut [PlanNode],
+        bodies: &mut [InodeBody],
+        placements: &mut [Placement],
+        next_data_block: &mut u64,
+    ) -> Result<()> {
+        while !self.queue.is_empty() {
+            self.retire_one(out, plan, bodies, placements, next_data_block)?;
+        }
+        Ok(())
+    }
+
+    /// Stop the compressing threads, once everything is written.
+    fn finish(&mut self) {
+        if let Compressors::Pool { jobs, .. } = &mut self.compressors {
+            jobs.take();
+        }
+    }
+
+    /// Write the oldest segment in flight, waiting for it if it is still
+    /// being compressed; and when it was its file's last, settle that
+    /// file's inode.
+    fn retire_one<W: Write + Seek>(
+        &mut self,
+        out: &mut ImageSink<'_, W>,
+        plan: &mut [PlanNode],
+        bodies: &mut [InodeBody],
+        placements: &mut [Placement],
+        next_data_block: &mut u64,
+    ) -> Result<()> {
+        let bs = self.bs;
+        let item = self.queue.pop_front().expect("something in flight");
+        let pieces = loop {
+            if let Some(pieces) = self.done.remove(&item.id) {
+                break pieces;
+            }
+            let Compressors::Pool { results, .. } = &self.compressors else {
+                unreachable!("compressed here as soon as it was read");
+            };
+            let (id, pieces) = results
+                .recv()
+                .map_err(|_| Error::BadInode("a compressing thread stopped"))?;
+            self.done.insert(id, pieces);
+        };
+        let file = self
+            .files
+            .get_mut(&item.node)
+            .expect("added before its segments");
+        if item.offset == 0 {
+            file.start = *next_data_block;
+        }
+        let mut at = item.offset;
+        for piece in pieces {
+            file.addrs.push(block_addr(*next_data_block)?);
+            out.write_blocks(*next_data_block, &piece.bytes, piece.blocks)?;
+            if piece.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN && piece.len < bs as usize {
+                file.last = piece.bytes;
+            }
+            file.pclusters.push((
+                at,
+                PclusterPlan {
+                    block_bytes: Vec::new(),
+                    cluster_type: piece.cluster_type,
+                    pcluster_block_count: piece.blocks as u32,
+                    raw_compressed: Vec::new(),
+                    head_lcluster_idx: (at / bs) as u32,
+                    n_lclusters: 0,
+                },
+            ));
+            at += piece.len as u64;
+            *next_data_block += piece.blocks;
+        }
+        if item.last {
+            let file = self.files.remove(&item.node).expect("just written to");
+            self.settle(item.node, file, plan, bodies, placements, next_data_block)?;
+        }
+        Ok(())
+    }
+
+    /// Describe a file whose every segment is written. When every pcluster
+    /// is PLAIN, each holds the next block of the file from offset 0, so
+    /// the file is in the image exactly as an uncompressed file is: it is
+    /// described as one, its last partial block inline when that fits,
+    /// and nothing is read twice.
+    fn settle(
+        &mut self,
+        i: usize,
+        file: FileInFlight,
+        plan: &mut [PlanNode],
+        bodies: &mut [InodeBody],
+        placements: &mut [Placement],
+        next_data_block: &mut u64,
+    ) -> Result<()> {
+        let bs = self.bs;
+        let size = file.size;
+        let body = &mut bodies[i];
+        if file
+            .pclusters
+            .iter()
+            .all(|(_, p)| p.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN)
+        {
+            placements[i].blkaddr = file.start;
+            let tail = size % bs;
+            if tail > 0 && tail <= tail_room(body, bs) {
+                if let PlanKind::File { layout, .. } = &mut plan[i].kind {
+                    *layout = FileLayout::FlatInline;
+                }
+                body.inline_tail = file.last;
+                // Its last partial block was the last thing written; the
+                // data that follows overwrites it.
+                *next_data_block = file.start + size / bs;
+            }
+            return Ok(());
+        }
+        self.any_compressed = true;
+        let entries = index_pclusters(&file.pclusters, size, bs)?;
+        let blocks: u64 = file
+            .pclusters
+            .iter()
+            .map(|(_, p)| p.pcluster_block_count as u64)
+            .sum();
+        // The legacy map header sits at the 8-byte boundary after the
+        // inode body and its xattrs; every slot starts 32-byte aligned, so
+        // that boundary is known from their sizes alone.
+        let end = body.body_size + body.xattr_bytes.len() as u64;
+        body.zmap_bytes = end.next_multiple_of(8) - end
+            + Z_EROFS_LEGACY_MAP_HEADER_SIZE
+            + entries.len() as u64 * Z_EROFS_LCLUSTER_INDEX_SIZE;
+        placements[i].pcluster_addrs = file.addrs;
+        let max = self.compression.max_pcluster_bytes as u64;
+        plan[i].kind = PlanKind::Compressed {
+            src: Vec::new(),
+            size,
+            big_pcluster: max > bs,
+            algo: CompressedAlgo::Lz4,
+            lclusterbits: 0,
+            pclusters: file.pclusters.into_iter().map(|(_, p)| p).collect(),
+            lcluster_entries: entries,
+            total_compressed_blocks: u32::try_from(blocks)
+                .map_err(|_| Error::BadInode("compressed blocks overflow u32"))?,
+            index_format: CompressedIndexFormat::Legacy,
+            ztailpacking_requested: false,
+            ztailpacking_inline: None,
+            target_pcluster_blocks: (max / bs) as u32,
+        };
+        Ok(())
+    }
+}
+
+/// Whether the data pass writes blocks for this inode outside the
+/// compressors -- the arms of its `match` that call the sink. Those writes
+/// wait for every segment in flight, and the rest need not.
+fn writes_data(n: &PlanNode, body: &InodeBody, bs: u64) -> bool {
+    match &n.kind {
+        PlanKind::File { size, layout, .. } => *layout == FileLayout::FlatPlain && *size > 0,
+        PlanKind::Symlink { target } => {
+            target.is_empty() || target.len() as u64 > tail_room(body, bs)
+        }
+        PlanKind::Chunked { chunks, .. } => chunks.iter().any(Option::is_some),
+        PlanKind::Compressed { pclusters, .. } => {
+            pclusters.iter().any(|p| p.pcluster_block_count > 0)
+        }
+        PlanKind::Dir { .. } | PlanKind::Device { .. } | PlanKind::Special => false,
+    }
 }
 
 /// The bytes left in a metadata block after an inode's body and xattrs:
