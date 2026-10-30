@@ -36,6 +36,7 @@ pub mod error;
 pub mod fs;
 pub mod inode;
 pub mod layout;
+mod lz4hc;
 pub mod mkfs;
 pub mod superblock;
 /// One in-memory device for every test in this crate.
