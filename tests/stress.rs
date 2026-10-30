@@ -43,7 +43,7 @@ impl Xs64 {
 /// node has a random ascii name; files get random byte payloads of
 /// random size in `0..max_file_size`. Small dirs (<=200 children) keep
 /// us under the writer's single-block-dir cap.
-fn random_tree(seed: u64, target_nodes: usize, max_file_size: usize) -> mkfs::Node {
+fn random_tree(seed: u64, target_nodes: usize, max_file_size: usize) -> mkfs::Node<'static> {
     let mut rng = Xs64::new(seed);
     let mut count = 0usize;
     let mut counter = 0u32;
@@ -68,7 +68,7 @@ fn random_tree(seed: u64, target_nodes: usize, max_file_size: usize) -> mkfs::No
         target: usize,
         max_size: usize,
         depth: usize,
-    ) -> mkfs::Node {
+    ) -> mkfs::Node<'static> {
         let mut entries = BTreeMap::new();
         let n_children = if depth >= 4 {
             0

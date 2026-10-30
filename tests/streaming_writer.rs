@@ -18,7 +18,7 @@ use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn streamed(content: Content) -> Node {
+fn streamed(content: Content<'_>) -> Node<'_> {
     Node::StreamedFile {
         mode: DEFAULT_FILE_MODE,
         content,
@@ -172,4 +172,60 @@ fn the_metadata_area_follows_the_file_data() {
         big.raw_u,
         big.raw_u + data_blocks
     );
+}
+
+/// A tree whose contents borrow -- here a local buffer, as a caller's
+/// would borrow another open image -- through openers that are not `Send`
+/// (they hold an `Rc`): content is only read on the thread that builds the
+/// image, compressing threads or not, so neither needs to be `'static` or
+/// `Send`.
+fn borrowing_tree<'a>(buf: &'a [u8], opens: &std::rc::Rc<std::cell::Cell<usize>>) -> Node<'a> {
+    let names = ["small", "block", "big", "half"];
+    let lens = [700, 4096, buf.len(), buf.len() / 2 + 3];
+    let entries = names
+        .iter()
+        .zip(lens)
+        .map(|(name, len)| {
+            let opens = opens.clone();
+            let content = Content::new(len as u64, move || {
+                opens.set(opens.get() + 1);
+                Ok(&buf[..len])
+            });
+            (name.to_string(), streamed(content))
+        })
+        .collect();
+    Node::Dir {
+        mode: mkfs::DEFAULT_DIR_MODE,
+        entries,
+        meta: NodeMeta::default(),
+        xattrs: Vec::new(),
+    }
+}
+
+#[test]
+fn contents_that_borrow_and_are_not_send_build_and_read_back() {
+    let buf = pattern(300_001, 9);
+    let opens = std::rc::Rc::new(std::cell::Cell::new(0));
+    for compression in [None, Some(mkfs::Compression::LZ4HC_12_32K)] {
+        opens.set(0);
+        let options = BuildOptions {
+            compression,
+            threads: 4,
+            ..BuildOptions::default()
+        };
+        let img = mkfs::build_image_with(borrowing_tree(&buf, &opens), 12, options).unwrap();
+        assert_eq!(opens.get(), 4, "{compression:?}: each content opened once");
+        let fs = open_image(img);
+        for (name, len) in [
+            ("small", 700),
+            ("block", 4096),
+            ("big", buf.len()),
+            ("half", buf.len() / 2 + 3),
+        ] {
+            let inode = fs.lookup_path(&format!("/{name}")).unwrap();
+            let mut got = vec![0u8; inode.size as usize];
+            fs.read_file(&inode, 0, &mut got).unwrap();
+            assert!(got == buf[..len], "{compression:?}: {name}");
+        }
+    }
 }
