@@ -303,7 +303,7 @@ fn fsck_passes_on_chunked_file_indexed() {
 
 // ---- W2a oracle coverage: LZ4 compressed inodes -----------------------
 
-fn compressed_lz4(data: &[u8]) -> mkfs::Node {
+fn compressed_lz4(data: &[u8]) -> mkfs::Node<'static> {
     mkfs::Node::CompressedFile(mkfs::CompressedFileSpec {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -319,7 +319,7 @@ fn compressed_lz4(data: &[u8]) -> mkfs::Node {
 
 /// Build a compacted-2B compressed-file node, with optional ztailpacking.
 /// Used by the W2b oracle tests below.
-fn compressed_lz4_compacted2b(data: &[u8], ztailpacking: bool) -> mkfs::Node {
+fn compressed_lz4_compacted2b(data: &[u8], ztailpacking: bool) -> mkfs::Node<'static> {
     mkfs::Node::CompressedFile(mkfs::CompressedFileSpec {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -471,7 +471,7 @@ fn collated_lz4_test_node(
     data: &[u8],
     target_pcluster_blocks: u32,
     index_format: mkfs::CompressedIndexFormat,
-) -> mkfs::Node {
+) -> mkfs::Node<'static> {
     mkfs::Node::CompressedFile(mkfs::CompressedFileSpec {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -536,7 +536,7 @@ fn fsck_passes_on_collated_compressed_legacy_index() {
 
 /// Helper for the W3 oracle tests. Builds a [`mkfs::Node::CompressedFile`]
 /// node with the requested codec, legacy index format, no ztailpacking.
-fn compressed_with(algo: mkfs::CompressedAlgo, data: &[u8]) -> mkfs::Node {
+fn compressed_with(algo: mkfs::CompressedAlgo, data: &[u8]) -> mkfs::Node<'static> {
     mkfs::Node::CompressedFile(mkfs::CompressedFileSpec {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -1238,4 +1238,45 @@ fn names_sorting_before_dot_are_found_by_fsck_and_the_kernel() {
         .map(str::to_string)
         .collect();
     assert_eq!(read, names);
+}
+
+/// Contents that borrow a local buffer rather than own their bytes build
+/// an image `fsck.erofs` accepts, uncompressed and compressed.
+#[test]
+fn fsck_passes_on_contents_that_borrow_a_local_buffer() {
+    let buf: Vec<u8> = (0..300_001u32)
+        .flat_map(|i| format!("{} ", i % 997).into_bytes())
+        .take(300_001)
+        .collect();
+    let source: &[u8] = &buf;
+    for compression in [None, Some(mkfs::Compression::LZ4HC_12_32K)] {
+        let borrowed = |len: usize| mkfs::Node::StreamedFile {
+            mode: mkfs::DEFAULT_FILE_MODE,
+            content: mkfs::Content::new(len as u64, move || Ok(&source[..len])),
+            meta: mkfs::NodeMeta::default(),
+            xattrs: Vec::new(),
+        };
+        let mut entries = std::collections::BTreeMap::new();
+        for (name, len) in [("small", 700), ("block", 4096), ("big", buf.len())] {
+            entries.insert(name.to_string(), borrowed(len));
+        }
+        let tree = mkfs::Node::Dir {
+            mode: mkfs::DEFAULT_DIR_MODE,
+            entries,
+            meta: mkfs::NodeMeta::default(),
+            xattrs: Vec::new(),
+        };
+        let options = mkfs::BuildOptions {
+            compression,
+            ..mkfs::BuildOptions::default()
+        };
+        let img = mkfs::build_image_with(tree, 12, options).unwrap();
+        let (path, _guard) = stage_image(&img);
+        let (code, stdout, stderr) = run_fsck(&path);
+        assert_eq!(
+            code,
+            Some(0),
+            "{compression:?}: fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
 }

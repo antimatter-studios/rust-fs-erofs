@@ -48,7 +48,7 @@ fn assert_tree_matches(fs: &Filesystem, expected: &[(&str, &[u8])]) {
 
 /// Standard small tree we feed every oracle case so behaviour is
 /// directly comparable across flag combinations.
-fn sample_tree() -> fs_erofs::mkfs::Node {
+fn sample_tree() -> fs_erofs::mkfs::Node<'static> {
     dir(vec![
         ("hello.txt", file(b"hello world\n")),
         ("a.bin", file(&[0xABu8; 200])),
@@ -1480,7 +1480,7 @@ fn oracle_uncompressed_ztailpacked_tail_round_trip() {
 /// Build a tree of N tiny files of varying sizes whose tails fragment-
 /// pack well. Each file's content is `pattern * size` so the SHA256
 /// per-file is content-distinct.
-fn fragments_sample_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node) {
+fn fragments_sample_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node<'static>) {
     // Chosen so each tail is small enough (well under one 4 KiB
     // lcluster) for mkfs.erofs to pack them into the shared packed
     // inode. Variety in size + content covers different
@@ -1621,7 +1621,7 @@ fn oracle_lzma_compr_cfgs_round_trip() {
 /// The content is a deterministic linear congruential stream: it does
 /// not compress to nothing, so the extents stay real, and it is the
 /// same bytes on every run, so a mismatch is reproducible.
-fn wide_fragment_sample_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node) {
+fn wide_fragment_sample_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node<'static>) {
     fn stream(len: usize, seed: u32) -> Vec<u8> {
         let mut out = Vec::with_capacity(len + 4);
         let mut x = seed;
@@ -1750,7 +1750,7 @@ fn partial_ref_extents(
 }
 
 /// `mixed_run_files` as a tree, and the files beside it.
-fn mixed_run_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node) {
+fn mixed_run_tree() -> (Vec<(String, Vec<u8>)>, fs_erofs::mkfs::Node<'static>) {
     let files = mixed_run_files();
     let entries: Vec<(&str, fs_erofs::mkfs::Node)> = files
         .iter()
