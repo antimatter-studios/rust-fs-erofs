@@ -668,10 +668,14 @@ pub fn build_image_to<W: Write + Seek>(
             PlanKind::File {
                 content,
                 size,
-                layout: FileLayout::FlatPlain,
-            } if *size > 0 => {
+                layout,
+            } if *layout == FileLayout::FlatPlain && *size > 0 => {
                 let content = content.take().expect("a file's content is read once");
                 let start = next_data_block;
+                // The last partial block goes inline when it fits after
+                // the inode, and the file takes only its whole blocks.
+                let tail = *size % bs;
+                let inline = tail > 0 && tail <= tail_room(body, bs);
                 // A file of a block or less cannot be stored in fewer
                 // blocks, so it is never compressed.
                 let streamed = match &mut lz4hc {
@@ -682,15 +686,22 @@ pub fn build_image_to<W: Write + Seek>(
                         start,
                         compression.max_pcluster_bytes as usize,
                     )?,
-                    _ => {
-                        out.write_content(start, content)?;
-                        Streamed::Stored
-                    }
+                    _ => Streamed::Stored {
+                        last: out.write_content(start, content, if inline { tail } else { 0 })?,
+                    },
                 };
                 match streamed {
-                    Streamed::Stored => {
+                    Streamed::Stored { last } => {
                         place.blkaddr = start;
-                        next_data_block += size.div_ceil(bs);
+                        if inline {
+                            // A stored file's last partial block was written
+                            // to the sink; the next data overwrites it.
+                            *layout = FileLayout::FlatInline;
+                            body.inline_tail = last;
+                            next_data_block += *size / bs;
+                        } else {
+                            next_data_block += size.div_ceil(bs);
+                        }
                     }
                     Streamed::Compressed {
                         pclusters,
@@ -741,9 +752,13 @@ pub fn build_image_to<W: Write + Seek>(
                 if target.len() as u64 > bs {
                     return Err(Error::BadInode("symlink target longer than one block"));
                 }
-                place.blkaddr = next_data_block;
-                out.write_blocks(next_data_block, target, 1)?;
-                next_data_block += 1;
+                if !target.is_empty() && target.len() as u64 <= tail_room(body, bs) {
+                    body.inline_tail = target.clone();
+                } else {
+                    place.blkaddr = next_data_block;
+                    out.write_blocks(next_data_block, target, 1)?;
+                    next_data_block += 1;
+                }
             }
             PlanKind::Chunked { chunks, .. } => {
                 for c in chunks.iter() {
@@ -790,6 +805,25 @@ pub fn build_image_to<W: Write + Seek>(
         placements.push(place);
     }
 
+    // A directory's last block goes inline when it fits after the inode.
+    // Which entries fill which block depends only on their names, so the
+    // blocks are sized here, before NIDs exist, with zeros for them; the
+    // inline tail is a placeholder of the right length until pass 4
+    // encodes the real entries.
+    let no_nids = vec![0u64; plan.len()];
+    for (i, n) in plan.iter().enumerate() {
+        if let PlanKind::Dir { children } = &n.kind {
+            let (blocks, last_used) = encode_dir_blocks(i, children, &plan, &no_nids, bs)?;
+            let full = blocks.len() as u64 - 1;
+            if last_used as u64 <= tail_room(&bodies[i], bs) {
+                bodies[i].inline_tail = vec![0u8; last_used];
+                placements[i].dir_size = full * bs + last_used as u64;
+            } else {
+                placements[i].dir_size = (full + 1) * bs;
+            }
+        }
+    }
+
     // Pass 3: lay out the metadata area, right after the data. Each inode
     // body + its trailers (xattrs, inline tail, chunkmap, zmap) consumes
     // contiguous bytes; `plan_meta_layout` owns the placement rules and is
@@ -817,9 +851,14 @@ pub fn build_image_to<W: Write + Seek>(
     let mut next_block = meta_blkaddr as u64 + meta_blocks;
     for (i, n) in plan.iter().enumerate() {
         if let PlanKind::Dir { children } = &n.kind {
-            let blocks = encode_dir_blocks(i, children, &plan, &nids, bs)?;
-            placements[i].blkaddr = next_block;
-            placements[i].dir_size = blocks.len() as u64 * bs;
+            let (mut blocks, last_used) = encode_dir_blocks(i, children, &plan, &nids, bs)?;
+            if !bodies[i].inline_tail.is_empty() {
+                let last = blocks.pop().expect("a directory has a block");
+                bodies[i].inline_tail = last[..last_used].to_vec();
+            }
+            if !blocks.is_empty() {
+                placements[i].blkaddr = next_block;
+            }
             for buf in &blocks {
                 out.write_blocks(next_block, buf, 1)?;
                 next_block += 1;
@@ -1104,8 +1143,9 @@ struct Placement {
 enum Streamed {
     /// Nothing in it was worth compressing: its bytes are in the image as
     /// they were read, from its first block on, as a FLAT_PLAIN file's
-    /// are.
-    Stored,
+    /// are. `last` is its last partial block, if it ends in one, for an
+    /// inline tail.
+    Stored { last: Vec<u8> },
     /// Its pclusters, one index entry per lcluster, each pcluster's first
     /// block, and the blocks they fill.
     Compressed {
@@ -1160,6 +1200,7 @@ fn compress_streamed<W: Write + Seek>(
     // Each pcluster: where in the file it starts, and its plan.
     let mut pclusters: Vec<(u64, PclusterPlan)> = Vec::new();
     let mut addrs: Vec<u32> = Vec::new();
+    let mut last: Vec<u8> = Vec::new();
     while pos < size {
         // Refill once less than half a window is left, moving what is
         // left to the front first: each byte moves at most once.
@@ -1203,6 +1244,9 @@ fn compress_streamed<W: Write + Seek>(
                 avail.len().min(bs as usize - into)
             };
             out.write_blocks(block, &avail[..len], 1)?;
+            if len < bs as usize {
+                last = avail[..len].to_vec();
+            }
             (len, 1, Z_EROFS_LCLUSTER_TYPE_PLAIN)
         };
         pclusters.push((
@@ -1227,7 +1271,7 @@ fn compress_streamed<W: Write + Seek>(
         .iter()
         .all(|(_, p)| p.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN)
     {
-        return Ok(Streamed::Stored);
+        return Ok(Streamed::Stored { last });
     }
 
     // One index entry per block of the file. A pcluster's head is the
@@ -1270,6 +1314,13 @@ fn compress_streamed<W: Write + Seek>(
         addrs,
         blocks: block - first_block,
     })
+}
+
+/// The bytes left in a metadata block after an inode's body and xattrs:
+/// the most an inline tail can hold, since the inode and its tail share
+/// one block.
+fn tail_room(body: &InodeBody, bs: u64) -> u64 {
+    bs.saturating_sub(body.body_size + body.xattr_bytes.len() as u64)
 }
 
 /// A block number, as the 32 bits every on-disk block address has.
@@ -1326,8 +1377,13 @@ impl<'a, W: Write + Seek> ImageSink<'a, W> {
     /// Copy a file's content to block `blkaddr`, through one bounded
     /// buffer, and pad its last block. Content that ends before its size,
     /// or goes on past it, is refused.
-    fn write_content(&mut self, blkaddr: u64, content: Content) -> Result<()> {
+    ///
+    /// The last `keep` bytes are returned rather than written, for an
+    /// inline tail; with `keep` zero nothing is returned.
+    fn write_content(&mut self, blkaddr: u64, content: Content, keep: u64) -> Result<Vec<u8>> {
         let size = content.size;
+        let to_sink = size - keep;
+        let mut kept = Vec::with_capacity(keep as usize);
         let mut reader = (content.open)().map_err(io_error)?;
         self.out
             .seek(std::io::SeekFrom::Start(blkaddr * self.bs))
@@ -1342,13 +1398,18 @@ impl<'a, W: Write + Seek> ImageSink<'a, W> {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(io_error(e)),
             };
-            self.out.write_all(&buf[..n]).map_err(io_error)?;
+            // Of these bytes, those before `to_sink` go to the sink.
+            let done = size - left;
+            let sink_part = (to_sink.saturating_sub(done) as usize).min(n);
+            self.out.write_all(&buf[..sink_part]).map_err(io_error)?;
+            kept.extend_from_slice(&buf[sink_part..n]);
             left -= n as u64;
         }
         if reader.read(&mut [0u8; 1]).map_err(io_error)? != 0 {
             return Err(Error::BadInode("file content is longer than its size"));
         }
-        self.write_zeros(size.next_multiple_of(self.bs) - size)
+        self.write_zeros(to_sink.next_multiple_of(self.bs) - to_sink)?;
+        Ok(kept)
     }
 }
 
@@ -3019,7 +3080,7 @@ fn encode_inode(
 ) -> Vec<u8> {
     let mut buf = vec![0u8; body.body_size as usize];
 
-    let (layout, flags) = inode_layout_and_flags(&n.kind);
+    let (layout, flags) = inode_layout_and_flags(&n.kind, body);
     let raw_format: u16 =
         (if body.is_extended { 1 } else { 0 }) | ((layout as u16) << 1) | ((flags & 0x0FFF) << 4);
     buf[ci::FORMAT].copy_from_slice(&raw_format.to_le_bytes());
@@ -3063,12 +3124,16 @@ fn encode_inode(
     buf
 }
 
-fn inode_layout_and_flags(kind: &PlanKind) -> (DataLayout, u16) {
+fn inode_layout_and_flags(kind: &PlanKind, body: &InodeBody) -> (DataLayout, u16) {
     match kind {
         PlanKind::File { layout, .. } => match layout {
             FileLayout::FlatPlain => (DataLayout::FlatPlain, 0),
             FileLayout::FlatInline => (DataLayout::FlatInline, 0),
         },
+        // A directory or symlink whose last block is inline.
+        PlanKind::Dir { .. } | PlanKind::Symlink { .. } if !body.inline_tail.is_empty() => {
+            (DataLayout::FlatInline, 0)
+        }
         PlanKind::Dir { .. }
         | PlanKind::Symlink { .. }
         | PlanKind::Device { .. }
@@ -3102,8 +3167,8 @@ fn inode_layout_and_flags(kind: &PlanKind) -> (DataLayout, u16) {
 fn inode_raw_u(n: &PlanNode, place: &Placement) -> u32 {
     match &n.kind {
         PlanKind::File { layout, .. } => match layout {
-            FileLayout::FlatPlain => place.blkaddr as u32,
-            FileLayout::FlatInline => 0,
+            // FLAT_INLINE: the whole blocks before the inline tail, if any.
+            FileLayout::FlatPlain | FileLayout::FlatInline => place.blkaddr as u32,
         },
         PlanKind::Dir { .. } | PlanKind::Symlink { .. } => place.blkaddr as u32,
         PlanKind::Device { rdev } => *rdev,
@@ -3163,7 +3228,7 @@ fn encode_dir_blocks(
     plan: &[PlanNode],
     nids: &[u64],
     bs: u64,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<(Vec<Vec<u8>>, usize)> {
     let parent = &plan[parent_idx];
     let parent_nid = nids[parent_idx];
     let parent_parent_nid = nids[parent.parent_idx as usize];
@@ -3188,6 +3253,7 @@ fn encode_dir_blocks(
     all.extend(sorted_children);
 
     let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut last_used = 0usize;
     let mut start = 0usize;
     while start < all.len() {
         let mut end = start;
@@ -3208,12 +3274,13 @@ fn encode_dir_blocks(
         }
         let block = encode_one_dir_block(&all[start..end], bs)?;
         out.push(block);
+        last_used = header + names;
         start = end;
     }
     if out.is_empty() {
         return Err(Error::BadDirent("dir has zero entries"));
     }
-    Ok(out)
+    Ok((out, last_used))
 }
 
 fn encode_one_dir_block(entries: &[(String, u64, u8)], bs: u64) -> Result<Vec<u8>> {
@@ -4448,14 +4515,12 @@ mod tests {
         )
         .unwrap();
 
-        // Walk the root dir block: read root inode, get raw_blkaddr,
-        // fetch that block, parse the dirent array.
-        let fs = open(img.clone());
+        // Walk the root's entries in on-disk order. Its one block is
+        // inline, after the inode, so read it through the directory
+        // reader rather than at a block address.
+        let fs = open(img);
         let root = fs.root_inode().unwrap();
-        let bs = fs.superblock().block_size() as usize;
-        let blk_off = root.raw_u as usize * bs;
-        let block = &img[blk_off..blk_off + bs];
-        let entries = crate::dir::iter_block(block).unwrap();
+        let entries = fs.read_dir(&root).unwrap();
 
         // First two entries must be ".", ".." per EROFS convention.
         assert_eq!(entries[0].name, b".");
