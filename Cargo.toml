@@ -76,6 +76,12 @@ lru = "0.12"
 # the `rust-fs-erofs` target above). No derive: the builder API keeps each
 # tool's command a function the man pages and completions can be made from.
 clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
+# LZ4HC for the builder's compression (src/lz4hc.rs): liblz4 itself,
+# which `mkfs.erofs -zlz4hc` calls, built from its BSD-2 `lib/` sources by
+# this MIT crate and bundled into the static library. No pure-Rust LZ4
+# encoder has an HC mode or the fixed-output (destSize) mode a pcluster
+# needs. Needs a C compiler at build time; nothing at run time.
+lz4-sys = "1.11"
 
 [dev-dependencies]
 # The test suite's one way in to a fixture, to an erofs-utils tool and to
