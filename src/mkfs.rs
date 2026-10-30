@@ -837,9 +837,13 @@ pub fn build_image_to<W: Write + Seek>(
 
     let meta_slots = plan_meta_layout(&bodies, bs);
     let nids: Vec<u64> = meta_slots.iter().map(MetaSlot::nid).collect();
+    // The furthest slot's end: an inode can fill room an earlier one
+    // left, so the last one planned need not be the last in the area.
     let meta_total_bytes = meta_slots
-        .last()
-        .map_or(0, MetaSlot::end)
+        .iter()
+        .map(MetaSlot::end)
+        .max()
+        .unwrap_or(0)
         .div_ceil(COMPACT_INODE_SIZE)
         * COMPACT_INODE_SIZE;
     let meta_blocks = meta_total_bytes.div_ceil(bs);
@@ -2327,6 +2331,14 @@ fn body_span(body: &InodeBody) -> u64 {
 ///    tolerate crossings, but it is simplest to enforce the same rule
 ///    for everything.)
 ///
+/// What a skip leaves at the end of a block is not lost: an inode that
+/// fits in one block goes in the block, of those left behind, with the
+/// least room that still holds it -- the lowest such block on a tie, so
+/// the same bodies always get the same NIDs -- and only when none holds
+/// it does it go at the end. Small files with inline tails would
+/// otherwise waste up to a block apiece; `mkfs.erofs` fills that room
+/// too. The root, planned first, is always at NID 0.
+///
 /// This function is the only place those rules exist. Both the NIDs
 /// written into directory entries and the addresses the inode bytes are
 /// written to are read out of the slots it returns, so there is no
@@ -2338,12 +2350,33 @@ fn body_span(body: &InodeBody) -> u64 {
 /// boundary.
 fn plan_meta_layout(bodies: &[InodeBody], bs: u64) -> Vec<MetaSlot> {
     let mut slots = Vec::with_capacity(bodies.len());
+    // Blocks left behind with room in them, as (room in bytes, block).
+    // Room is always at a block's end, and a multiple of a slot.
+    let mut room: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
     let mut cursor: u64 = 0;
     for body in bodies {
-        cursor = cursor.div_ceil(COMPACT_INODE_SIZE) * COMPACT_INODE_SIZE;
         let span = body_span(body);
+        if span <= bs {
+            if let Some(&(free, block)) = room.range((span, 0)..).next() {
+                room.remove(&(free, block));
+                let used = bs - free;
+                slots.push(MetaSlot {
+                    start: block * bs + used,
+                    span,
+                });
+                let used = (used + span).next_multiple_of(COMPACT_INODE_SIZE);
+                if used < bs {
+                    room.insert((bs - used, block));
+                }
+                continue;
+            }
+        }
+        cursor = cursor.div_ceil(COMPACT_INODE_SIZE) * COMPACT_INODE_SIZE;
         let trailers = span - body.body_size;
         if trailers > 0 && cursor % bs + span > bs {
+            if !cursor.is_multiple_of(bs) {
+                room.insert((bs - cursor % bs, cursor / bs));
+            }
             cursor = cursor.div_ceil(bs) * bs;
         }
         slots.push(MetaSlot {
@@ -4888,7 +4921,10 @@ mod tests {
 
     #[test]
     fn meta_layout_slots_never_overlap() {
-        let slots = plan_meta_layout(&meta_layout_fixture(), 4096);
+        // In address order: an inode can fill room an earlier one left,
+        // so plan order is not address order.
+        let mut slots = plan_meta_layout(&meta_layout_fixture(), 4096);
+        slots.sort_by_key(|slot| slot.start);
         for pair in slots.windows(2) {
             assert!(
                 pair[0].end() <= pair[1].start,
