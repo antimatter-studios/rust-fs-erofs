@@ -297,6 +297,22 @@ pub struct BuildOptions {
     /// `EROFS_FEATURE_INCOMPAT_COMPR_CFGS` bit. Reader decoders consult
     /// this for non-default codec props (today: LZMA `dict_size`).
     pub compr_cfgs: Option<ComprCfgsConfig>,
+
+    /// The superblock's 16-byte volume UUID. All zeros by default, which
+    /// tools read as "no UUID".
+    pub uuid: [u8; 16],
+
+    /// The superblock's `build_time`, in seconds since the epoch, and
+    /// its nanoseconds. A compact inode has no mtime of its own and
+    /// reads as this, so an inode whose mtime equals it stays compact.
+    pub build_time: u64,
+    pub build_time_nsec: u32,
+
+    /// When `true`, every inode's mtime is `build_time` whatever its
+    /// [`NodeMeta`] says -- what `mkfs.erofs -T` does. With a fixed
+    /// `build_time` the same tree then builds to the same bytes, and
+    /// every inode that needs nothing wider is compact.
+    pub mtime_is_build_time: bool,
 }
 
 /// Per-codec configuration to surface in the COMPR_CFGS blob.
@@ -386,6 +402,12 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     let mut plan: Vec<PlanNode> = Vec::new();
     flatten(root, 0, &mut plan)?;
     plan[0].parent_idx = 0;
+    if options.mtime_is_build_time {
+        for node in &mut plan {
+            node.meta.mtime = options.build_time;
+            node.meta.mtime_nsec = options.build_time_nsec;
+        }
+    }
 
     // Detect which non-LZ4 codecs the tree actually uses. LZ4
     // (algorithmtype 0) is the implicit default and needs no
@@ -427,7 +449,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
 
     let mut bodies: Vec<InodeBody> = Vec::with_capacity(plan.len());
     for node in &mut plan {
-        let body = plan_body(node, bs, lzma_dict_size_override)?;
+        let body = plan_body(node, bs, lzma_dict_size_override, &options)?;
         bodies.push(body);
     }
 
@@ -724,6 +746,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         sb_u1,
         xattr_prefix_count,
         xattr_prefix_start_div4,
+        &options,
     );
 
     // Inodes + their inline trailers. Every address here comes out of
@@ -1932,7 +1955,12 @@ fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64>
 /// planning compressed inodes — it lets the writer advertise a
 /// non-default dict in the COMPR_CFGS blob and patch the in-stream
 /// LZMA1 header to match. `None` keeps the lzma-rs default (8 MiB).
-fn plan_body(n: &mut PlanNode, bs: u64, lzma_dict_size_override: Option<u32>) -> Result<InodeBody> {
+fn plan_body(
+    n: &mut PlanNode,
+    bs: u64,
+    lzma_dict_size_override: Option<u32>,
+    options: &BuildOptions,
+) -> Result<InodeBody> {
     let (xattr_bytes, xattr_icount) = encode_inline_xattrs(&n.xattrs)?;
 
     // Compute the file-size field that ends up in i_size. For dirs the
@@ -1953,8 +1981,11 @@ fn plan_body(n: &mut PlanNode, bs: u64, lzma_dict_size_override: Option<u32>) ->
     let is_extended = size > u32::MAX as u64
         || n.meta.uid > u16::MAX as u32
         || n.meta.gid > u16::MAX as u32
-        || n.meta.mtime != 0
-        || n.meta.mtime_nsec != 0;
+        // A compact inode has no mtime field: it reads as the
+        // superblock's build time, so only a different mtime needs the
+        // extended body.
+        || n.meta.mtime != options.build_time
+        || n.meta.mtime_nsec != options.build_time_nsec;
 
     // FLAT_INLINE for regular files whose entire payload fits in one
     // metadata block AFTER the body+xattrs. The block-fit invariant is
@@ -2220,6 +2251,7 @@ fn write_superblock(
     u1: u16,
     xattr_prefix_count: u8,
     xattr_prefix_start: u32,
+    options: &BuildOptions,
 ) {
     // Every field below is placed through `superblock::offsets`, the
     // same table the parser reads — so a field cannot move on the write
@@ -2235,6 +2267,13 @@ fn write_superblock(
     put(img, sb::INOS, &n_inodes.to_le_bytes());
     put(img, sb::BLOCKS, &total_blocks.to_le_bytes());
     put(img, sb::META_BLKADDR, &meta_blkaddr.to_le_bytes());
+    put(img, sb::BUILD_TIME, &options.build_time.to_le_bytes());
+    put(
+        img,
+        sb::BUILD_TIME_NSEC,
+        &options.build_time_nsec.to_le_bytes(),
+    );
+    put(img, sb::UUID, &options.uuid);
     let label = b"rsmkfs";
     img[off + sb::VOLUME_NAME.start..off + sb::VOLUME_NAME.start + label.len()]
         .copy_from_slice(label);
@@ -4208,6 +4247,118 @@ mod tests {
         assert!(
             block_aligned >= 2,
             "fixture no longer forces metadata-block skips ({block_aligned} aligned inodes)"
+        );
+    }
+
+    fn with_mtime(node: Node, mtime: u64) -> Node {
+        let meta = NodeMeta {
+            mtime,
+            ..NodeMeta::default()
+        };
+        match node {
+            Node::File {
+                mode, data, xattrs, ..
+            } => Node::File {
+                mode,
+                data,
+                meta,
+                xattrs,
+            },
+            Node::Dir {
+                mode,
+                entries,
+                xattrs,
+                ..
+            } => Node::Dir {
+                mode,
+                entries,
+                meta,
+                xattrs,
+            },
+            other => other,
+        }
+    }
+
+    const EPOCH: u64 = 1_230_768_000;
+
+    #[test]
+    fn the_superblock_carries_the_requested_uuid_and_build_time() {
+        let uuid = *b"\x01\x23\x45\x67\x89\xab\xcd\xef\xfe\xdc\xba\x98\x76\x54\x32\x10";
+        let options = BuildOptions {
+            uuid,
+            build_time: EPOCH,
+            build_time_nsec: 7,
+            ..BuildOptions::default()
+        };
+        let fs = open(build_image_with(dir(vec![]), 12, options).unwrap());
+        let sb = fs.superblock();
+        assert_eq!(sb.uuid, uuid);
+        assert_eq!(sb.build_time, EPOCH);
+        assert_eq!(sb.build_time_nsec, 7);
+    }
+
+    /// `-T`: every inode takes the build time as its mtime, whatever the
+    /// tree said, and so every one of them fits a compact inode.
+    #[test]
+    fn mtime_is_build_time_makes_every_inode_compact_with_that_mtime() {
+        let options = BuildOptions {
+            build_time: EPOCH,
+            mtime_is_build_time: true,
+            ..BuildOptions::default()
+        };
+        let tree = with_mtime(
+            dir(vec![
+                ("a", with_mtime(file(b"one"), 5)),
+                ("sub", with_mtime(dir(vec![("b", file(&[7u8; 9000]))]), 6)),
+            ]),
+            4,
+        );
+        let fs = open(build_image_with(tree, 12, options).unwrap());
+        for path in ["/", "/a", "/sub", "/sub/b"] {
+            let inode = fs.lookup_path(path).unwrap();
+            assert_eq!(inode.on_disk_size as u64, COMPACT_INODE_SIZE, "{path}");
+            assert_eq!(inode.mtime, EPOCH, "{path} mtime");
+        }
+    }
+
+    /// A compact inode's mtime is the superblock's build time: an inode
+    /// whose own mtime matches it needs no extended body to say so.
+    #[test]
+    fn an_mtime_equal_to_the_build_time_is_written_compact() {
+        let options = BuildOptions {
+            build_time: EPOCH,
+            ..BuildOptions::default()
+        };
+        let tree = dir(vec![
+            ("same", with_mtime(file(b"x"), EPOCH)),
+            ("other", with_mtime(file(b"y"), EPOCH + 1)),
+        ]);
+        let fs = open(build_image_with(tree, 12, options).unwrap());
+        let same = fs.lookup_path("/same").unwrap();
+        assert_eq!(same.on_disk_size as u64, COMPACT_INODE_SIZE);
+        assert_eq!(same.mtime, EPOCH);
+        let other = fs.lookup_path("/other").unwrap();
+        assert_eq!(other.on_disk_size as u64, EXTENDED_INODE_SIZE);
+        assert_eq!(other.mtime, EPOCH + 1);
+    }
+
+    #[test]
+    fn the_same_tree_and_options_build_the_same_bytes() {
+        let options = || BuildOptions {
+            uuid: [9; 16],
+            build_time: EPOCH,
+            mtime_is_build_time: true,
+            ..BuildOptions::default()
+        };
+        let tree = || {
+            dir(vec![
+                ("a", file(b"one")),
+                ("sub", dir(vec![("b", file(&[7u8; 9000]))])),
+            ])
+        };
+        assert_eq!(
+            build_image_with(tree(), 12, options()).unwrap(),
+            build_image_with(tree(), 12, options()).unwrap()
         );
     }
 }
