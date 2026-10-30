@@ -9,7 +9,7 @@ mod common;
 
 use common::open_image;
 use fs_erofs::mkfs::{
-    self, BuildOptions, Content, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
+    self, BuildOptions, Compression, Content, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
@@ -86,8 +86,7 @@ const SMALL_FILES: u64 = 10_000;
 /// The bound on the build's peak heap: an eighth of the file data.
 const PEAK_LIMIT: usize = 24 << 20;
 
-#[test]
-fn a_build_holds_the_metadata_in_memory_and_never_the_file_data() {
+fn tree() -> Node {
     let mut root = BTreeMap::new();
     for d in 0..100u64 {
         let mut entries = BTreeMap::new();
@@ -100,12 +99,27 @@ fn a_build_holds_the_metadata_in_memory_and_never_the_file_data() {
     for b in 0..BIG_FILES {
         root.insert(format!("big-{b:02}"), generated(1_000_000 + b, BIG_SIZE));
     }
-    let tree = directory(root);
+    directory(root)
+}
 
+/// Uncompressed, and compressed as `-zlz4hc,12 -C 32768`, which adds the
+/// compressor's window and buffers and nothing per byte of data.
+#[test]
+fn a_build_holds_the_metadata_in_memory_and_never_the_file_data() {
+    build_and_check(None);
+    build_and_check(Some(Compression::LZ4HC_12_32K));
+}
+
+fn build_and_check(compression: Option<Compression>) {
+    let tree = tree();
+    let options = BuildOptions {
+        compression,
+        ..BuildOptions::default()
+    };
     let mut sink = tempfile::tempfile().expect("a file to build into");
     let before = LIVE.load(Ordering::SeqCst);
     PEAK.store(before, Ordering::SeqCst);
-    let len = mkfs::build_image_to(tree, 12, BuildOptions::default(), &mut sink).expect("build");
+    let len = mkfs::build_image_to(tree, 12, options, &mut sink).expect("build");
     let peak = PEAK.load(Ordering::SeqCst) - before;
 
     assert!(
@@ -114,7 +128,8 @@ fn a_build_holds_the_metadata_in_memory_and_never_the_file_data() {
     );
     assert!(
         peak < PEAK_LIMIT,
-        "building an image of {} MiB of file data peaked at {} MiB of heap; the limit is {} MiB",
+        "building an image of {} MiB of file data ({compression:?}) peaked at {} MiB of heap; \
+         the limit is {} MiB",
         (BIG_FILES * BIG_SIZE) >> 20,
         peak >> 20,
         PEAK_LIMIT >> 20

@@ -280,3 +280,91 @@ fn fsck_accepts_the_compressed_image_and_the_kernel_reads_every_file() {
         );
     }
 }
+
+/// What the kernel requires of a big-pcluster legacy index, entry by
+/// entry, over files whose text ends in an incompressible stretch, stored
+/// a block at a time from wherever the text's last pcluster ended, and
+/// whose length steps through two blocks so the last stored pcluster
+/// starts at every kind of offset and is every kind of length:
+///
+/// - the file starts with a head at offset 0;
+/// - a NONHEAD lcluster belongs to a compressed pcluster, never a stored
+///   one: a stored pcluster maps one block of the file, no more, and the
+///   last one ends in the lcluster after its head at most when a head
+///   follows it there;
+/// - a compressed pcluster's first NONHEAD carries its block count;
+/// - every NONHEAD's `delta[1]` reaches the next head, or the end.
+#[test]
+fn the_index_holds_what_the_kernel_requires_of_it() {
+    use fs_erofs::zmap::{
+        Z_EROFS_LCLUSTER_TYPE_HEAD1 as HEAD1, Z_EROFS_LCLUSTER_TYPE_NONHEAD as NONHEAD,
+    };
+    let tails: Vec<usize> = (0..=8192).step_by(97).collect();
+    let names: Vec<String> = tails.iter().map(|t| format!("t{t}")).collect();
+    let files: Vec<Vec<u8>> = tails
+        .iter()
+        .map(|&t| {
+            let mut data = text(70_000 + t * 3, t as u64);
+            data.extend(noise(50_000 + t, t as u64 + 1));
+            data
+        })
+        .collect();
+    let tree = dir(names
+        .iter()
+        .zip(&files)
+        .map(|(n, d)| (n.as_str(), file(d)))
+        .collect());
+    let img = mkfs::build_image_with(tree, 12, options()).unwrap();
+    let dev = common::MemDev::new(img.clone());
+    let fs = open_image(img);
+    for (name, data) in names.iter().zip(&files) {
+        let inode = fs.lookup_path(&format!("/{name}")).unwrap();
+        assert_eq!(read_back(&fs, &format!("/{name}")), *data, "{name}");
+        let zmap = ZMap::open(&dev as &dyn BlockRead, fs.superblock(), &inode).unwrap();
+        let n = zmap.n_lclusters();
+        let entries: Vec<_> = (0..n)
+            .map(|i| zmap.read_lcluster(&dev as &dyn BlockRead, i).unwrap())
+            .collect();
+        assert!(
+            entries[0].cluster_type != NONHEAD && entries[0].clusterofs == 0,
+            "{name}"
+        );
+        let mut head = 0usize;
+        for (i, e) in entries.iter().enumerate() {
+            if e.cluster_type != NONHEAD {
+                head = i;
+                continue;
+            }
+            let back = match e.cblkcnt {
+                Some(blocks) => {
+                    assert!(
+                        (1..=8).contains(&blocks),
+                        "{name} lcluster {i}: {blocks} blocks"
+                    );
+                    1
+                }
+                None => (e.u_raw & 0xFFFF) as usize,
+            };
+            assert_eq!(i - back, head, "{name} lcluster {i}: delta[0]");
+            assert_eq!(
+                entries[head].cluster_type, HEAD1,
+                "{name} lcluster {i} follows a stored pcluster"
+            );
+            if i == head + 1 {
+                assert!(
+                    e.cblkcnt.is_some(),
+                    "{name} lcluster {i}: no CBLKCNT after its head"
+                );
+            }
+            let next = entries[i..]
+                .iter()
+                .position(|x| x.cluster_type != NONHEAD)
+                .map_or(n as usize, |p| i + p);
+            assert_eq!(
+                (e.u_raw >> 16) as usize,
+                next - i,
+                "{name} lcluster {i}: delta[1]"
+            );
+        }
+    }
+}

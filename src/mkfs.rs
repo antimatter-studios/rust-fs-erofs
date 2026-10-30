@@ -40,6 +40,7 @@ use crate::dir::{ftype, EROFS_DIRENT_SIZE};
 use crate::error::{Error, Result};
 use crate::inode::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK};
 use crate::layout::DataLayout;
+use crate::lz4hc::Lz4Hc;
 pub use crate::superblock::LzmaCfg;
 use crate::superblock::{
     EROFS_FEATURE_COMPAT_SB_CHKSUM, EROFS_FEATURE_INCOMPAT_COMPR_CFGS,
@@ -49,10 +50,11 @@ use crate::superblock::{
 pub use crate::xattr::XattrLongPrefix;
 use crate::xattr::{XATTR_ENTRY_ALIGN, XATTR_HEADER_SIZE};
 use crate::zmap::{
-    CompactPackShape, COMPACT_2B, COMPACT_4B, COMPACT_MAP_EBASE_ALIGN, Z_EROFS_ADVISE_COMPACTED_2B,
-    Z_EROFS_ADVISE_INLINE_PCLUSTER, Z_EROFS_COMPACT_MAP_HEADER_SIZE, Z_EROFS_LCLUSTER_INDEX_SIZE,
-    Z_EROFS_LCLUSTER_TYPE_HEAD1, Z_EROFS_LCLUSTER_TYPE_NONHEAD, Z_EROFS_LCLUSTER_TYPE_PLAIN,
-    Z_EROFS_LEGACY_MAP_HEADER_SIZE,
+    CompactPackShape, COMPACT_2B, COMPACT_4B, COMPACT_MAP_EBASE_ALIGN,
+    Z_EROFS_ADVISE_BIG_PCLUSTER_1, Z_EROFS_ADVISE_COMPACTED_2B, Z_EROFS_ADVISE_INLINE_PCLUSTER,
+    Z_EROFS_COMPACT_MAP_HEADER_SIZE, Z_EROFS_LCLUSTER_INDEX_SIZE, Z_EROFS_LCLUSTER_TYPE_HEAD1,
+    Z_EROFS_LCLUSTER_TYPE_NONHEAD, Z_EROFS_LCLUSTER_TYPE_PLAIN, Z_EROFS_LEGACY_MAP_HEADER_SIZE,
+    Z_EROFS_LI_D0_CBLKCNT,
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
@@ -440,6 +442,22 @@ pub struct Compression {
 }
 
 impl Compression {
+    /// Refuse a level LZ4HC does not have, and a pcluster size that is
+    /// not a whole number of blocks from one block to 1 MiB, the most
+    /// the kernel decompresses at once.
+    fn validate(&self, bs: u64) -> Result<()> {
+        if !(1..=12).contains(&self.lz4hc_level) {
+            return Err(Error::BadInode("LZ4HC level outside 1..=12"));
+        }
+        let max = self.max_pcluster_bytes as u64;
+        if max < bs || !max.is_multiple_of(bs) || max > 1 << 20 {
+            return Err(Error::BadInode(
+                "max_pcluster_bytes is not a whole number of blocks up to 1 MiB",
+            ));
+        }
+        Ok(())
+    }
+
     /// `-zlz4hc,12 -C 32768`.
     pub const LZ4HC_12_32K: Compression = Compression {
         lz4hc_level: 12,
@@ -638,8 +656,14 @@ pub fn build_image_to<W: Write + Seek>(
     };
     let mut placements: Vec<Placement> = Vec::with_capacity(plan.len());
     let mut any_compressed = false;
-    for n in plan.iter_mut() {
+    let mut any_streamed_compressed = false;
+    let mut lz4hc = options
+        .compression
+        .map(|c| c.validate(bs).map(|()| (Lz4Hc::new(c.lz4hc_level), c)))
+        .transpose()?;
+    for (n, body) in plan.iter_mut().zip(bodies.iter_mut()) {
         let mut place = Placement::default();
+        let mut compressed: Option<PlanKind> = None;
         match &mut n.kind {
             PlanKind::File {
                 content,
@@ -647,9 +671,64 @@ pub fn build_image_to<W: Write + Seek>(
                 layout: FileLayout::FlatPlain,
             } if *size > 0 => {
                 let content = content.take().expect("a file's content is read once");
-                place.blkaddr = next_data_block;
-                out.write_content(next_data_block, content)?;
-                next_data_block += size.div_ceil(bs);
+                let start = next_data_block;
+                // A file of a block or less cannot be stored in fewer
+                // blocks, so it is never compressed.
+                let streamed = match &mut lz4hc {
+                    Some((encoder, compression)) if *size > bs => compress_streamed(
+                        &mut out,
+                        encoder,
+                        content,
+                        start,
+                        compression.max_pcluster_bytes as usize,
+                    )?,
+                    _ => {
+                        out.write_content(start, content)?;
+                        Streamed::Stored
+                    }
+                };
+                match streamed {
+                    Streamed::Stored => {
+                        place.blkaddr = start;
+                        next_data_block += size.div_ceil(bs);
+                    }
+                    Streamed::Compressed {
+                        pclusters,
+                        entries,
+                        addrs,
+                        blocks,
+                    } => {
+                        any_compressed = true;
+                        any_streamed_compressed = true;
+                        let (_, compression) = lz4hc.as_ref().expect("compressed with it");
+                        // The legacy map header sits at the 8-byte boundary
+                        // after the inode body and its xattrs; every slot
+                        // starts 32-byte aligned, so that boundary is known
+                        // from their sizes alone.
+                        let end = body.body_size + body.xattr_bytes.len() as u64;
+                        body.zmap_bytes = end.next_multiple_of(8) - end
+                            + Z_EROFS_LEGACY_MAP_HEADER_SIZE
+                            + entries.len() as u64 * Z_EROFS_LCLUSTER_INDEX_SIZE;
+                        place.pcluster_addrs = addrs;
+                        next_data_block += blocks;
+                        compressed = Some(PlanKind::Compressed {
+                            src: Vec::new(),
+                            size: *size,
+                            big_pcluster: compression.max_pcluster_bytes as u64 > bs,
+                            algo: CompressedAlgo::Lz4,
+                            lclusterbits: 0,
+                            pclusters,
+                            lcluster_entries: entries,
+                            total_compressed_blocks: u32::try_from(blocks)
+                                .map_err(|_| Error::BadInode("compressed blocks overflow u32"))?,
+                            index_format: CompressedIndexFormat::Legacy,
+                            ztailpacking_requested: false,
+                            ztailpacking_inline: None,
+                            target_pcluster_blocks: (compression.max_pcluster_bytes as u64 / bs)
+                                as u32,
+                        });
+                    }
+                }
             }
             PlanKind::File { content, .. } => {
                 // An empty file still opens its content, to refuse a
@@ -704,6 +783,9 @@ pub fn build_image_to<W: Write + Seek>(
                 }
             }
             PlanKind::Dir { .. } | PlanKind::Device { .. } | PlanKind::Special => {}
+        }
+        if let Some(kind) = compressed {
+            n.kind = kind;
         }
         placements.push(place);
     }
@@ -787,7 +869,13 @@ pub fn build_image_to<W: Write + Seek>(
     // implicit default and is only declared when the caller explicitly
     // asks for it.
     let cfg = options.compr_cfgs.as_ref();
-    let lz4_cfg: Option<u16> = cfg.and_then(|c| c.lz4);
+    // A file compressed as it streams can have pclusters of more than
+    // one block, which the LZ4 record's `max_pcluster_blks` must allow:
+    // declare LZ4 with liblz4's full 64 KiB - 1 match distance, as
+    // `mkfs.erofs` does.
+    let lz4_cfg: Option<u16> = cfg
+        .and_then(|c| c.lz4)
+        .or(any_streamed_compressed.then_some(u16::MAX));
     let lzma_cfg: Option<LzmaCfg> = cfg.and_then(|c| c.lzma).or(if used_lzma {
         Some(LzmaCfg::default())
     } else {
@@ -1010,6 +1098,178 @@ struct Placement {
     chunk_addrs: Vec<u32>,
     /// A compressed file's pclusters, each its first block.
     pcluster_addrs: Vec<u32>,
+}
+
+/// What compressing one file as it was read came to.
+enum Streamed {
+    /// Nothing in it was worth compressing: its bytes are in the image as
+    /// they were read, from its first block on, as a FLAT_PLAIN file's
+    /// are.
+    Stored,
+    /// Its pclusters, one index entry per lcluster, each pcluster's first
+    /// block, and the blocks they fill.
+    Compressed {
+        pclusters: Vec<PclusterPlan>,
+        entries: Vec<LclusterIndexEntry>,
+        addrs: Vec<u32>,
+        blocks: u64,
+    },
+}
+
+/// The most of a file LZ4HC is shown at once. A pcluster holds what
+/// compresses into it from the start of this, so it bounds how much one
+/// pcluster can hold; at 1 MiB a block of the image still holds a whole
+/// pcluster of a file's zeros.
+const COMPRESS_WINDOW: usize = 1 << 20;
+
+/// Compress a file as it is read, into pclusters written from block
+/// `first_block` on, as `mkfs.erofs -zlz4hc -C` does.
+///
+/// Each pcluster takes as much of the file as LZ4HC fits in
+/// `max_pcluster_bytes`, padded at the front to whole blocks
+/// (`EROFS_FEATURE_INCOMPAT_ZERO_PADDING`) -- unless that saves no block
+/// over the bytes it took, when one block of the file is stored as it is
+/// (a PLAIN pcluster) instead. Pclusters need not start on a block, so a
+/// head lcluster records where in it its pcluster starts. Logical clusters
+/// are one block each.
+///
+/// When every pcluster is PLAIN, each one holds the next block of the file
+/// from offset 0, so the file is in the image exactly as an uncompressed
+/// file is: [`Streamed::Stored`] says to describe it as one, and nothing
+/// is read twice.
+fn compress_streamed<W: Write + Seek>(
+    out: &mut ImageSink<'_, W>,
+    encoder: &mut Lz4Hc,
+    content: Content,
+    first_block: u64,
+    max_pcluster_bytes: usize,
+) -> Result<Streamed> {
+    let bs = out.bs;
+    let size = content.size;
+    let mut reader = (content.open)().map_err(io_error)?;
+    let window = COMPRESS_WINDOW.max(2 * max_pcluster_bytes);
+    let mut buf: Vec<u8> = Vec::with_capacity(window);
+    // `buf[start..]` is what has been read and not yet put in a pcluster;
+    // it begins at file offset `pos`.
+    let mut start = 0usize;
+    let mut pos = 0u64;
+    let mut unread = size;
+    let mut dst = vec![0u8; max_pcluster_bytes];
+    let mut frame: Vec<u8> = Vec::with_capacity(max_pcluster_bytes);
+    let mut block = first_block;
+    // Each pcluster: where in the file it starts, and its plan.
+    let mut pclusters: Vec<(u64, PclusterPlan)> = Vec::new();
+    let mut addrs: Vec<u32> = Vec::new();
+    while pos < size {
+        // Refill once less than half a window is left, moving what is
+        // left to the front first: each byte moves at most once.
+        if unread > 0 && buf.len() - start < window / 2 {
+            buf.drain(..start);
+            start = 0;
+            let want = ((window - buf.len()) as u64).min(unread) as usize;
+            let old = buf.len();
+            buf.resize(old + want, 0);
+            reader.read_exact(&mut buf[old..]).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Error::BadInode("file content is shorter than its size")
+                } else {
+                    io_error(e)
+                }
+            })?;
+            unread -= want as u64;
+        }
+        let avail = &buf[start..];
+        let (taken, written) = encoder.compress_dest_size(avail, &mut dst);
+        let cblks = (written as u64).div_ceil(bs);
+        addrs.push(block_addr(block)?);
+        let (len, blocks, cluster_type) = if taken > 0 && cblks < (taken as u64).div_ceil(bs) {
+            frame.clear();
+            frame.resize((cblks * bs) as usize - written, 0);
+            frame.extend_from_slice(&dst[..written]);
+            out.write_blocks(block, &frame, cblks)?;
+            (taken, cblks, Z_EROFS_LCLUSTER_TYPE_HEAD1)
+        } else {
+            // One block of the file, stored as it is. The kernel maps a
+            // stored pcluster to one block of the file at most, from its
+            // head up to the next head; with no head after it, that is to
+            // the end of the lcluster the file ends in. So the last one,
+            // if it starts inside a block and would run on into the next,
+            // stops at the boundary and leaves the rest to a pcluster of
+            // its own there.
+            let into = (pos % bs) as usize;
+            let len = if avail.len() > bs as usize || into == 0 {
+                (bs as usize).min(avail.len())
+            } else {
+                avail.len().min(bs as usize - into)
+            };
+            out.write_blocks(block, &avail[..len], 1)?;
+            (len, 1, Z_EROFS_LCLUSTER_TYPE_PLAIN)
+        };
+        pclusters.push((
+            pos,
+            PclusterPlan {
+                block_bytes: Vec::new(),
+                cluster_type,
+                pcluster_block_count: blocks as u32,
+                raw_compressed: Vec::new(),
+                head_lcluster_idx: (pos / bs) as u32,
+                n_lclusters: 0,
+            },
+        ));
+        pos += len as u64;
+        start += len;
+        block += blocks;
+    }
+    if reader.read(&mut [0u8; 1]).map_err(io_error)? != 0 {
+        return Err(Error::BadInode("file content is longer than its size"));
+    }
+    if pclusters
+        .iter()
+        .all(|(_, p)| p.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN)
+    {
+        return Ok(Streamed::Stored);
+    }
+
+    // One index entry per block of the file. A pcluster's head is the
+    // lcluster it starts in, recording where in it; every lcluster no
+    // pcluster starts in belongs to the last one that started before it.
+    // Each pcluster takes more than a block of the file but the last, so
+    // no two start in one lcluster.
+    let n_lclusters = size.div_ceil(bs) as usize;
+    let mut heads: Vec<Option<LclusterIndexEntry>> = vec![None; n_lclusters];
+    for (idx, (at, p)) in pclusters.iter().enumerate() {
+        let lcn = (at / bs) as usize;
+        if heads[lcn].is_some() {
+            return Err(Error::BadInode("two pclusters start in one lcluster"));
+        }
+        heads[lcn] = Some(LclusterIndexEntry {
+            cluster_type: p.cluster_type,
+            clusterofs_or_delta0: (at % bs) as u16,
+            pcluster_idx: idx as u32,
+        });
+    }
+    let mut entries = Vec::with_capacity(n_lclusters);
+    let mut owner = (0u32, 0usize);
+    for (lcn, head) in heads.into_iter().enumerate() {
+        match head {
+            Some(entry) => {
+                owner = (entry.pcluster_idx, lcn);
+                entries.push(entry);
+            }
+            None => entries.push(LclusterIndexEntry {
+                cluster_type: Z_EROFS_LCLUSTER_TYPE_NONHEAD,
+                clusterofs_or_delta0: u16::try_from(lcn - owner.1)
+                    .map_err(|_| Error::BadInode("pcluster spans more than 65535 lclusters"))?,
+                pcluster_idx: owner.0,
+            }),
+        }
+    }
+    Ok(Streamed::Compressed {
+        pclusters: pclusters.into_iter().map(|(_, p)| p).collect(),
+        entries,
+        addrs,
+        blocks: block - first_block,
+    })
 }
 
 /// A block number, as the 32 bits every on-disk block address has.
@@ -1285,6 +1545,22 @@ fn encode_zmap_header(advise: u16, lclusterbits: u8, algorithm: u8) -> [u8; 16] 
     out[0x07] = lclusterbits & 0x0F;
     // 0x08..0x10 left as zero (reserved gap; reader's
     // `Z_EROFS_LEGACY_MAP_HEADER_SIZE` accounts for this).
+    out
+}
+
+/// Each lcluster's `delta[1]`: for a NONHEAD, the lclusters from it to
+/// the next HEAD or PLAIN, or to one past the last lcluster when no head
+/// follows it; zero for a head, which does not carry one.
+fn lcluster_delta1(entries: &[LclusterIndexEntry]) -> Vec<u16> {
+    let mut out = vec![0u16; entries.len()];
+    let mut next_head = entries.len();
+    for (i, e) in entries.iter().enumerate().rev() {
+        if e.cluster_type == Z_EROFS_LCLUSTER_TYPE_NONHEAD {
+            out[i] = u16::try_from(next_head - i).unwrap_or(u16::MAX);
+        } else {
+            next_head = i;
+        }
+    }
     out
 }
 
@@ -1850,10 +2126,15 @@ enum PlanKind {
         use_indexed_format: bool,
     },
     Compressed {
-        /// Original (uncompressed) source bytes. Kept around so the
-        /// inode's `i_size` reflects the source length; pcluster
-        /// payloads are pre-baked in `pclusters`.
+        /// Original (uncompressed) source bytes, for a
+        /// [`Node::CompressedFile`]; released once `pclusters` are
+        /// planned from them. Empty for a file compressed as it streams.
         src: Vec<u8>,
+        /// The uncompressed length: the inode's `i_size`.
+        size: u64,
+        /// Pclusters may span more than one block, so the index carries
+        /// each one's block count (`Z_EROFS_ADVISE_BIG_PCLUSTER_1`).
+        big_pcluster: bool,
         algo: CompressedAlgo,
         lclusterbits: u8,
         /// One entry per *physical* cluster. With multi-lcluster
@@ -2167,6 +2448,8 @@ fn flatten(
             plan[idx as usize].meta = spec.meta;
             plan[idx as usize].xattrs = spec.xattrs;
             plan[idx as usize].kind = PlanKind::Compressed {
+                size: spec.data.len() as u64,
+                big_pcluster: false,
                 src: spec.data,
                 algo: spec.algo,
                 lclusterbits: spec.lclusterbits,
@@ -2303,7 +2586,7 @@ fn plan_body(
         PlanKind::Chunked {
             chunks, chunk_bits, ..
         } => total_chunked_size(chunks, *chunk_bits, bs)?,
-        PlanKind::Compressed { src, .. } => src.len() as u64,
+        PlanKind::Compressed { size, .. } => *size,
     };
 
     let is_extended = size > u32::MAX as u64
@@ -2380,10 +2663,11 @@ fn plan_body(
         ztailpacking_requested,
         ztailpacking_inline,
         target_pcluster_blocks,
+        ..
     } = &mut n.kind
     {
         let (mut pcs, lcl_entries, mut total) = plan_compressed_pclusters_with_cfg(
-            src,
+            &std::mem::take(src),
             *algo,
             *lclusterbits,
             bs,
@@ -2757,7 +3041,7 @@ fn encode_inode(
         // Compressed: i_size is the ORIGINAL (uncompressed) source
         // length. The reader uses it to bound the last pcluster's
         // decompressed-source span.
-        PlanKind::Compressed { src, .. } => src.len() as u64,
+        PlanKind::Compressed { size, .. } => *size,
     };
 
     if body.is_extended {
@@ -3005,6 +3289,7 @@ fn encode_zmap_trailer(n: &PlanNode, addrs: &[u32], body_end: u64, blkszbits: u8
         lcluster_entries,
         index_format,
         ztailpacking_inline,
+        big_pcluster,
         ..
     } = &n.kind
     else {
@@ -3026,11 +3311,14 @@ fn encode_zmap_trailer(n: &PlanNode, addrs: &[u32], body_end: u64, blkszbits: u8
     match index_format {
         CompressedIndexFormat::Legacy => {
             // advise: ztailpacking only when inline is present.
-            let advise = if has_inline {
+            let mut advise = if has_inline {
                 Z_EROFS_ADVISE_INLINE_PCLUSTER
             } else {
                 0
             };
+            if *big_pcluster {
+                advise |= Z_EROFS_ADVISE_BIG_PCLUSTER_1;
+            }
             let mut header = encode_zmap_header(advise, *lclusterbits, algorithm);
             // h_idata_size lives in the HIGH 16 bits of the
             // fragment_off / idata_size union (kernel
@@ -3050,14 +3338,26 @@ fn encode_zmap_trailer(n: &PlanNode, addrs: &[u32], body_end: u64, blkszbits: u8
             out.extend_from_slice(&header);
             // One 8-byte entry per LOGICAL cluster. HEAD/PLAIN
             // entries carry their pcluster's blkaddr (resolved via
-            // `pcluster_idx`); NONHEAD entries carry `delta[0]` in
-            // the LOW 16 bits of the `u` union (high 16 bits left as
-            // zero -- delta[1] is implicit; the reader's legacy path
-            // only consults delta[0]).
-            for entry in lcluster_entries {
+            // `pcluster_idx`); NONHEAD entries carry `delta[0]`, the
+            // lclusters back to their HEAD, in the low 16 bits of the
+            // `u` union, and `delta[1]`, the lclusters on to the next
+            // HEAD or past the last lcluster, in the high 16. With big
+            // pclusters, a HEAD1's first NONHEAD carries the pcluster's
+            // block count in place of its `delta[0]`, which is 1 by
+            // position, under the `Z_EROFS_LI_D0_CBLKCNT` flag.
+            let delta1 = lcluster_delta1(lcluster_entries);
+            for (i, entry) in lcluster_entries.iter().enumerate() {
                 let (clusterofs, u) = if entry.cluster_type == Z_EROFS_LCLUSTER_TYPE_NONHEAD {
-                    // delta[0] in low 16 bits.
-                    (0u16, entry.clusterofs_or_delta0 as u32)
+                    let owner = &pclusters[entry.pcluster_idx as usize];
+                    let delta0 = if *big_pcluster
+                        && entry.clusterofs_or_delta0 == 1
+                        && lcluster_entries[i - 1].cluster_type == Z_EROFS_LCLUSTER_TYPE_HEAD1
+                    {
+                        Z_EROFS_LI_D0_CBLKCNT | owner.pcluster_block_count
+                    } else {
+                        entry.clusterofs_or_delta0 as u32
+                    };
+                    (0u16, delta0 | (delta1[i] as u32) << 16)
                 } else {
                     let blkaddr = addrs[entry.pcluster_idx as usize];
                     (entry.clusterofs_or_delta0, blkaddr)
