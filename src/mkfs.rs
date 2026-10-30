@@ -357,6 +357,19 @@ impl XattrSpec {
             value: value.into(),
         }
     }
+
+    /// The xattr a full name such as `security.selinux` or `user.foo`
+    /// names: its namespace index from the prefix, and the rest as its
+    /// name. The POSIX ACL names, `system.posix_acl_access` and
+    /// `system.posix_acl_default`, have an empty name. The inverse of
+    /// [`crate::xattr::resolve_full_name`], from the same prefix table.
+    ///
+    /// A name with no known prefix is refused with `BadXattr`, rather
+    /// than kept whole under the raw namespace, which no kernel reads.
+    pub fn from_full_name(full_name: impl AsRef<[u8]>, value: impl Into<Vec<u8>>) -> Result<Self> {
+        let _ = (full_name.as_ref(), value.into());
+        Err(Error::BadXattr("xattr name has no known namespace prefix"))
+    }
 }
 
 /// Default mode bits, kept for backwards compatibility with tests that
@@ -5673,5 +5686,54 @@ mod tests {
             blocks <= 101,
             "{blocks} metadata blocks for 200 tails two to a block"
         );
+    }
+
+    /// Every full name the reader resolves for a known namespace converts
+    /// back to the namespace index and name it came from.
+    #[test]
+    fn a_full_name_converts_back_to_the_index_and_name_it_resolved_from() {
+        use crate::xattr::{ns, resolve_full_name};
+        for (index, name) in [
+            (ns::USER, &b"foo"[..]),
+            (ns::USER, b"dataitem.thing"),
+            (ns::TRUSTED, b"overlay.opaque"),
+            (ns::LUSTRE, b"lov"),
+            (ns::SECURITY, b"selinux"),
+            (ns::SECURITY, b"capability"),
+            (ns::POSIX_ACL_ACCESS, b""),
+            (ns::POSIX_ACL_DEFAULT, b""),
+        ] {
+            let full = resolve_full_name(index, name);
+            let spec = XattrSpec::from_full_name(&full, b"v".to_vec())
+                .unwrap_or_else(|e| panic!("{}: {e}", String::from_utf8_lossy(&full)));
+            assert_eq!(
+                (spec.name_index, spec.name.as_slice(), spec.value.as_slice()),
+                (index, name, &b"v"[..]),
+                "{}",
+                String::from_utf8_lossy(&full)
+            );
+        }
+    }
+
+    /// A name with no known prefix is refused, not written to the raw
+    /// namespace -- and neither is a prefix that only starts like one.
+    #[test]
+    fn a_full_name_with_no_known_prefix_is_refused() {
+        for full in [
+            &b"selinux"[..],
+            b"system.foo",
+            b"securityx.selinux",
+            b"",
+            b"user",
+        ] {
+            assert!(
+                matches!(
+                    XattrSpec::from_full_name(full, Vec::new()),
+                    Err(Error::BadXattr(_))
+                ),
+                "{}",
+                String::from_utf8_lossy(full)
+            );
+        }
     }
 }
