@@ -129,6 +129,12 @@ pub enum Node {
     /// no BIG_PCLUSTER. Multi-lcluster collation (one frame spanning
     /// many lclusters) is still future work.
     CompressedFile(CompressedFileSpec),
+    /// Another name for a node elsewhere in the tree: a hard link. The
+    /// directory entry names the same inode as `target`, a path from the
+    /// root (`a/b` or `/a/b`), and that inode's `nlink` counts every
+    /// name. The target must not be a directory or another link -- a
+    /// tar link entry names the file it links to, never a link.
+    HardLink { target: String },
 }
 
 /// Compression algorithm selector for [`Node::CompressedFile`].
@@ -297,6 +303,22 @@ pub struct BuildOptions {
     /// `EROFS_FEATURE_INCOMPAT_COMPR_CFGS` bit. Reader decoders consult
     /// this for non-default codec props (today: LZMA `dict_size`).
     pub compr_cfgs: Option<ComprCfgsConfig>,
+
+    /// The superblock's 16-byte volume UUID. All zeros by default, which
+    /// tools read as "no UUID".
+    pub uuid: [u8; 16],
+
+    /// The superblock's `build_time`, in seconds since the epoch, and
+    /// its nanoseconds. A compact inode has no mtime of its own and
+    /// reads as this, so an inode whose mtime equals it stays compact.
+    pub build_time: u64,
+    pub build_time_nsec: u32,
+
+    /// When `true`, every inode's mtime is `build_time` whatever its
+    /// [`NodeMeta`] says -- what `mkfs.erofs -T` does. With a fixed
+    /// `build_time` the same tree then builds to the same bytes, and
+    /// every inode that needs nothing wider is compact.
+    pub mtime_is_build_time: bool,
 }
 
 /// Per-codec configuration to surface in the COMPR_CFGS blob.
@@ -384,8 +406,17 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     // chunkmap). Mutates the tree in place to record FlatInline vs FlatPlain
     // file layout.
     let mut plan: Vec<PlanNode> = Vec::new();
-    flatten(root, 0, &mut plan)?;
+    let mut links: Vec<PendingLink> = Vec::new();
+    flatten(root, 0, &mut plan, &mut links)?;
     plan[0].parent_idx = 0;
+    resolve_hard_links(&mut plan, links)?;
+    let nlinks = link_counts(&plan);
+    if options.mtime_is_build_time {
+        for node in &mut plan {
+            node.meta.mtime = options.build_time;
+            node.meta.mtime_nsec = options.build_time_nsec;
+        }
+    }
 
     // Detect which non-LZ4 codecs the tree actually uses. LZ4
     // (algorithmtype 0) is the implicit default and needs no
@@ -426,8 +457,8 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         });
 
     let mut bodies: Vec<InodeBody> = Vec::with_capacity(plan.len());
-    for node in &mut plan {
-        let body = plan_body(node, bs, lzma_dict_size_override)?;
+    for (node, &nlink) in plan.iter_mut().zip(&nlinks) {
+        let body = plan_body(node, nlink, bs, lzma_dict_size_override, &options)?;
         bodies.push(body);
     }
 
@@ -724,6 +755,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
         sb_u1,
         xattr_prefix_count,
         xattr_prefix_start_div4,
+        &options,
     );
 
     // Inodes + their inline trailers. Every address here comes out of
@@ -739,8 +771,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
             i,
             nid,
             body,
-            &nids,
-            &plan,
+            &nlinks,
             &dir_size_for_nid,
             &dir_block_for_nid,
             &data_block_for_nid,
@@ -1776,7 +1807,21 @@ fn plan_meta_layout(bodies: &[InodeBody], bs: u64) -> Vec<MetaSlot> {
     slots
 }
 
-fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64> {
+/// A [`Node::HardLink`] met while flattening: the directory it sits in,
+/// its name there, and the path it names. Resolved once the whole tree is
+/// in the plan, since the target may come later in the walk.
+struct PendingLink {
+    dir_idx: u64,
+    name: String,
+    target: String,
+}
+
+fn flatten(
+    node: Node,
+    parent_idx: u64,
+    plan: &mut Vec<PlanNode>,
+    links: &mut Vec<PendingLink>,
+) -> Result<u64> {
     let idx = plan.len() as u64;
     plan.push(PlanNode {
         parent_idx,
@@ -1820,7 +1865,15 @@ fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64>
                 if name.len() > u16::MAX as usize {
                     return Err(Error::BadDirent("name length > 65535"));
                 }
-                let child_idx = flatten(child, idx, plan)?;
+                if let Node::HardLink { target } = child {
+                    links.push(PendingLink {
+                        dir_idx: idx,
+                        name,
+                        target,
+                    });
+                    continue;
+                }
+                let child_idx = flatten(child, idx, plan, links)?;
                 children.push((name, child_idx));
             }
             plan[idx as usize].mode = mode;
@@ -1920,8 +1973,79 @@ fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64>
                 target_pcluster_blocks: spec.target_pcluster_blocks,
             };
         }
+        Node::HardLink { .. } => return Err(Error::BadInode("the root is a hard link")),
     }
     Ok(idx)
+}
+
+/// Give every [`PendingLink`] its directory entry, naming the plan node
+/// its target path reaches from the root. Links are not in any
+/// directory's children yet, so a link to a link finds nothing and is
+/// refused, as is a link to a directory, which would give the tree a
+/// cycle and the directory a second parent.
+fn resolve_hard_links(plan: &mut [PlanNode], links: Vec<PendingLink>) -> Result<()> {
+    let mut resolved = Vec::with_capacity(links.len());
+    for link in &links {
+        let mut idx = 0usize;
+        for component in link.target.split('/').filter(|c| !c.is_empty()) {
+            let PlanKind::Dir { children } = &plan[idx].kind else {
+                return Err(Error::BadInode(
+                    "hard link target runs through a non-directory",
+                ));
+            };
+            // `children` is in `BTreeMap` order, which is byte order.
+            let at = children
+                .binary_search_by(|(name, _)| name.as_bytes().cmp(component.as_bytes()))
+                .map_err(|_| Error::BadInode("hard link target not found"))?;
+            idx = children[at].1 as usize;
+        }
+        if let PlanKind::Dir { .. } = plan[idx].kind {
+            return Err(Error::BadInode("hard link target is a directory"));
+        }
+        resolved.push(idx as u64);
+    }
+    for (link, target_idx) in links.into_iter().zip(resolved) {
+        if let PlanKind::Dir { children } = &mut plan[link.dir_idx as usize].kind {
+            children.push((link.name, target_idx));
+        }
+    }
+    Ok(())
+}
+
+/// Every inode's link count, by plan index. A directory has one for
+/// itself, one for its "." and one for each subdirectory's ".."; anything
+/// else has one per directory entry that names it, and at least one, for
+/// a root that is not a directory.
+fn link_counts(plan: &[PlanNode]) -> Vec<u32> {
+    let mut nlinks = vec![0u32; plan.len()];
+    for node in plan {
+        if let PlanKind::Dir { children } = &node.kind {
+            for (_, child_idx) in children {
+                let child = &mut nlinks[*child_idx as usize];
+                *child = child.saturating_add(1);
+            }
+        }
+    }
+    for (count, node) in nlinks.iter_mut().zip(plan) {
+        *count = match &node.kind {
+            // Spec: a directory's nlink = 2 (for "." and "..") + the
+            // number of subdirectories (each subdir's ".." link counts
+            // toward this dir's nlink). Files and other non-directories
+            // among the children do not contribute. This matches the
+            // canonical Unix directory-nlink semantics that `ls -l`
+            // displays.
+            //
+            // Spec source: POSIX `<sys/stat.h>` directory link-count
+            // convention (referenced by the EROFS read-side tools and by
+            // every other Unix filesystem). Independent implementation.
+            PlanKind::Dir { children } => children
+                .iter()
+                .filter(|(_, c)| matches!(plan[*c as usize].kind, PlanKind::Dir { .. }))
+                .fold(2u32, |n, _| n.saturating_add(1)),
+            _ => (*count).max(1),
+        };
+    }
+    nlinks
 }
 
 /// Decide compact-vs-extended, build the inline-xattr blob, FLAT_INLINE
@@ -1932,7 +2056,13 @@ fn flatten(node: Node, parent_idx: u64, plan: &mut Vec<PlanNode>) -> Result<u64>
 /// planning compressed inodes — it lets the writer advertise a
 /// non-default dict in the COMPR_CFGS blob and patch the in-stream
 /// LZMA1 header to match. `None` keeps the lzma-rs default (8 MiB).
-fn plan_body(n: &mut PlanNode, bs: u64, lzma_dict_size_override: Option<u32>) -> Result<InodeBody> {
+fn plan_body(
+    n: &mut PlanNode,
+    nlink: u32,
+    bs: u64,
+    lzma_dict_size_override: Option<u32>,
+    options: &BuildOptions,
+) -> Result<InodeBody> {
     let (xattr_bytes, xattr_icount) = encode_inline_xattrs(&n.xattrs)?;
 
     // Compute the file-size field that ends up in i_size. For dirs the
@@ -1951,10 +2081,14 @@ fn plan_body(n: &mut PlanNode, bs: u64, lzma_dict_size_override: Option<u32>) ->
     };
 
     let is_extended = size > u32::MAX as u64
+        || nlink > u16::MAX as u32
         || n.meta.uid > u16::MAX as u32
         || n.meta.gid > u16::MAX as u32
-        || n.meta.mtime != 0
-        || n.meta.mtime_nsec != 0;
+        // A compact inode has no mtime field: it reads as the
+        // superblock's build time, so only a different mtime needs the
+        // extended body.
+        || n.meta.mtime != options.build_time
+        || n.meta.mtime_nsec != options.build_time_nsec;
 
     // FLAT_INLINE for regular files whose entire payload fits in one
     // metadata block AFTER the body+xattrs. The block-fit invariant is
@@ -2220,6 +2354,7 @@ fn write_superblock(
     u1: u16,
     xattr_prefix_count: u8,
     xattr_prefix_start: u32,
+    options: &BuildOptions,
 ) {
     // Every field below is placed through `superblock::offsets`, the
     // same table the parser reads — so a field cannot move on the write
@@ -2235,6 +2370,13 @@ fn write_superblock(
     put(img, sb::INOS, &n_inodes.to_le_bytes());
     put(img, sb::BLOCKS, &total_blocks.to_le_bytes());
     put(img, sb::META_BLKADDR, &meta_blkaddr.to_le_bytes());
+    put(img, sb::BUILD_TIME, &options.build_time.to_le_bytes());
+    put(
+        img,
+        sb::BUILD_TIME_NSEC,
+        &options.build_time_nsec.to_le_bytes(),
+    );
+    put(img, sb::UUID, &options.uuid);
     let label = b"rsmkfs";
     img[off + sb::VOLUME_NAME.start..off + sb::VOLUME_NAME.start + label.len()]
         .copy_from_slice(label);
@@ -2287,8 +2429,7 @@ fn encode_inode(
     idx: usize,
     nid: u64,
     body: &InodeBody,
-    nids: &[u64],
-    plan: &[PlanNode],
+    nlinks: &[u32],
     dir_size_for_nid: &BTreeMap<u64, u64>,
     dir_block_for_nid: &BTreeMap<u64, u64>,
     data_block_for_nid: &BTreeMap<u64, u64>,
@@ -2321,7 +2462,7 @@ fn encode_inode(
         PlanKind::Compressed { src, .. } => src.len() as u64,
     };
 
-    let nlink = inode_nlink(n, idx, plan);
+    let nlink = nlinks[idx];
 
     if body.is_extended {
         buf[xi::SIZE].copy_from_slice(&size.to_le_bytes());
@@ -2339,7 +2480,6 @@ fn encode_inode(
         buf[ci::GID].copy_from_slice(&(n.meta.gid as u16).to_le_bytes());
     }
 
-    let _ = nids; // reserved for future: hardlink-aware nlink computation.
     buf
 }
 
@@ -2420,33 +2560,6 @@ fn inode_raw_u(
             total_compressed_blocks,
             ..
         } => *total_compressed_blocks,
-    }
-}
-
-fn inode_nlink(n: &PlanNode, _idx: usize, plan: &[PlanNode]) -> u32 {
-    match &n.kind {
-        // Spec: a directory's nlink = 2 (for "." and "..") + the number
-        // of subdirectories (each subdir's ".." link counts toward this
-        // dir's nlink). Empty dir => nlink == 2; one-subdir dir => 3;
-        // two-subdir dir => 4; etc. Files / non-directories among the
-        // children DO NOT contribute. This matches the canonical Unix
-        // directory-nlink semantics that `ls -l` displays.
-        //
-        // Spec source: POSIX `<sys/stat.h>` directory link-count
-        // convention (referenced by the EROFS read-side tools and by
-        // every other Unix filesystem). Independent implementation.
-        PlanKind::Dir { children } => {
-            let mut nlink: u32 = 2;
-            for (_, child_idx) in children {
-                if let PlanKind::Dir { .. } = &plan[*child_idx as usize].kind {
-                    nlink = nlink.saturating_add(1);
-                }
-            }
-            nlink
-        }
-        // Files/symlinks/specials have nlink=1 (no hardlink dedup
-        // support today; per-Node-distinct-inode policy unchanged).
-        _ => 1,
     }
 }
 
@@ -4209,5 +4322,204 @@ mod tests {
             block_aligned >= 2,
             "fixture no longer forces metadata-block skips ({block_aligned} aligned inodes)"
         );
+    }
+
+    fn with_mtime(node: Node, mtime: u64) -> Node {
+        let meta = NodeMeta {
+            mtime,
+            ..NodeMeta::default()
+        };
+        match node {
+            Node::File {
+                mode, data, xattrs, ..
+            } => Node::File {
+                mode,
+                data,
+                meta,
+                xattrs,
+            },
+            Node::Dir {
+                mode,
+                entries,
+                xattrs,
+                ..
+            } => Node::Dir {
+                mode,
+                entries,
+                meta,
+                xattrs,
+            },
+            other => other,
+        }
+    }
+
+    const EPOCH: u64 = 1_230_768_000;
+
+    #[test]
+    fn the_superblock_carries_the_requested_uuid_and_build_time() {
+        let uuid = *b"\x01\x23\x45\x67\x89\xab\xcd\xef\xfe\xdc\xba\x98\x76\x54\x32\x10";
+        let options = BuildOptions {
+            uuid,
+            build_time: EPOCH,
+            build_time_nsec: 7,
+            ..BuildOptions::default()
+        };
+        let fs = open(build_image_with(dir(vec![]), 12, options).unwrap());
+        let sb = fs.superblock();
+        assert_eq!(sb.uuid, uuid);
+        assert_eq!(sb.build_time, EPOCH);
+        assert_eq!(sb.build_time_nsec, 7);
+    }
+
+    /// `-T`: every inode takes the build time as its mtime, whatever the
+    /// tree said, and so every one of them fits a compact inode.
+    #[test]
+    fn mtime_is_build_time_makes_every_inode_compact_with_that_mtime() {
+        let options = BuildOptions {
+            build_time: EPOCH,
+            mtime_is_build_time: true,
+            ..BuildOptions::default()
+        };
+        let tree = with_mtime(
+            dir(vec![
+                ("a", with_mtime(file(b"one"), 5)),
+                ("sub", with_mtime(dir(vec![("b", file(&[7u8; 9000]))]), 6)),
+            ]),
+            4,
+        );
+        let fs = open(build_image_with(tree, 12, options).unwrap());
+        for path in ["/", "/a", "/sub", "/sub/b"] {
+            let inode = fs.lookup_path(path).unwrap();
+            assert_eq!(inode.on_disk_size as u64, COMPACT_INODE_SIZE, "{path}");
+            assert_eq!(inode.mtime, EPOCH, "{path} mtime");
+        }
+    }
+
+    /// A compact inode's mtime is the superblock's build time: an inode
+    /// whose own mtime matches it needs no extended body to say so.
+    #[test]
+    fn an_mtime_equal_to_the_build_time_is_written_compact() {
+        let options = BuildOptions {
+            build_time: EPOCH,
+            ..BuildOptions::default()
+        };
+        let tree = dir(vec![
+            ("same", with_mtime(file(b"x"), EPOCH)),
+            ("other", with_mtime(file(b"y"), EPOCH + 1)),
+        ]);
+        let fs = open(build_image_with(tree, 12, options).unwrap());
+        let same = fs.lookup_path("/same").unwrap();
+        assert_eq!(same.on_disk_size as u64, COMPACT_INODE_SIZE);
+        assert_eq!(same.mtime, EPOCH);
+        let other = fs.lookup_path("/other").unwrap();
+        assert_eq!(other.on_disk_size as u64, EXTENDED_INODE_SIZE);
+        assert_eq!(other.mtime, EPOCH + 1);
+    }
+
+    #[test]
+    fn the_same_tree_and_options_build_the_same_bytes() {
+        let options = || BuildOptions {
+            uuid: [9; 16],
+            build_time: EPOCH,
+            mtime_is_build_time: true,
+            ..BuildOptions::default()
+        };
+        let tree = || {
+            dir(vec![
+                ("a", file(b"one")),
+                ("sub", dir(vec![("b", file(&[7u8; 9000]))])),
+            ])
+        };
+        assert_eq!(
+            build_image_with(tree(), 12, options()).unwrap(),
+            build_image_with(tree(), 12, options()).unwrap()
+        );
+    }
+
+    fn link(target: &str) -> Node {
+        Node::HardLink {
+            target: target.to_string(),
+        }
+    }
+
+    /// Three names for one file across two directories, and two for a
+    /// symlink: each set is one inode, counted once per name.
+    #[test]
+    fn hard_links_name_one_inode_and_count_every_name() {
+        let tree = dir(vec![
+            ("a", file(b"shared\n")),
+            ("b", link("a")),
+            ("d", dir(vec![("c", link("/a")), ("lone", file(b"x"))])),
+            (
+                "sym",
+                Node::Symlink {
+                    mode: DEFAULT_SYMLINK_MODE,
+                    target: "a".to_string(),
+                    meta: NodeMeta::default(),
+                    xattrs: Vec::new(),
+                },
+            ),
+            ("sym-link", link("sym")),
+        ]);
+        let fs = open(build_image(tree, 12).unwrap());
+        assert_eq!(
+            fs.superblock().inos,
+            5,
+            "root, a, d, d/lone, sym and nothing else"
+        );
+
+        let a = fs.lookup_path("/a").unwrap();
+        for path in ["/b", "/d/c"] {
+            let other = fs.lookup_path(path).unwrap();
+            assert_eq!(other.nid, a.nid, "{path} names a's inode");
+        }
+        assert_eq!(a.nlink, 3);
+        let mut buf = vec![0u8; a.size as usize];
+        fs.read_file(&fs.lookup_path("/d/c").unwrap(), 0, &mut buf)
+            .unwrap();
+        assert_eq!(buf, b"shared\n");
+
+        assert_eq!(fs.lookup_path("/sym").unwrap().nlink, 2);
+        assert_eq!(
+            fs.lookup_path("/sym-link").unwrap().nid,
+            fs.lookup_path("/sym").unwrap().nid
+        );
+        assert_eq!(fs.lookup_path("/d/lone").unwrap().nlink, 1);
+        // A link adds no subdirectory: the root's count is "." , ".." and d.
+        assert_eq!(fs.root_inode().unwrap().nlink, 3);
+    }
+
+    /// A compact inode's link count is 16 bits; one more name than that
+    /// holds needs the extended inode, and must still read back exactly.
+    #[test]
+    fn more_names_than_a_compact_inode_counts_make_it_extended() {
+        let names: Vec<String> = (0..=u16::MAX as u32).map(|i| i.to_string()).collect();
+        let links = dir(names.iter().map(|n| (n.as_str(), link("/f"))).collect());
+        let tree = dir(vec![("f", file(b"many")), ("links", links)]);
+        let fs = open(build_image(tree, 12).unwrap());
+        let f = fs.lookup_path("/f").unwrap();
+        assert_eq!(f.nlink, u16::MAX as u32 + 2);
+        assert_eq!(f.on_disk_size as u64, EXTENDED_INODE_SIZE);
+    }
+
+    #[test]
+    fn a_hard_link_to_nothing_a_directory_or_a_link_is_refused() {
+        for (label, tree) in [
+            ("missing", dir(vec![("b", link("nope"))])),
+            ("directory", dir(vec![("d", dir(vec![])), ("b", link("d"))])),
+            (
+                "link",
+                dir(vec![("a", file(b"x")), ("b", link("a")), ("c", link("b"))]),
+            ),
+            (
+                "through a file",
+                dir(vec![("a", file(b"x")), ("b", link("a/x"))]),
+            ),
+        ] {
+            assert!(
+                matches!(build_image(tree, 12), Err(Error::BadInode(_))),
+                "{label}"
+            );
+        }
     }
 }
