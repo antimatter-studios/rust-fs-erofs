@@ -240,7 +240,7 @@ pub const Z_EROFS_FRAGMENT_INODE_BIT: u8 = 0x80;
 /// (it sits exactly one lcluster past its head). Spec source: the
 /// public EROFS compression-format documentation
 /// (<https://erofs.docs.kernel.org/en/latest/design.html#compressed-data>).
-const Z_EROFS_LI_D0_CBLKCNT: u32 = 1 << 11;
+pub(crate) const Z_EROFS_LI_D0_CBLKCNT: u32 = 1 << 11;
 
 /// `Z_EROFS_LI_PARTIAL_REF = 1 << 15` -- bit 15 of a full (8-byte)
 /// index entry's `di_advise`: the HEAD's extent uses only a PREFIX of
