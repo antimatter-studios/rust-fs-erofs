@@ -110,6 +110,35 @@ jobs:
       # tarballs (#185); the cli-windows job in ci.yml tests the same zip.
       windows: true
 
+  # WINGET, after the release holds the zips it will point at. The first
+  # version is submitted by hand (winget/README.md); every later one is
+  # submitted from here, by wingetcreate, as a pull request from the fork the
+  # token can push to. Without WINGET_TOKEN the job says so and stops: a
+  # release is not failed for a submission nobody configured.
+  winget:
+    name: submit the new version to winget
+    needs: [cli]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: submit, or say why not
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:WINGET_TOKEN) {
+            Write-Host "::notice::WINGET_TOKEN is not configured, so this version is not submitted to winget."
+            exit 0
+          }
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $base = "https://github.com/${{ github.repository }}/releases/download/v$version"
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe update AntimatterStudios.rust-fs-erofs --version $version `
+            --urls "$base/rust-fs-erofs-$version-windows-x86_64.zip|x64" "$base/rust-fs-erofs-$version-windows-arm64.zip|arm64" `
+            --submit --token $env:WINGET_TOKEN
+
   publish:
     name: publish to crates.io
     needs: test

@@ -39,7 +39,6 @@ version and manifest version.
 4. Copy the three files into a fork of winget-pkgs and open a pull
    request there.
 
-The first submission is made by hand. Later versions are meant to be
-submitted by `release.yml`. That needs an account that forks winget-pkgs
-and a `WINGET_TOKEN` secret for it, and both are still the owner's
-decision.
+The first submission is made by hand. Later versions are submitted by the
+`winget` job in `release.yml`, from the fork the organisation's `WINGET_TOKEN`
+secret can push to, so these steps apply only to that first version.
