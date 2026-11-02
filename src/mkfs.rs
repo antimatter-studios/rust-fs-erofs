@@ -693,6 +693,7 @@ pub fn build_image_to<W: Write + Seek>(
     };
     let mut placements: Vec<Placement> = (0..plan.len()).map(|_| Placement::default()).collect();
     let mut any_compressed = false;
+    let mut any_inline_tail = false;
     let mut any_streamed_compressed = false;
     std::thread::scope(|scope| -> Result<()> {
         let mut pipeline = compression.map(|c| Pipeline::new(scope, c, threads, bs));
@@ -779,8 +780,13 @@ pub fn build_image_to<W: Write + Seek>(
                         }
                     }
                 }
-                PlanKind::Compressed { pclusters, .. } => {
+                PlanKind::Compressed {
+                    pclusters,
+                    ztailpacking_inline,
+                    ..
+                } => {
                     any_compressed = true;
+                    any_inline_tail |= ztailpacking_inline.is_some();
                     for pc in pclusters.iter_mut() {
                         // For ztailpacked pclusters (block_count == 0) we
                         // still record next_data_block as the entry's
@@ -918,6 +924,10 @@ pub fn build_image_to<W: Write + Seek>(
     } else {
         0
     };
+
+    if any_inline_tail {
+        feature_incompat |= crate::superblock::EROFS_FEATURE_INCOMPAT_ZTAILPACKING;
+    }
 
     // Encode COMPR_CFGS blob into the gap right after the SB area.
     // Format: a sequence of `__le16 size; payload[size];` records, one

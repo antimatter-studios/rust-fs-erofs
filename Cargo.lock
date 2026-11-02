@@ -323,8 +323,8 @@ dependencies = [
 
 [[package]]
 name = "lz4_flex"
-version = "0.13.0"
-source = "git+https://github.com/antimatter-studios/lz4_flex?rev=421c1185351378f03fcb71d677c2bd475847c6d1#421c1185351378f03fcb71d677c2bd475847c6d1"
+version = "0.14.0"
+source = "git+https://github.com/antimatter-studios/lz4_flex?rev=b19fe1ae5eca4023dc7314076d42ae52d621cedd#b19fe1ae5eca4023dc7314076d42ae52d621cedd"
 
 [[package]]
 name = "lzma-rs"
@@ -458,7 +458,7 @@ dependencies = [
  "fs-erofs-test-support",
  "lru",
  "lz4_flex 0.11.6",
- "lz4_flex 0.13.0",
+ "lz4_flex 0.14.0",
  "lzma-rs",
  "rust-fs-core",
  "ruzstd",
