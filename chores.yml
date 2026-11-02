@@ -400,7 +400,7 @@ tasks:
     # step to build exactly what the tier runs.
     cmds:
       - 'scripts/test.sh --locked --no-run --quiet $(scripts/test-targets.sh unit)'
-      - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 740 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 740 41000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
       # local-unit.sh measured 518 baseline cases plus five import refusal
       # cases on 2026-10-18, and 524 with the core pin floor guard (#231);
       # every baseline case remains in the unit tier. The two not_found
