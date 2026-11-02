@@ -104,15 +104,26 @@ fn an_image_without_the_checksum_bit_is_not_verified() {
     open_bytes(img).expect("no checksum advertised, nothing to verify");
 }
 
-/// Block sizes at and below the superblock offset use a different span
-/// (`block_size - 1024 % block_size`); the writer's own images at every
-/// size must still open.
+/// A block of 2 KiB or more holds the rest of the superblock's block, which
+/// the checksum covers, and the writer's own images at those sizes verify.
+/// At 1 KiB and below the writer leaves the checksum off, as `mkfs.erofs`
+/// 1.8.6 does: `fsck.erofs` 1.8.6 crashes on a 512-byte image that has one.
 #[test]
 fn every_block_size_this_writer_emits_verifies() {
-    for blkszbits in [9u8, 10, 12, 14] {
+    for blkszbits in [11u8, 12, 14] {
         let tree = dir(vec![("a.txt", file(b"alpha\n"))]);
         let img = mkfs::build_image(tree, blkszbits).expect("build");
         assert!(has_checksum(&img), "blkszbits {blkszbits}");
+        open_bytes(img).unwrap_or_else(|e| panic!("blkszbits {blkszbits}: {e}"));
+    }
+}
+
+#[test]
+fn a_block_of_1_kib_or_less_carries_no_checksum() {
+    for blkszbits in [9u8, 10] {
+        let tree = dir(vec![("a.txt", file(b"alpha\n"))]);
+        let img = mkfs::build_image(tree, blkszbits).expect("build");
+        assert!(!has_checksum(&img), "blkszbits {blkszbits}");
         open_bytes(img).unwrap_or_else(|e| panic!("blkszbits {blkszbits}: {e}"));
     }
 }
