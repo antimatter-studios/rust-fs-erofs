@@ -79,7 +79,7 @@ clap = { version = "4.5", optional = true, default-features = false, features = 
 # LZ4HC with a fixed output for the builder's compression (src/lz4hc.rs): the
 # fork adds that mode over upstream's open HC work. A git dependency until the
 # fork is published under its own name.
-lz4_flex_hc = { git = "https://github.com/antimatter-studios/lz4_flex", rev = "421c1185351378f03fcb71d677c2bd475847c6d1", package = "lz4_flex", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+lz4_flex_hc = { git = "https://github.com/antimatter-studios/lz4_flex", rev = "b19fe1ae5eca4023dc7314076d42ae52d621cedd", package = "lz4_flex", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 
 [dev-dependencies]
 # The test suite's one way in to a fixture, to an erofs-utils tool and to
