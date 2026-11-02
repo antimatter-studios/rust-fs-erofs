@@ -1,74 +1,26 @@
-//! LZ4HC, through liblz4.
+//! LZ4HC, through the antimatter-studios fork of `lz4_flex`.
 //!
-//! The writer's high-ratio LZ4 encoder. `mkfs.erofs -zlz4hc` calls
-//! liblz4's `LZ4_compress_HC_destSize`, which compresses as much of its
-//! input as fits in a fixed output: exactly what filling a physical
-//! cluster needs. No pure-Rust LZ4 encoder has an HC mode or a
-//! fixed-output one -- `lz4_flex`, which this crate decodes with, has
-//! neither -- so this is the reference implementation itself, which
-//! `lz4-sys` (MIT) builds from liblz4 1.10's BSD-2 `lib/` sources. Its
-//! output is standard LZ4 blocks, which the kernel and `lz4_flex` decode.
-//!
-//! `lz4-sys` binds liblz4's frame and fast-block functions but not these
-//! two, so they are declared here; the library it links defines them.
+//! The writer's high-ratio LZ4 encoder. A physical cluster needs a
+//! fixed-output mode, which compresses as much of its input as fits, and
+//! the fork adds that as `compress_hc_dest_size` over upstream's open HC
+//! work. Its output is standard LZ4 blocks, which the kernel and `lz4_flex`
+//! decode.
 
-use lz4_sys as _;
-use std::os::raw::{c_char, c_int, c_void};
-
-extern "C" {
-    fn LZ4_sizeofStateHC() -> c_int;
-    fn LZ4_compress_HC_destSize(
-        state: *mut c_void,
-        src: *const c_char,
-        dst: *mut c_char,
-        src_size: *mut c_int,
-        target_dst_size: c_int,
-        level: c_int,
-    ) -> c_int;
-}
-
-/// An LZ4HC encoder and the working state it reuses across calls.
+/// An LZ4HC encoder at one compression level.
 pub(crate) struct Lz4Hc {
-    /// `LZ4_streamHC_t`, which wants pointer alignment; `u64` gives it.
-    state: Vec<u64>,
-    level: c_int,
+    level: u8,
 }
 
 impl Lz4Hc {
     pub(crate) fn new(level: u8) -> Self {
-        // SAFETY: a pure size query.
-        let bytes = unsafe { LZ4_sizeofStateHC() } as usize;
-        Self {
-            state: vec![0u64; bytes.div_ceil(8)],
-            level: level as c_int,
-        }
+        Self { level }
     }
 
     /// Compress as much of `src` as fits in `dst`, as one LZ4 block that
     /// decodes on its own. Returns the input bytes it took and the output
     /// bytes it wrote; `(0, 0)` when not even one byte fits.
     pub(crate) fn compress_dest_size(&mut self, src: &[u8], dst: &mut [u8]) -> (usize, usize) {
-        let mut taken = src.len().min(c_int::MAX as usize) as c_int;
-        let target = dst.len().min(c_int::MAX as usize) as c_int;
-        // SAFETY: `state` is at least `LZ4_sizeofStateHC()` bytes and
-        // 8-aligned, and the call initialises it; `src` is valid for
-        // `taken` bytes and `dst` for `target`, and liblz4 reads and
-        // writes no further. It writes back in `taken` how much of `src`
-        // it consumed.
-        let written = unsafe {
-            LZ4_compress_HC_destSize(
-                self.state.as_mut_ptr().cast(),
-                src.as_ptr().cast(),
-                dst.as_mut_ptr().cast(),
-                &mut taken,
-                target,
-                self.level,
-            )
-        };
-        if written <= 0 {
-            return (0, 0);
-        }
-        (taken as usize, written as usize)
+        lz4_flex_hc::block::compress_hc_dest_size(src, dst, self.level)
     }
 }
 
