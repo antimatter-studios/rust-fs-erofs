@@ -405,7 +405,9 @@ tasks:
       # cases on 2026-10-18, and 524 with the core pin floor guard (#231);
       # every baseline case remains in the unit tier. The two not_found
       # cases in src/cli/erofs/fs.rs's own tests make it 526.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 526'
+      # Measured locally on 2026-11-02: 529 baseline cases plus four
+      # real-command recursive-listing cases in cli_listing.rs make 533.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 533'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
