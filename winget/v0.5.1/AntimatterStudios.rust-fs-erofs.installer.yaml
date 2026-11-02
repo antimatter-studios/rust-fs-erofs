@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+PackageIdentifier: AntimatterStudios.rust-fs-erofs
+PackageVersion: 0.5.1
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: bin\rust-fs-erofs.exe
+    PortableCommandAlias: rust-fs-erofs
+  - RelativeFilePath: bin\fs.erofs.exe
+    PortableCommandAlias: fs.erofs
+  - RelativeFilePath: bin\mkfs.erofs.exe
+    PortableCommandAlias: mkfs.erofs
+Commands:
+  - rust-fs-erofs
+  - fs.erofs
+  - mkfs.erofs
+ReleaseDate: 2026-11-02
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/antimatter-studios/rust-fs-erofs/releases/download/v0.5.1/rust-fs-erofs-0.5.1-windows-x86_64.zip
+    InstallerSha256: E7983314A9821F0B9D9DD6791884809258684D7F00FE8FEDAC38E20D78CE87BE
+  - Architecture: arm64
+    InstallerUrl: https://github.com/antimatter-studios/rust-fs-erofs/releases/download/v0.5.1/rust-fs-erofs-0.5.1-windows-arm64.zip
+    InstallerSha256: 8A593842DAB2885F76F85058F3F6C71E50280EEABA5F9403E8BAD8325ABEE434
+ManifestType: installer
+ManifestVersion: 1.12.0
