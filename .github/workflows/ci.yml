@@ -532,7 +532,11 @@ jobs:
             target
           key: ${{ runner.os }}-${{ runner.arch }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-cli-cargo-
+      # As the release builds them. package-cli.sh refuses a binary that imports
+      # VCRUNTIME140.dll, so this job proves the flag removes the import.
       - name: Build the tools
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --locked --release --features cli --bin rust-fs-erofs --quiet
       - name: The release zip, packaged and its layout checked
         id: pack
