@@ -2265,6 +2265,13 @@ fn write_superblock(
     // 0xFFFFFFFF), so we undo that XOR to match. The checksum field
     // is already zero in `img` here -- nothing has written into it --
     // so we can compute over `img` directly without a temporary copy.
+    //
+    // At 1 KiB and below no checksum is written, as `mkfs.erofs` 1.8.6
+    // writes none there: `fsck.erofs` 1.8.6 crashes on a 512-byte image
+    // that has one (#264). The reader still verifies older tools' images.
+    if blkszbits <= 10 {
+        return;
+    }
     put(
         img,
         sb::FEATURE_COMPAT,
