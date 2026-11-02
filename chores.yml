@@ -451,7 +451,9 @@ tasks:
     # deliberate corruption the kernel has to refuse.
     cmds:
       - scripts/tools.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 320 21000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      # BUDGET: run 41429236288 printed 21,037 bytes once tests/inlined_tail_kernel.rs
+      # joined; 22,000 leaves room for the next test.
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 320 22000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
     # 5: the 3 measured on main at ca0c577 (CI run 36351672753) -- the
     # third being the readlink kernel oracle #139 added -- plus the two
     # #125 added: the deduplicated images read back through the kernel,
@@ -472,7 +474,7 @@ tasks:
       # #239 adds one declared case comparing compact and extended preservation with the kernel.
       # #240 adds one declared case for depth, merge, refusal, offset and single-file commands.
       # #233 adds one declared case exporting a damaged tree.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 20'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 21'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'

@@ -476,6 +476,7 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     let mut chunk_addrs_for_nid: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
     let mut pcluster_addrs_for_nid: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
     let mut any_compressed = false;
+    let mut any_inline_tail = false;
     for (i, n) in plan.iter().enumerate() {
         let nid = nids[i];
         match &n.kind {
@@ -517,8 +518,13 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
                 }
                 chunk_addrs_for_nid.insert(nid, addrs);
             }
-            PlanKind::Compressed { pclusters, .. } => {
+            PlanKind::Compressed {
+                pclusters,
+                ztailpacking_inline,
+                ..
+            } => {
                 any_compressed = true;
+                any_inline_tail |= ztailpacking_inline.is_some();
                 let mut addrs: Vec<u32> = Vec::with_capacity(pclusters.len());
                 for pc in pclusters {
                     if next_data_block > u32::MAX as u64 {
@@ -562,6 +568,12 @@ pub fn build_image_with(root: Node, blkszbits: u8, options: BuildOptions) -> Res
     } else {
         0
     };
+
+    // Linux 6.1 reads an inlined tail as an ordinary pcluster, and fails to
+    // decompress it, unless this says the image holds one (#266).
+    if any_inline_tail {
+        feature_incompat |= crate::superblock::EROFS_FEATURE_INCOMPAT_ZTAILPACKING;
+    }
 
     // Encode COMPR_CFGS blob into the gap right after the SB area.
     // Format: a sequence of `__le16 size; payload[size];` records, one
