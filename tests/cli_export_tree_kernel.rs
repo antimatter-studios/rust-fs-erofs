@@ -85,7 +85,7 @@ fn recursive_export_matches_kernel_and_reference_digests_and_reports_each_item()
             .output()
             .unwrap();
         let report = stdout(&out);
-        assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+        assert_eq!(out.status.code(), Some(5), "{report}{}", stderr(&out));
         assert_eq!(
             json_field(&report, "completed"),
             (DEPTH * 2 + 3).to_string()
@@ -136,7 +136,7 @@ fn recursive_export_matches_kernel_and_reference_digests_and_reports_each_item()
             .arg(&dest)
             .output()
             .unwrap();
-        assert_eq!(again.status.code(), Some(1), "{}", stderr(&again));
+        assert_eq!(again.status.code(), Some(5), "{}", stderr(&again));
         assert!(item(&stdout(&again), "/tree/big").contains("\"status\": \"refused\""));
         assert_eq!(std::fs::read(&kept).unwrap(), b"keep me");
         assert_eq!(
@@ -219,7 +219,7 @@ PY
             .arg(&plain)
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
         let report = stdout(&out);
         for name in ["short", "long", "raw", "sub/up"] {
             let entry = item(&report, &format!("/tree/{name}"));
@@ -403,7 +403,7 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
         let shallow = (POLICY_DEPTH - 1).to_string();
         let out = export_tree(&image, &[], &["--max-depth", &shallow], &over);
         let report = stdout(&out);
-        assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+        assert_eq!(out.status.code(), Some(5), "{report}{}", stderr(&out));
         assert_eq!(json_field(&report, "completed"), "6", "{report}");
         assert_eq!(json_field(&report, "failed"), "1", "{report}");
         let deep = item(&report, "/tree/sub/a/b/deep");
@@ -445,7 +445,7 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
             let flags: &[&str] = if replace { &["--replace"] } else { &[] };
             let out = export_tree(&image, &[], flags, &kept);
             let report = stdout(&out);
-            assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+            assert_eq!(out.status.code(), Some(5), "{report}{}", stderr(&out));
             let refused = if replace { "2" } else { "3" };
             assert_eq!(json_field(&report, "refused"), refused, "{report}");
             assert_eq!(json_field(&report, "failed"), "0", "{report}");
@@ -624,7 +624,7 @@ fn recursive_export_reports_a_damaged_file_failed_and_never_publishes_or_replace
         let flags: &[&str] = if replace { &["--replace"] } else { &[] };
         let out = export_tree(&image, &[], flags, &dest);
         let report = stdout(&out);
-        assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+        assert_eq!(out.status.code(), Some(5), "{report}{}", stderr(&out));
         assert_eq!(json_field(&report, "failed"), "1", "{report}");
         let failed = item(&report, "/tree/big");
         assert!(failed.contains("\"status\": \"failed\""), "{failed}");
