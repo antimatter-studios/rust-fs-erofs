@@ -9,6 +9,35 @@ pull request; a release gathers them into a section here.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-02
+
+### Changed
+
+- **`fs.erofs` reports a missing path with the `not_found` error kind
+  (#251).** `ls`, `ls -R`, `stat`, `read`, `export` and
+  `export --recursive` given a path that is not there, or one whose parent
+  is not there, still exit 1 and now carry `"kind": "not_found"` beside
+  `code` and `error` in the JSON error. A script can match that across
+  drivers, whatever the message says. A path through a regular file and a
+  damaged directory keep their plain failure.
+- **Built on rust-fs-core 0.4.2**, for `CliError::not_found`.
+
+- **A partial tree export exits 5.** With rust-fs-core 0.4.3, a recursive export
+  that published what it could and reported the rest as refused or failed exits
+  with the partial status instead of 1.
+
+### Fixed
+
+- An image of 1 KiB blocks or less no longer carries a superblock checksum, as `mkfs.erofs` writes none there. `fsck.erofs` 1.8.6 crashed on a 512-byte image that had one. The reader still verifies images from older tools that do.
+
+- **An inlined compressed tail sets the ztailpacking feature (#266).** Without
+  that bit in the superblock, Linux 6.1 could not read such a file and returned
+  an I/O error.
+
+- **The Windows tools start without the Visual C++ runtime.** rust-fs-core 0.4.3
+  links the C runtime statically into the Windows release zips, which did not
+  start on a Windows install without it.
+
 ## [0.5.0] — 2026-10-19
 
 ### Added
@@ -465,6 +494,7 @@ pull request; a release gathers them into a section here.
 
 - Package renamed to `am-fs-erofs`; the lib name stays `fs_erofs`.
 
+[0.5.1]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.3.1...v0.4.0
