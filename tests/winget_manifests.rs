@@ -326,3 +326,29 @@ fn the_winget_checks_recognise_the_shapes_they_refuse() {
         "a manifest version that disagrees",
     );
 }
+
+/// A release submits itself: the job waits for the zips it points at, names
+/// this package, and has one URL per architecture the manifests declare.
+#[test]
+fn the_release_submits_each_later_version_to_winget() {
+    let workflow = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml"),
+    )
+    .unwrap();
+    let job = workflow
+        .split("\n  winget:\n")
+        .nth(1)
+        .expect("release.yml has no winget job");
+    assert!(
+        job.contains("needs: [cli]"),
+        "the job does not wait for the zips"
+    );
+    for wanted in [
+        "wingetcreate.exe update AntimatterStudios.rust-fs-erofs",
+        "rust-fs-erofs-$version-windows-x86_64.zip|x64",
+        "rust-fs-erofs-$version-windows-arm64.zip|arm64",
+        "secrets.WINGET_TOKEN",
+    ] {
+        assert!(job.contains(wanted), "the job does not name {wanted}");
+    }
+}
