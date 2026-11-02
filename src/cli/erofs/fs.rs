@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
+use fs_core::cli::listing::{bound_reached, recursive_args, ListBounds};
 use fs_core::cli::{transfer, CliError, Json, Outcome, Tool};
 use fs_core::{BlockRead, FileDevice, OwnedSlice};
 use fs_erofs::{DataLayout, FileType, Filesystem, Inode, InodeVersion};
@@ -78,31 +79,7 @@ fn command() -> Cmd {
         .subcommand(
             Cmd::new("ls")
                 .about("List a directory: name, type, size, mode, mtime (and a symlink's target)")
-                .arg(
-                    Arg::new("recursive")
-                        .long("recursive")
-                        .short('R')
-                        .action(ArgAction::SetTrue)
-                        .help("Walk depth first, sorting names as bytes; never follow symlinks"),
-                )
-                .arg(
-                    Arg::new("max-depth")
-                        .long("max-depth")
-                        .value_name("N")
-                        .value_parser(value_parser!(u64))
-                        .requires("recursive")
-                        .help(
-                            "Maximum recursive depth (default: 64); direct children have depth 1",
-                        ),
-                )
-                .arg(
-                    Arg::new("limit")
-                        .long("limit")
-                        .value_name("N")
-                        .value_parser(value_parser!(u64))
-                        .requires("recursive")
-                        .help("Maximum recursive entries (default: 100000)"),
-                )
+                .args(recursive_args())
                 .arg(
                     Arg::new("path")
                         .value_name("PATH")
@@ -664,8 +641,7 @@ fn ls_recursive(fs: &Filesystem, path: &[u8], sub: &ArgMatches) -> Result<Outcom
     let inode = fs
         .lookup_path_bytes(path)
         .map_err(|e| erofs_error(path, e))?;
-    let max_depth = sub.get_one::<u64>("max-depth").copied().unwrap_or(64);
-    let limit = sub.get_one::<u64>("limit").copied().unwrap_or(100_000);
+    let ListBounds { max_depth, limit } = ListBounds::from_matches(sub);
     let mut full = Vec::new();
     for component in path.split(|b| *b == b'/').filter(|c| !c.is_empty()) {
         full.push(b'/');
@@ -678,10 +654,7 @@ fn ls_recursive(fs: &Filesystem, path: &[u8], sub: &ArgMatches) -> Result<Outcom
     let result = (|| {
         if !inode.is_dir() {
             if limit == 0 {
-                return Err(CliError::failed(format!(
-                    "--limit 0 reached at {}",
-                    show(&full)
-                )));
+                return Err(bound_reached("--limit", limit, &show(&full)));
             }
             entries.push(recursive_entry(fs, &full, 0, &inode, false)?);
             return Ok(());
@@ -707,16 +680,10 @@ fn ls_recursive(fs: &Filesystem, path: &[u8], sub: &ArgMatches) -> Result<Outcom
             full.extend_from_slice(&child.name);
             let depth = *parent_depth + 1;
             if entries.len() as u64 >= limit {
-                return Err(CliError::failed(format!(
-                    "--limit {limit} reached at {}",
-                    show(&full)
-                )));
+                return Err(bound_reached("--limit", limit, &show(&full)));
             }
             if depth > max_depth {
-                return Err(CliError::failed(format!(
-                    "--max-depth {max_depth} reached at {}",
-                    show(&full)
-                )));
+                return Err(bound_reached("--max-depth", max_depth, &show(&full)));
             }
             let inode = fs
                 .read_inode(child.nid)
