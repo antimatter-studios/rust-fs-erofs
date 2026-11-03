@@ -39,13 +39,14 @@ cat "$1" > "$2"
 EOF
 chmod +x "$work/bsd-bin/cp"
 
-# 8 MiB with data at the start, in the middle and nowhere at the end, so a
+# 64 MiB with data at the start, in the middle and nowhere at the end, so a
 # copy that drops a trailing hole comes out short. Allocated size is read with
-# `du -k`, which both GNU and BSD du answer the same way.
+# `du -k`, which both GNU and BSD du answer the same way. APFS fills small
+# gaps on close; a middle extent at 32 MiB keeps this fixture sparse there too.
 src="$work/src.img"
 printf 'EROFS-head' > "$src"
-printf 'middle' | dd of="$src" bs=1 seek=3145728 conv=notrunc 2>/dev/null
-truncate -s 8M "$src" 2>/dev/null || dd if=/dev/null of="$src" bs=1 seek=8388608 2>/dev/null
+printf 'middle' | dd of="$src" bs=1 seek=33554432 conv=notrunc 2>/dev/null
+truncate -s 64M "$src" 2>/dev/null || dd if=/dev/null of="$src" bs=1 seek=67108864 2>/dev/null
 src_kib="$(du -k "$src" | cut -f1)"
 
 # The control: if this filesystem cannot hold a hole, nothing below can tell a
@@ -57,11 +58,11 @@ fi
 check_copy() { # LABEL DST
     local label="$1" dst="$2"
     if cmp -s "$src" "$dst"; then ok; else bad "$label: the copy's bytes differ from the source"; fi
-    if [ "$(wc -c < "$dst" | tr -d ' ')" = 8388608 ]; then ok; else
-        bad "$label: the copy is $(wc -c < "$dst" | tr -d ' ') bytes, not 8388608 (a trailing hole was dropped)"
+    if [ "$(wc -c < "$dst" | tr -d ' ')" = 67108864 ]; then ok; else
+        bad "$label: the copy is $(wc -c < "$dst" | tr -d ' ') bytes, not 67108864 (a trailing hole was dropped)"
     fi
     local kib; kib="$(du -k "$dst" | cut -f1)"
-    if [ "$kib" -lt 1024 ]; then ok; else bad "$label: the copy is dense (${kib} KiB allocated for 8 MiB of mostly holes)"; fi
+    if [ "$kib" -lt 1024 ]; then ok; else bad "$label: the copy is dense (${kib} KiB allocated for 64 MiB of mostly holes)"; fi
 }
 
 if "$COPY" "$src" "$work/host.img" 2>"$work/host.err"; then
