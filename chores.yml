@@ -233,7 +233,9 @@ vars:
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
   # however it ends; v0.2.0 answers it with "unknown command".
-  LINUX_HARNESS_REF: v0.3.0
+  # v0.5.5 lets a host admit more than one VM (FLTH_SLOT_COUNT). v0.5.6 gives
+  # back what a guest deletes and says what stopped a lost guest.
+  LINUX_HARNESS_REF: v0.5.6
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
@@ -552,9 +554,10 @@ tasks:
         done
         # BUDGET: merge-queue run 40054968238 printed 1151 lines / 57,950
         # bytes once the CLI's own not_found unit cases joined (#251), one
-        # line over 1150; 1170 leaves room for the next case.
+        # line over 1150. Harness v0.5.6 prints more: merge-queue run 41709815453
+        # printed 1174 lines / 59,196 bytes; 1190 / 61000 leaves room.
         # shellcheck disable=SC2086  # the words are the point
-        ../rust-fs-core/scripts/tier.sh test:vm vm 1170 60000 -- \
+        ../rust-fs-core/scripts/tier.sh test:vm vm 1190 61000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
         # #239 adds one declared preservation test to the 528-case floor (#235).
         # #240 adds one declared export policy test.
