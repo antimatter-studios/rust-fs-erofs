@@ -132,8 +132,14 @@ chore_min_version: 0.10.0
 #                                                   retries ("Connection reset.
 #                                                   Retrying...") are noise this
 #                                                   repository does not control
-#     scripts     3 l /     77 B   30 l /  2,000 B  one shell test today, and
-#                                                   the glob picks up the next
+#     scripts    31 l /  1,231 B   40 l /  2,000 B  ~29%. 29 l / 1,118 B in the
+#                                                   merge-queue run 41877043436,
+#                                                   plus 2 l / 113 B for
+#                                                   test-staticlib-target-dir.sh
+#                                                   (#282). Each file prints its
+#                                                   `==` line and a verdict; the
+#                                                   glob picks up the next. Was
+#                                                   3 l / 77 B against 30 l
 #     cli        19 l /    683 B   31 l /  1,100 B  the installed tools, no cargo
 #               137 checks                          output at all: 19 lines on a
 #                                                   Mac with erofs-utils linked
@@ -678,7 +684,7 @@ tasks:
     cmds:
       - |
         set -eu
-        ../rust-fs-core/scripts/tier.sh test:scripts scripts 30 2000 -- bash -c '
+        ../rust-fs-core/scripts/tier.sh test:scripts scripts 40 2000 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
@@ -733,7 +739,14 @@ tasks:
       - 'rustup target add {{.TRIPLE}}'
       - 'cargo build --release --target {{.TRIPLE}}'
       - 'mkdir -p "{{.OUT}}/include"'
-      - 'cp target/{{.TRIPLE}}/release/lib{{.LIBNAME}}.a "{{.OUT}}/lib{{.LIBNAME}}.a"'
+      # From where cargo built it, which only cargo can say: ./target,
+      # CARGO_TARGET_DIR (which may be relative), or build.target-dir in a
+      # config file. `cargo metadata` gives an absolute path for all of them.
+      # A path it cannot give leaves the cp failing rather than guessing.
+      # tests/scripts/test-staticlib-target-dir.sh holds this (#282).
+      - |
+        target_dir="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+        cp "$target_dir/{{.TRIPLE}}/release/lib{{.LIBNAME}}.a" "{{.OUT}}/lib{{.LIBNAME}}.a"
       - 'cp include/{{.LIBNAME}}.h "{{.OUT}}/include/{{.LIBNAME}}.h"'
       # Shipping fs_core.h is ours: the header we emit #includes it, so a
       # consumer handed only fs_erofs.h cannot compile.
