@@ -870,3 +870,141 @@ fn fsck_passes_on_image_with_correct_nlink() {
         "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
+
+/// `dump.erofs` prints the superblock's UUID as the caller asked for it,
+/// and `fsck.erofs` accepts an image whose every inode was made compact by
+/// taking the build time as its mtime (`mkfs.erofs -T`).
+#[test]
+fn uuid_and_build_time_reach_dump_and_fsck_accepts_the_compact_inodes() {
+    let uuid = *b"\x01\x23\x45\x67\x89\xab\xcd\xef\xfe\xdc\xba\x98\x76\x54\x32\x10";
+    let options = mkfs::BuildOptions {
+        uuid,
+        build_time: 1_230_768_000,
+        mtime_is_build_time: true,
+        ..mkfs::BuildOptions::default()
+    };
+    let img = mkfs::build_image_with(
+        dir(vec![
+            ("a.txt", file(b"hello\n")),
+            ("sub", dir(vec![("b.bin", file(&[3u8; 9000]))])),
+        ]),
+        12,
+        options,
+    )
+    .unwrap();
+    let (path, _guard) = stage_image(&img);
+    let (code, stdout, stderr) = run_fsck(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let (code, stdout, stderr) = run_dump(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "dump.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let printed = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("Filesystem UUID:"))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("dump.erofs printed no UUID line:\n{stdout}"));
+    assert_eq!(printed, "01234567-89ab-cdef-fedc-ba9876543210");
+}
+
+/// Repeated xattrs written once, in the shared area, and referenced from
+/// every inode that carries them: `fsck.erofs` accepts the image, and the
+/// kernel reads every inode's full set, shared and inline, as this crate
+/// does.
+#[test]
+fn shared_xattrs_are_accepted_by_fsck_and_read_by_the_kernel() {
+    use fs_erofs::xattr::ns;
+    let label = || {
+        mkfs::XattrSpec::new(
+            ns::SECURITY,
+            b"selinux".to_vec(),
+            b"u:object_r:system_file:s0\0".to_vec(),
+        )
+    };
+    let with = |data: &[u8], xattrs: Vec<mkfs::XattrSpec>| mkfs::Node::File {
+        mode: mkfs::DEFAULT_FILE_MODE,
+        data: data.to_vec(),
+        meta: mkfs::NodeMeta::default(),
+        xattrs,
+    };
+    let names: Vec<String> = (0..200).map(|i| format!("f{i}")).collect();
+    let mut entries: Vec<(&str, mkfs::Node)> = names
+        .iter()
+        .map(|n| (n.as_str(), with(n.as_bytes(), vec![label()])))
+        .collect();
+    entries.push((
+        "own",
+        with(
+            b"own",
+            vec![
+                label(),
+                mkfs::XattrSpec::new(ns::USER, b"only".to_vec(), b"here".to_vec()),
+            ],
+        ),
+    ));
+    let options = mkfs::BuildOptions {
+        share_xattrs: true,
+        ..mkfs::BuildOptions::default()
+    };
+    let img = mkfs::build_image_with(dir(entries), 12, options).unwrap();
+    let (path, _guard) = stage_image(&img);
+    let (code, stdout, stderr) = run_fsck(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let report = fs_erofs_test_support::guest_kernel_read(
+        path.to_str().expect("utf-8 path"),
+        r#"python3 - "$MNT" <<'PY'
+import os, sys
+for name in sorted(os.listdir(sys.argv[1])):
+    p = os.path.join(sys.argv[1], name)
+    for x in sorted(os.listxattr(p)):
+        print(name, x, os.getxattr(p, x).hex())
+PY"#,
+    );
+    assert!(
+        report.status.success(),
+        "the kernel could not read the image:\n{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let kernel = String::from_utf8(report.stdout).expect("utf-8 report");
+
+    let fs = open_image_path(&path);
+    let root = fs.root_inode().unwrap();
+    let mut ours = String::new();
+    let mut listed: Vec<Vec<u8>> = fs
+        .read_dir(&root)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n != b"." && n != b"..")
+        .collect();
+    listed.sort();
+    for name in listed {
+        let inode = fs.lookup(&root, &name).unwrap();
+        let mut xattrs = fs.xattrs(&inode).unwrap();
+        xattrs.sort();
+        for (key, value) in xattrs {
+            let hex: String = value.iter().map(|b| format!("{b:02x}")).collect();
+            ours.push_str(&format!(
+                "{} {} {hex}\n",
+                String::from_utf8_lossy(&name),
+                String::from_utf8_lossy(&key)
+            ));
+        }
+    }
+    assert_eq!(
+        ours, kernel,
+        "this crate and the kernel read different xattrs"
+    );
+}
