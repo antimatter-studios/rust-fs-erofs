@@ -23,7 +23,7 @@ use fs_erofs_test_support::{fixture, guest_kernel_refusal, guest_kernel_report, 
 /// parses; only reading every one of these back proves the inodes,
 /// directory blocks and data layout the writer emitted are the ones the
 /// kernel thinks they are.
-fn kernel_mount_sample() -> (Vec<(String, Vec<u8>)>, mkfs::Node) {
+fn kernel_mount_sample() -> (Vec<(String, Vec<u8>)>, mkfs::Node<'static>) {
     let mut big = Vec::with_capacity(100_000);
     let mut seed = 0x2545_f491_4f6c_dd1du64;
     while big.len() < 100_000 {

@@ -15,7 +15,7 @@ use common::{dir, file, open_image};
 use fs_erofs::mkfs::{self, BuildOptions, Compression, Node, NodeMeta, DEFAULT_SYMLINK_MODE};
 use fs_erofs::DataLayout;
 
-fn symlink(target: &str) -> Node {
+fn symlink(target: &str) -> Node<'static> {
     Node::Symlink {
         mode: DEFAULT_SYMLINK_MODE,
         target: target.to_string(),
