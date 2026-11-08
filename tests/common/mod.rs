@@ -69,7 +69,7 @@ pub fn open_image_path(path: &Path) -> Filesystem {
 // ---- mkfs::Node tree builders -----------------------------------------
 
 /// Build a `mkfs::Node::Dir` from a `(name, child)` slice.
-pub fn dir(entries: Vec<(&str, mkfs::Node)>) -> mkfs::Node {
+pub fn dir(entries: Vec<(&str, mkfs::Node<'static>)>) -> mkfs::Node<'static> {
     let mut m = BTreeMap::new();
     for (k, v) in entries {
         m.insert(k.to_string(), v);
@@ -83,7 +83,7 @@ pub fn dir(entries: Vec<(&str, mkfs::Node)>) -> mkfs::Node {
 }
 
 /// Build a `mkfs::Node::File` from a byte slice.
-pub fn file(data: &[u8]) -> mkfs::Node {
+pub fn file(data: &[u8]) -> mkfs::Node<'static> {
     mkfs::Node::File {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -203,7 +203,7 @@ pub fn run_mkfs_erofs(extra_args: &[&str], out_path: &Path, source_dir: &Path) -
 /// scratch directory, because that is the only tree the guest can see.
 /// A `tempfile::tempdir()` under /tmp -- which is what this used to do
 /// -- is a path `mkfs.erofs` in the guest cannot open.
-pub fn build_with_mkfs_erofs(args: &[&str], tree: &mkfs::Node) -> ImageArtifact {
+pub fn build_with_mkfs_erofs(args: &[&str], tree: &mkfs::Node<'static>) -> ImageArtifact {
     let dir = ScratchDir::new("mkfs");
     let src = dir.join("src");
     let img = dir.join("out.img");
@@ -306,7 +306,7 @@ pub fn long_link_target() -> String {
 }
 
 /// Build a `mkfs::Node::Symlink` with the default symlink mode.
-pub fn symlink(target: &str) -> mkfs::Node {
+pub fn symlink(target: &str) -> mkfs::Node<'static> {
     mkfs::Node::Symlink {
         mode: mkfs::DEFAULT_SYMLINK_MODE,
         target: target.to_string(),
@@ -316,7 +316,7 @@ pub fn symlink(target: &str) -> mkfs::Node {
 }
 
 /// Build a `mkfs::Node::Device`. `mode` must carry S_IFCHR or S_IFBLK.
-pub fn device(mode: u16, rdev: u32) -> mkfs::Node {
+pub fn device(mode: u16, rdev: u32) -> mkfs::Node<'static> {
     mkfs::Node::Device {
         mode,
         rdev,
@@ -326,7 +326,7 @@ pub fn device(mode: u16, rdev: u32) -> mkfs::Node {
 }
 
 /// Build a `mkfs::Node::Special`. `mode` must carry S_IFIFO or S_IFSOCK.
-pub fn special(mode: u16) -> mkfs::Node {
+pub fn special(mode: u16) -> mkfs::Node<'static> {
     mkfs::Node::Special {
         mode,
         meta: mkfs::NodeMeta::default(),
@@ -335,7 +335,7 @@ pub fn special(mode: u16) -> mkfs::Node {
 }
 
 /// Build a `mkfs::Node::File` carrying explicit uid/gid/mtime.
-pub fn file_with_meta(data: &[u8], meta: mkfs::NodeMeta) -> mkfs::Node {
+pub fn file_with_meta(data: &[u8], meta: mkfs::NodeMeta) -> mkfs::Node<'static> {
     mkfs::Node::File {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -359,7 +359,7 @@ pub fn file_with_meta(data: &[u8], meta: mkfs::NodeMeta) -> mkfs::Node {
 /// /sub/deeper/leaf.txt
 /// /chr /blk /fifo /sock
 /// ```
-pub fn capi_fixture_tree() -> mkfs::Node {
+pub fn capi_fixture_tree() -> mkfs::Node<'static> {
     use fs_erofs::inode::{S_IFBLK, S_IFCHR, S_IFIFO, S_IFSOCK};
     let big = big_body();
     let long = long_link_target();

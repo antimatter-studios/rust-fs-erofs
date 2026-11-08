@@ -29,7 +29,7 @@ const CHECKSUM_AT: usize = SB + 0x04;
 const BLKSZBITS_AT: usize = SB + 0x0C;
 const FEATURE_INCOMPAT_AT: usize = SB + 0x50;
 
-fn tree() -> mkfs::Node {
+fn tree() -> mkfs::Node<'static> {
     dir(vec![
         ("hello.txt", file(b"hello, world\n")),
         ("sub", dir(vec![("inner.txt", file(b"inner\n"))])),

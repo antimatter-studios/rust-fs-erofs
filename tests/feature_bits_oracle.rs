@@ -41,7 +41,7 @@ use std::path::Path;
 /// 1024 bytes into the image.
 const FEATURE_INCOMPAT_AT: usize = 1024 + 0x50;
 
-fn source_tree() -> mkfs::Node {
+fn source_tree() -> mkfs::Node<'static> {
     // Big enough and varied enough that the encoder has something to
     // fragment and something to inline: a tree of tiny tails alongside
     // one file well over a block.
