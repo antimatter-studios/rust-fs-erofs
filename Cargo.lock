@@ -322,6 +322,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "git+https://github.com/antimatter-studios/lz4_flex?rev=b19fe1ae5eca4023dc7314076d42ae52d621cedd#b19fe1ae5eca4023dc7314076d42ae52d621cedd"
+
+[[package]]
 name = "lzma-rs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -452,7 +457,8 @@ dependencies = [
  "flate2",
  "fs-erofs-test-support",
  "lru",
- "lz4_flex",
+ "lz4_flex 0.11.6",
+ "lz4_flex 0.14.0",
  "lzma-rs",
  "rust-fs-core",
  "ruzstd",
