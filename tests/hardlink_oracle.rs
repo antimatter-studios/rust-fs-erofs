@@ -174,3 +174,91 @@ fn link_counts_in_compact_inodes_agree_with_the_kernel() {
 fn link_counts_in_extended_inodes_agree_with_the_kernel() {
     links_agree_with_the_kernel("links-extended", "-Eforce-inode-extended", 64);
 }
+
+/// This crate's writer makes the links -- three names for one file across
+/// two directories, a hard-linked symlink, and one file with 301 names --
+/// and the kernel, mounting the image, must count and group them as the
+/// tree described them. `fsck.erofs` must accept the image first.
+#[test]
+fn links_this_crate_writes_are_the_links_the_kernel_reads() {
+    use fs_erofs::mkfs::{self, Node, NodeMeta, DEFAULT_SYMLINK_MODE};
+
+    let link = |target: &str| Node::HardLink {
+        target: target.to_string(),
+    };
+    let many: Vec<String> = (1..=300).map(|i| i.to_string()).collect();
+    let tree = common::dir(vec![
+        ("a", common::file(b"one\n")),
+        ("b", link("a")),
+        ("d", common::dir(vec![("c", link("/a"))])),
+        ("solo", common::file(b"solo\n")),
+        (
+            "sym",
+            Node::Symlink {
+                mode: DEFAULT_SYMLINK_MODE,
+                target: "a".to_string(),
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+        ),
+        ("sym-link", link("sym")),
+        ("many", common::file(b"many\n")),
+        (
+            "many.d",
+            common::dir(many.iter().map(|n| (n.as_str(), link("many"))).collect()),
+        ),
+    ]);
+    let image = mkfs::build_image(tree, 12).expect("build");
+    let dir = ScratchDir::new("writer-links");
+    let image_path = dir.join("links.img");
+    std::fs::write(&image_path, &image).expect("write the image");
+
+    let fsck = fs_erofs_test_support::oracle("fsck.erofs")
+        .arg(&image_path)
+        .output();
+    assert!(
+        fsck.status.success(),
+        "fsck.erofs refused the writer's links:\n{}{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    let kernel = guest_kernel_link_report(image_path.to_str().expect("utf-8 path"), "writer-links");
+    let field = |kind: &str, path: &str| -> String {
+        kernel
+            .get(&(kind.to_string(), path.to_string()))
+            .unwrap_or_else(|| panic!("the kernel reported no {kind} for {path}"))
+            .clone()
+    };
+    for (path, want) in [
+        ("a", "3"),
+        ("b", "3"),
+        ("d/c", "3"),
+        ("solo", "1"),
+        ("sym", "2"),
+        ("sym-link", "2"),
+        ("many", "301"),
+        ("many.d/300", "301"),
+        ("d", "2"),
+        (".", "4"),
+    ] {
+        assert_eq!(field("links", path), want, "kernel link count of {path}");
+    }
+    assert_eq!(field("ino", "a"), field("ino", "d/c"));
+    assert_eq!(field("ino", "sym"), field("ino", "sym-link"));
+    assert_ne!(field("ino", "a"), field("ino", "solo"));
+
+    let fs = common::open_image(image);
+    for (path, inode) in {
+        let root = fs.root_inode().expect("root");
+        let mut paths = Vec::new();
+        walk(&fs, &root, "", &mut paths);
+        paths
+    } {
+        assert_eq!(
+            field("links", &path),
+            inode.nlink.to_string(),
+            "this crate's link count of {path}"
+        );
+    }
+}
