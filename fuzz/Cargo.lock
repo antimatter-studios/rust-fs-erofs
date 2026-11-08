@@ -209,7 +209,7 @@ version = "0.4.3"
 
 [[package]]
 name = "rust-fs-erofs"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "crc32c",
  "flate2",
