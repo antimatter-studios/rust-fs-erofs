@@ -511,9 +511,9 @@ tasks:
       # #239 adds one declared case comparing compact and extended preservation with the kernel.
       # #240 adds one declared case for depth, merge, refusal, offset and single-file commands.
       # #233 adds one declared case exporting a damaged tree.
-      # 32 with the builder's own kernel tests, in hardlink_oracle.rs, writer_kernel.rs
+      # 33 with the builder's own kernel tests, in hardlink_oracle.rs, writer_kernel.rs
       # and lz4hc_writer.rs (#252-#263), which kernel-floor.sh counts.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 32'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 33'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
