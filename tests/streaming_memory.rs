@@ -102,19 +102,32 @@ fn tree() -> Node {
     directory(root)
 }
 
-/// Uncompressed, and compressed as `-zlz4hc,12 -C 32768`, which adds the
-/// compressor's window and buffers and nothing per byte of data.
+/// Uncompressed, and compressed as `-zlz4hc,12 -C 32768` on one thread
+/// and on four. Compression adds segments in flight -- one more than the
+/// threads, each a 4 MiB segment and its output -- and nothing per byte of
+/// data.
 #[test]
 fn a_build_holds_the_metadata_in_memory_and_never_the_file_data() {
-    build_and_check(None);
-    build_and_check(Some(Compression::LZ4HC_12_32K));
+    build_and_check(None, 1);
+    build_and_check(Some(Compression::LZ4HC_12_32K), 1);
+    build_and_check(Some(Compression::LZ4HC_12_32K), 4);
 }
 
-fn build_and_check(compression: Option<Compression>) {
+/// What each segment in flight may hold: its 4 MiB of input, and its
+/// output, which is never larger.
+const PER_SEGMENT: usize = 8 << 20;
+
+fn build_and_check(compression: Option<Compression>, threads: usize) {
     let tree = tree();
     let options = BuildOptions {
         compression,
+        threads,
         ..BuildOptions::default()
+    };
+    let limit = if threads > 1 {
+        PEAK_LIMIT + (threads + 1) * PER_SEGMENT
+    } else {
+        PEAK_LIMIT
     };
     let mut sink = tempfile::tempfile().expect("a file to build into");
     let before = LIVE.load(Ordering::SeqCst);
@@ -127,12 +140,12 @@ fn build_and_check(compression: Option<Compression>) {
         "the image holds the data ({len} bytes)"
     );
     assert!(
-        peak < PEAK_LIMIT,
-        "building an image of {} MiB of file data ({compression:?}) peaked at {} MiB of heap; \
-         the limit is {} MiB",
+        peak < limit,
+        "building an image of {} MiB of file data ({compression:?}, {threads} threads) peaked \
+         at {} MiB of heap; the limit is {} MiB",
         (BIG_FILES * BIG_SIZE) >> 20,
         peak >> 20,
-        PEAK_LIMIT >> 20
+        limit >> 20
     );
 
     // And it is the image the tree described.
