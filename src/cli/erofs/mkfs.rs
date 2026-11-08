@@ -223,7 +223,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
 
 /// The image's root: SOURCE itself when it is a directory, or a root
 /// holding SOURCE when it is a single regular file.
-fn root_node(path: &Path, walk: &mut Walk) -> std::io::Result<Node> {
+fn root_node(path: &Path, walk: &mut Walk) -> std::io::Result<Node<'static>> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_dir() {
         return walk_dir(path, &meta, walk);
@@ -251,7 +251,11 @@ fn root_node(path: &Path, walk: &mut Walk) -> std::io::Result<Node> {
     })
 }
 
-fn walk_dir(path: &Path, meta: &std::fs::Metadata, walk: &mut Walk) -> std::io::Result<Node> {
+fn walk_dir(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    walk: &mut Walk,
+) -> std::io::Result<Node<'static>> {
     walk.directories += 1;
     let mut entries = BTreeMap::new();
     for entry in std::fs::read_dir(path)? {
@@ -290,7 +294,7 @@ fn walk_dir(path: &Path, meta: &std::fs::Metadata, walk: &mut Walk) -> std::io::
     })
 }
 
-fn file_node(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<Node> {
+fn file_node(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<Node<'static>> {
     Ok(Node::File {
         mode: mode_for(meta, DEFAULT_FILE_MODE),
         data: std::fs::read(path)?,
