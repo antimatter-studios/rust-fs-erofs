@@ -9,18 +9,36 @@
 /// An LZ4HC encoder at one compression level.
 pub(crate) struct Lz4Hc {
     level: u8,
+    #[cfg(feature = "lz4hc-workspace")]
+    table: lz4_flex_hc::block::CompressHcDestSizeTable,
 }
 
 impl Lz4Hc {
     pub(crate) fn new(level: u8) -> Self {
-        Self { level }
+        Self {
+            level,
+            #[cfg(feature = "lz4hc-workspace")]
+            table: lz4_flex_hc::block::CompressHcDestSizeTable::new(),
+        }
     }
 
     /// Compress as much of `src` as fits in `dst`, as one LZ4 block that
     /// decodes on its own. Returns the input bytes it took and the output
     /// bytes it wrote; `(0, 0)` when not even one byte fits.
     pub(crate) fn compress_dest_size(&mut self, src: &[u8], dst: &mut [u8]) -> (usize, usize) {
-        lz4_flex_hc::block::compress_hc_dest_size(src, dst, self.level)
+        #[cfg(feature = "lz4hc-workspace")]
+        {
+            lz4_flex_hc::block::compress_hc_dest_size_with_table(
+                src,
+                dst,
+                self.level,
+                &mut self.table,
+            )
+        }
+        #[cfg(not(feature = "lz4hc-workspace"))]
+        {
+            lz4_flex_hc::block::compress_hc_dest_size(src, dst, self.level)
+        }
     }
 }
 
