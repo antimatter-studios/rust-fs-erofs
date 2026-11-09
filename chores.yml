@@ -92,7 +92,7 @@ chore_min_version: 0.10.0
 #
 #     tier      measured          budget            headroom, and why
 #     tier      measured          budget            headroom, and why
-#     unit      643 l / 35,194 B  740 l / 40,000 B  ~15%. The tests' own output:
+#     unit      726 l / 40,374 B  830 l / 46,000 B  ~14%. The tests' own output:
 #               453 tests                           the build runs first,
 #                                                   outside the budget (#189),
 #                                                   so a cold cache no longer
@@ -100,14 +100,29 @@ chore_min_version: 0.10.0
 #                                                   37545116802's unit.log,
 #                                                   792 l / 42,371 B cold,
 #                                                   less its 149 cargo and
-#                                                   rustup lines
+#                                                   rustup lines. 726 l / 40,374
+#                                                   B is run 41432903213 with the
+#                                                   builder's tests (#252-#263);
+#                                                   was 643 l / 35,194 B against
+#                                                   740 l / 40,000 B
 #     images     13 l /    684 B  120 l /  8,000 B  the first --release tier in
 #                 3 tests                           a job, so it pays the cold
 #                                                   build too: 73 l cold
-#     oracle    529 l / 41,268 B  700 l / 55,000 B  runs warm in CI (unit and
-#                87 tests                           images built already): ~18%
-#     kernel    244 l / 16,065 B  320 l / 21,000 B  ~30%, measured in CI: the
-#                17 tests                           x86_64 merge-queue run
+#     oracle    674 l / 53,442 B  800 l / 63,000 B  runs warm in CI (unit and
+#                                                   images built already): ~18%.
+#                                                   Run 41432903213's oracle.log
+#                                                   and the part of its
+#                                                   kernel.log that stays in
+#                                                   oracle_writer.rs (#252-#263).
+#                                                   Was 529 l / 41,268 B for 87
+#                                                   tests against 700 l / 55,000
+#     kernel    349 l / 25,545 B  430 l / 31,000 B  ~20%. Run 41432903213's
+#                                                   kernel.log less oracle_writer
+#                                                   plus the four tests that moved
+#                                                   to writer_kernel.rs (#252-#263).
+#                                                   Was 244 l / 16,065 B for 17
+#                                                   tests, measured in CI: the
+#                                                   x86_64 merge-queue run
 #                                                   39169325727 of #237
 #                                                   (#243). Every kernel test
 #                                                   adds its --show-output
@@ -131,7 +146,11 @@ chore_min_version: 0.10.0
 #                                                   because vagrant's boot
 #                                                   retries ("Connection reset.
 #                                                   Retrying...") are noise this
-#                                                   repository does not control
+#                                                   repository does not control.
+#                                                   1,230 l / 62,725 B in run
+#                                                   41432903213 with the builder's
+#                                                   tests (#252-#263); the budget
+#                                                   is 1,400 l / 72,000 B
 #     scripts    31 l /  1,231 B   40 l /  2,000 B  ~29%. 29 l / 1,118 B in the
 #                                                   merge-queue run 41877043436,
 #                                                   plus 2 l / 113 B for
@@ -416,7 +435,7 @@ tasks:
     # step to build exactly what the tier runs.
     cmds:
       - 'scripts/test.sh --locked --no-run --quiet $(scripts/test-targets.sh unit)'
-      - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 740 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 830 46000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
       # local-unit.sh measured 518 baseline cases plus five import refusal
       # cases on 2026-10-18, and 524 with the core pin floor guard (#231);
       # every baseline case remains in the unit tier. The two not_found
@@ -454,7 +473,7 @@ tasks:
     # for a run that never reached scripts/test.sh.
     cmds:
       - scripts/tools.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 700 55000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 800 63000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
       # 90: the 87 measured before the tools, plus tests/cli_mkfs_oracle.rs
       # and tests/cli_fs_oracle.rs's eight, less a margin. Only goes up.
       - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored oracle 90'
@@ -471,7 +490,7 @@ tasks:
       - scripts/tools.sh --check
       # BUDGET: run 41429236288 printed 21,037 bytes once tests/inlined_tail_kernel.rs
       # joined; 22,000 leaves room for the next test.
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 320 22000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 430 31000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
     # 5: the 3 measured on main at ca0c577 (CI run 36351672753) -- the
     # third being the readlink kernel oracle #139 added -- plus the two
     # #125 added: the deduplicated images read back through the kernel,
@@ -492,7 +511,9 @@ tasks:
       # #239 adds one declared case comparing compact and extended preservation with the kernel.
       # #240 adds one declared case for depth, merge, refusal, offset and single-file commands.
       # #233 adds one declared case exporting a damaged tree.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 21'
+      # 36 with the builder's own kernel tests, in hardlink_oracle.rs, writer_kernel.rs
+      # and lz4hc_writer.rs (#252-#263), which kernel-floor.sh counts.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 36'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
@@ -569,9 +590,11 @@ tasks:
         # BUDGET: merge-queue run 40054968238 printed 1151 lines / 57,950
         # bytes once the CLI's own not_found unit cases joined (#251), one
         # line over 1150. Harness v0.5.6 prints more: merge-queue run 41709815453
-        # printed 1174 lines / 59,196 bytes; 1190 / 61000 leaves room.
+        # printed 1174 lines / 59,196 bytes; 1190 / 61000 leaves room. The
+        # builder's tests (#252-#263) printed 1230 lines / 62,725 bytes in
+        # run 41432903213; 1400 / 72000 is about 14% over that.
         # shellcheck disable=SC2086  # the words are the point
-        ../rust-fs-core/scripts/tier.sh test:vm vm 1190 61000 -- \
+        ../rust-fs-core/scripts/tier.sh test:vm vm 1400 72000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
         # #239 adds one declared preservation test to the 528-case floor (#235).
         # #240 adds one declared export policy test.

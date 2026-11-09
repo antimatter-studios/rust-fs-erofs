@@ -1,6 +1,6 @@
 [package]
 name = "rust-fs-erofs"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust EROFS (Enhanced Read-Only File System) reader and writer. Clean-room implementation; reads mkfs.erofs 1.9 images (LZ4/LZMA/DEFLATE/ZSTD, compacted-2B, ztailpacking, fragments, dedupe, big_pcluster), and refuses rather than misreads the shapes it cannot vouch for and produces fsck.erofs-clean output."
@@ -48,6 +48,14 @@ names = { "mkfs.erofs" = 8, "fs.erofs" = 1 }
 licenses = ["LICENSE"]
 
 [features]
+# Enables the benchmark's reusable-workspace path. Historical fork revisions
+# lack that API, so the comparison workflow leaves this off for old commits.
+bench-reuse = []
+# Keep the EROFS encoder's reusable table enabled in normal builds. The fork's
+# earlier revisions lack this API; the historical benchmark disables defaults
+# to exercise its stateless compatibility path.
+default = ["lz4hc-workspace"]
+lz4hc-workspace = []
 # The command-line tools and nothing else. The plumbing they share --
 # dispatch, --version, doctor, the output contract, man pages and
 # completions -- is rust-fs-core's `cli` feature, turned on only here, so
@@ -76,6 +84,12 @@ lru = "0.12"
 # the `rust-fs-erofs` target above). No derive: the builder API keeps each
 # tool's command a function the man pages and completions can be made from.
 clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
+# LZ4HC with a fixed output for the builder's compression (src/lz4hc.rs): the
+# fork adds that mode over upstream's open HC work, offered in
+# PSeitz/lz4_flex#244. Pure Rust. A git dependency until that lands or the
+# fork is published under its own name, and the alias lets it sit beside the
+# 0.11 this crate decodes with.
+lz4_flex_hc = { git = "https://github.com/antimatter-studios/lz4_flex", rev = "5de9839", package = "lz4_flex", default-features = false, features = ["std", "safe-decode"] }
 
 [dev-dependencies]
 # The test suite's one way in to a fixture, to an erofs-utils tool and to
@@ -101,6 +115,14 @@ saphyr = "0.0.12"
 # Android image against hashes the kernel's EROFS driver and fsck.erofs
 # produced. MIT/Apache-2.0, pure Rust. Dev-only.
 sha2 = "0.10"
+# The performance bench compares the Rust encoder with liblz4. The existing
+# lz4_flex_hc dependency above is reused; lzzzz is dev-only and its MIT wrapper
+# includes BSD-2-Clause liblz4. Neither C code nor lzzzz enters the runtime graph.
+lzzzz = "=2.0.0"
+
+[[bench]]
+name = "erofs_lz4hc"
+harness = false
 
 [profile.release]
 lto = true

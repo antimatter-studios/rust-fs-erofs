@@ -43,7 +43,7 @@ impl Xs64 {
 /// node has a random ascii name; files get random byte payloads of
 /// random size in `0..max_file_size`. Small dirs (<=200 children) keep
 /// us under the writer's single-block-dir cap.
-fn random_tree(seed: u64, target_nodes: usize, max_file_size: usize) -> mkfs::Node {
+fn random_tree(seed: u64, target_nodes: usize, max_file_size: usize) -> mkfs::Node<'static> {
     let mut rng = Xs64::new(seed);
     let mut count = 0usize;
     let mut counter = 0u32;
@@ -68,7 +68,7 @@ fn random_tree(seed: u64, target_nodes: usize, max_file_size: usize) -> mkfs::No
         target: usize,
         max_size: usize,
         depth: usize,
-    ) -> mkfs::Node {
+    ) -> mkfs::Node<'static> {
         let mut entries = BTreeMap::new();
         let n_children = if depth >= 4 {
             0
@@ -131,7 +131,9 @@ fn collect_files(node: &mkfs::Node, prefix: String, out: &mut Vec<(String, Vec<u
         | mkfs::Node::Device { .. }
         | mkfs::Node::Special { .. }
         | mkfs::Node::ChunkedFile { .. }
-        | mkfs::Node::CompressedFile(_) => {}
+        | mkfs::Node::CompressedFile(_)
+        | mkfs::Node::HardLink { .. }
+        | mkfs::Node::StreamedFile { .. } => {}
     }
 }
 
@@ -287,11 +289,19 @@ fn corrupt_inode_format_is_handled_no_panic() {
 #[test]
 fn corrupt_dirent_nameoff_is_handled_no_panic() {
     let mut img = build_simple_image();
-    // The root dir's data block sits right after the inode area. With
-    // a small tree that fits in one inode block, the dir area starts
-    // at block 2 (byte 8192). Stomp the first dirent's nameoff to a
+    // Find the root directory's first dirent: in its first block, or
+    // after the inode when that block is inline. Stomp its nameoff to a
     // value not divisible by EROFS_DIRENT_SIZE (=12).
-    let dir_block_off = 2 * 4096;
+    let dir_block_off = {
+        let fs = open_image(img.clone());
+        let root = fs.root_inode().unwrap();
+        match root.format.layout {
+            fs_erofs::DataLayout::FlatInline if root.size < 4096 => {
+                root.body_end(fs.superblock()) as usize
+            }
+            _ => root.raw_u as usize * 4096,
+        }
+    };
     img[dir_block_off + 8..dir_block_off + 10].copy_from_slice(&5u16.to_le_bytes());
     let res: std::thread::Result<fs_erofs::Result<()>> = std::panic::catch_unwind(move || {
         let dev: Arc<dyn fs_core::BlockRead> = Arc::new(MemDev::new(img));

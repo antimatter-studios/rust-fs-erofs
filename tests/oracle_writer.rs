@@ -303,7 +303,7 @@ fn fsck_passes_on_chunked_file_indexed() {
 
 // ---- W2a oracle coverage: LZ4 compressed inodes -----------------------
 
-fn compressed_lz4(data: &[u8]) -> mkfs::Node {
+fn compressed_lz4(data: &[u8]) -> mkfs::Node<'static> {
     mkfs::Node::CompressedFile(mkfs::CompressedFileSpec {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -319,7 +319,7 @@ fn compressed_lz4(data: &[u8]) -> mkfs::Node {
 
 /// Build a compacted-2B compressed-file node, with optional ztailpacking.
 /// Used by the W2b oracle tests below.
-fn compressed_lz4_compacted2b(data: &[u8], ztailpacking: bool) -> mkfs::Node {
+fn compressed_lz4_compacted2b(data: &[u8], ztailpacking: bool) -> mkfs::Node<'static> {
     mkfs::Node::CompressedFile(mkfs::CompressedFileSpec {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -471,7 +471,7 @@ fn collated_lz4_test_node(
     data: &[u8],
     target_pcluster_blocks: u32,
     index_format: mkfs::CompressedIndexFormat,
-) -> mkfs::Node {
+) -> mkfs::Node<'static> {
     mkfs::Node::CompressedFile(mkfs::CompressedFileSpec {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -536,7 +536,7 @@ fn fsck_passes_on_collated_compressed_legacy_index() {
 
 /// Helper for the W3 oracle tests. Builds a [`mkfs::Node::CompressedFile`]
 /// node with the requested codec, legacy index format, no ztailpacking.
-fn compressed_with(algo: mkfs::CompressedAlgo, data: &[u8]) -> mkfs::Node {
+fn compressed_with(algo: mkfs::CompressedAlgo, data: &[u8]) -> mkfs::Node<'static> {
     mkfs::Node::CompressedFile(mkfs::CompressedFileSpec {
         mode: mkfs::DEFAULT_FILE_MODE,
         data: data.to_vec(),
@@ -869,4 +869,158 @@ fn fsck_passes_on_image_with_correct_nlink() {
         Some(0),
         "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
+}
+
+/// `dump.erofs` prints the superblock's UUID as the caller asked for it,
+/// and `fsck.erofs` accepts an image whose every inode was made compact by
+/// taking the build time as its mtime (`mkfs.erofs -T`).
+#[test]
+fn uuid_and_build_time_reach_dump_and_fsck_accepts_the_compact_inodes() {
+    let uuid = *b"\x01\x23\x45\x67\x89\xab\xcd\xef\xfe\xdc\xba\x98\x76\x54\x32\x10";
+    let options = mkfs::BuildOptions {
+        uuid,
+        build_time: 1_230_768_000,
+        mtime_is_build_time: true,
+        ..mkfs::BuildOptions::default()
+    };
+    let img = mkfs::build_image_with(
+        dir(vec![
+            ("a.txt", file(b"hello\n")),
+            ("sub", dir(vec![("b.bin", file(&[3u8; 9000]))])),
+        ]),
+        12,
+        options,
+    )
+    .unwrap();
+    let (path, _guard) = stage_image(&img);
+    let (code, stdout, stderr) = run_fsck(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let (code, stdout, stderr) = run_dump(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "dump.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let printed = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("Filesystem UUID:"))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("dump.erofs printed no UUID line:\n{stdout}"));
+    assert_eq!(printed, "01234567-89ab-cdef-fedc-ba9876543210");
+}
+
+/// Every kind of inode the writer makes, with the data area before the
+/// metadata area as the streaming writer lays it out, built into a sink
+/// by `build_image_to`: `fsck.erofs` must accept it, and must find every
+/// file's bytes where the inodes say they are.
+#[test]
+fn fsck_passes_on_every_inode_kind_streamed_into_a_sink() {
+    use fs_erofs::xattr::ns;
+    let label = || {
+        mkfs::XattrSpec::new(
+            ns::SECURITY,
+            b"selinux".to_vec(),
+            b"u:object_r:a:s0\0".to_vec(),
+        )
+    };
+    let streamed = |bytes: Vec<u8>| mkfs::Node::StreamedFile {
+        mode: mkfs::DEFAULT_FILE_MODE,
+        content: mkfs::Content::from_bytes(bytes),
+        meta: mkfs::NodeMeta::default(),
+        xattrs: vec![label()],
+    };
+    let big: Vec<u8> = (0..300_001u32).map(|i| (i % 251) as u8).collect();
+    let tree = dir(vec![
+        ("inline", streamed(b"inline bytes".to_vec())),
+        ("big", streamed(big.clone())),
+        (
+            "big-link",
+            mkfs::Node::HardLink {
+                target: "big".to_string(),
+            },
+        ),
+        ("compressed", compressed_lz4(&vec![b'z'; 70_000])),
+        (
+            "sym",
+            mkfs::Node::Symlink {
+                mode: mkfs::DEFAULT_SYMLINK_MODE,
+                target: "big".to_string(),
+                meta: mkfs::NodeMeta::default(),
+                xattrs: vec![label()],
+            },
+        ),
+        (
+            "chunked",
+            mkfs::Node::ChunkedFile {
+                mode: mkfs::DEFAULT_FILE_MODE,
+                chunk_bits: 0,
+                chunks: vec![Some(vec![1u8; 4096]), None, Some(vec![2u8; 100])],
+                use_indexed_format: false,
+                meta: mkfs::NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+        ),
+        ("sub", dir(vec![("deep", streamed(big[..5000].to_vec()))])),
+    ]);
+    let options = mkfs::BuildOptions {
+        share_xattrs: true,
+        build_time: 1_230_768_000,
+        mtime_is_build_time: true,
+        ..mkfs::BuildOptions::default()
+    };
+    let mut sink = std::io::Cursor::new(Vec::new());
+    mkfs::build_image_to(tree, 12, options, &mut sink).unwrap();
+    let (path, _guard) = stage_image(&sink.into_inner());
+    let (code, stdout, stderr) = run_fsck(&path);
+    assert_eq!(
+        code,
+        Some(0),
+        "fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// Contents that borrow a local buffer rather than own their bytes build
+/// an image `fsck.erofs` accepts, uncompressed and compressed.
+#[test]
+fn fsck_passes_on_contents_that_borrow_a_local_buffer() {
+    let buf: Vec<u8> = (0..300_001u32)
+        .flat_map(|i| format!("{} ", i % 997).into_bytes())
+        .take(300_001)
+        .collect();
+    let source: &[u8] = &buf;
+    for compression in [None, Some(mkfs::Compression::LZ4HC_12_32K)] {
+        let borrowed = |len: usize| mkfs::Node::StreamedFile {
+            mode: mkfs::DEFAULT_FILE_MODE,
+            content: mkfs::Content::new(len as u64, move || Ok(&source[..len])),
+            meta: mkfs::NodeMeta::default(),
+            xattrs: Vec::new(),
+        };
+        let mut entries = std::collections::BTreeMap::new();
+        for (name, len) in [("small", 700), ("block", 4096), ("big", buf.len())] {
+            entries.insert(name.to_string(), borrowed(len));
+        }
+        let tree = mkfs::Node::Dir {
+            mode: mkfs::DEFAULT_DIR_MODE,
+            entries,
+            meta: mkfs::NodeMeta::default(),
+            xattrs: Vec::new(),
+        };
+        let options = mkfs::BuildOptions {
+            compression,
+            ..mkfs::BuildOptions::default()
+        };
+        let img = mkfs::build_image_with(tree, 12, options).unwrap();
+        let (path, _guard) = stage_image(&img);
+        let (code, stdout, stderr) = run_fsck(&path);
+        assert_eq!(
+            code,
+            Some(0),
+            "{compression:?}: fsck.erofs failed:\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
 }
