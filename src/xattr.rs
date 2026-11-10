@@ -252,26 +252,57 @@ fn parse_shared_entry(buf: &[u8]) -> Result<XattrEntry> {
     })
 }
 
+/// Each namespace index and the prefix its full names start with. The
+/// one table both directions read: [`resolve_full_name`] puts a prefix in
+/// front of a name, [`split_full_name`] takes it off.
+///
+/// The POSIX ACL entries are whole names, not prefixes: their on-disk
+/// name is empty.
+const NAMESPACE_PREFIXES: [(u8, &[u8]); 6] = [
+    (ns::USER, b"user."),
+    (ns::POSIX_ACL_ACCESS, b"system.posix_acl_access"),
+    (ns::POSIX_ACL_DEFAULT, b"system.posix_acl_default"),
+    (ns::TRUSTED, b"trusted."),
+    (ns::LUSTRE, b"lustre."),
+    (ns::SECURITY, b"security."),
+];
+
 /// Concatenate the namespace prefix and `name`. ACL slots return their
 /// canonical full attribute name even when `name` is empty, since
 /// `e_name_index == 2|3` carries no on-disk suffix. Custom-prefix
 /// indices (high bit set) fall through to a raw-name copy here -- use
 /// [`resolve_with_dict`] when a dictionary is available.
 pub fn resolve_full_name(name_index: u8, name: &[u8]) -> Vec<u8> {
-    let prefix: &[u8] = match name_index {
-        ns::RAW => b"",
-        ns::USER => b"user.",
-        ns::POSIX_ACL_ACCESS => b"system.posix_acl_access",
-        ns::POSIX_ACL_DEFAULT => b"system.posix_acl_default",
-        ns::TRUSTED => b"trusted.",
-        ns::LUSTRE => b"lustre.",
-        ns::SECURITY => b"security.",
-        _ => b"",
-    };
+    let prefix: &[u8] = NAMESPACE_PREFIXES
+        .iter()
+        .find(|(index, _)| *index == name_index)
+        .map_or(b"", |(_, prefix)| prefix);
     let mut out = Vec::with_capacity(prefix.len() + name.len());
     out.extend_from_slice(prefix);
     out.extend_from_slice(name);
     out
+}
+
+/// The inverse of [`resolve_full_name`]: a full name's namespace index,
+/// and the name after its prefix. A POSIX ACL name must be the whole name
+/// and has an empty one.
+///
+/// A name with no known prefix is refused rather than taken as
+/// [`ns::RAW`], which `resolve_full_name` would give back unchanged but
+/// no kernel reads.
+pub fn split_full_name(full: &[u8]) -> Result<(u8, &[u8])> {
+    for (index, prefix) in NAMESPACE_PREFIXES {
+        let rest = match index {
+            ns::POSIX_ACL_ACCESS | ns::POSIX_ACL_DEFAULT => {
+                (full == prefix).then_some(&full[full.len()..])
+            }
+            _ => full.strip_prefix(prefix),
+        };
+        if let Some(rest) = rest {
+            return Ok((index, rest));
+        }
+    }
+    Err(Error::BadXattr("xattr name has no known namespace prefix"))
 }
 
 /// Resolve a full attribute name using the optional custom-prefix
