@@ -249,7 +249,11 @@ vars:
   # machine's disks, and suites can share one guest through FLTH_SHARED_ROOT
   # (harness #153). A macOS host now needs vagrant-notify-forwarder-christhomas
   # 0.7.7 or newer, which `chore vm:host:check` says (harness #164).
-  LINUX_HARNESS_REF: v0.6.1
+  # v0.6.2: an apt-get attempt after a stall moves to another Ubuntu mirror
+  # (harness #204). On v0.6.1 the x86_64 job's QEMU install stalled on all
+  # three attempts at one mirror and failed merge-queue runs 42809592787 and
+  # 42812830322.
+  LINUX_HARNESS_REF: v0.6.2
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
