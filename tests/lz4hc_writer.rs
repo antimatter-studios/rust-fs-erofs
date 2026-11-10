@@ -431,7 +431,7 @@ fn any_thread_count_builds_the_same_bytes() {
     }
 }
 
-fn clone_file(node: &Node) -> Node {
+fn clone_file(node: &Node<'static>) -> Node<'static> {
     match node {
         Node::File {
             mode,
