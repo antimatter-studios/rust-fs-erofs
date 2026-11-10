@@ -9,6 +9,9 @@ name: CI
 #                profile that traps an arithmetic overflow. That the job
 #                passes with test-disks/ holding only the committed ZSTD
 #                image is what proves the split.
+#   benchmark    the deterministic EROFS-shaped LZ4HC suite, compared with
+#                liblz4 and round-trip checked before timing. Runs on code
+#                changes and is included in ci-ok; its output is an artifact.
 #   fixtures     `chore fixtures`: the mkfs.erofs-made images, built in the
 #                fs-linux-test-harness VM under KVM on x86_64, and handed
 #                to the other jobs as an artifact (they are disk images,
@@ -241,6 +244,35 @@ jobs:
         with:
           name: tier-logs-unit
           path: tmp/logs/*.log
+          if-no-files-found: error
+
+  benchmark:
+    name: EROFS fixed-output LZ4HC performance
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Test stateless HC compatibility path
+        run: cargo test --locked --lib --no-default-features
+      - name: Run benchmark and correctness checks
+        env:
+          LZ4_FLEX_REV: 5de9839
+        run: |
+          set -o pipefail
+          cargo bench --locked --features bench-reuse,bench-liblz4 --bench erofs_lz4hc 2>&1 | tee lz4hc-benchmark.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: erofs-lz4hc-benchmark
+          path: lz4hc-benchmark.txt
           if-no-files-found: error
 
   fixtures:
@@ -627,7 +659,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, unit, fixtures, test, test-arm64, suite-in-vm, cli, cli-windows, semver]
+    needs: [changes, unit, benchmark, fixtures, test, test-arm64, suite-in-vm, cli, cli-windows, semver]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
