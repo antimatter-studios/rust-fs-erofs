@@ -1,0 +1,65 @@
+name: Diagnose VM host setup
+
+on:
+  push:
+    branches: [ci/diagnose-qemu-install]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/fs-linux-test-harness
+          ref: v0.6.1
+          path: harness
+      - name: Capture package installation diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics "$RUNNER_TEMP/apt-diagnostics"
+          # Keep the harness's existing timeout/retry policy. Expose download
+          # activity and the dpkg command in its normally quiet apt logs.
+          sudo tee /etc/apt/apt.conf.d/99-erofs-diagnostics >/dev/null <<'EOF'
+          Debug::Acquire::http "true";
+          Debug::pkgDPkgPM "true";
+          Dpkg::Use-Pty "0";
+          EOF
+          snapshot() {
+            date --iso-8601=seconds
+            ps -eo pid,ppid,stat,wchan:28,etime,args
+            sudo lslocks || true
+            for log in "$RUNNER_TEMP"/apt-diagnostics/*; do
+              [ -f "$log" ] || continue
+              echo "apt log: $log"
+              tail -n 120 "$log"
+            done
+            sudo tail -n 100 /var/log/dpkg.log /var/log/apt/term.log || true
+          }
+          (
+            while :; do
+              snapshot
+              sleep 30
+            done
+          ) > diagnostics/process-and-package-state.log 2>&1 &
+          observer=$!
+          finish() {
+            kill "$observer" 2>/dev/null || true
+            wait "$observer" 2>/dev/null || true
+            snapshot >> diagnostics/process-and-package-state.log 2>&1 || true
+          }
+          trap finish EXIT
+          export TMPDIR="$RUNNER_TEMP/apt-diagnostics"
+          bash -x harness/scripts/ci-setup-linux.sh 2>&1 | tee diagnostics/setup.log
+      - name: Preserve setup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-host-setup-diagnostics
+          path: diagnostics/
+          if-no-files-found: error
