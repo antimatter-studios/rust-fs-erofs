@@ -843,9 +843,13 @@ pub fn build_image_to<W: Write + Seek>(
 
     let meta_slots = plan_meta_layout(&bodies, bs);
     let nids: Vec<u64> = meta_slots.iter().map(MetaSlot::nid).collect();
+    // The furthest slot's end: an inode can fill room an earlier one
+    // left, so the last one planned need not be the last in the area.
     let meta_total_bytes = meta_slots
-        .last()
-        .map_or(0, MetaSlot::end)
+        .iter()
+        .map(MetaSlot::end)
+        .max()
+        .unwrap_or(0)
         .div_ceil(COMPACT_INODE_SIZE)
         * COMPACT_INODE_SIZE;
     let meta_blocks = meta_total_bytes.div_ceil(bs);
@@ -2339,6 +2343,14 @@ fn body_span(body: &InodeBody) -> u64 {
 ///    tolerate crossings, but it is simplest to enforce the same rule
 ///    for everything.)
 ///
+/// What a skip leaves at the end of a block is not lost: an inode that
+/// fits in one block goes in the block, of those left behind, with the
+/// least room that still holds it -- the lowest such block on a tie, so
+/// the same bodies always get the same NIDs -- and only when none holds
+/// it does it go at the end. Small files with inline tails would
+/// otherwise waste up to a block apiece; `mkfs.erofs` fills that room
+/// too. The root, planned first, is always at NID 0.
+///
 /// This function is the only place those rules exist. Both the NIDs
 /// written into directory entries and the addresses the inode bytes are
 /// written to are read out of the slots it returns, so there is no
@@ -2350,12 +2362,33 @@ fn body_span(body: &InodeBody) -> u64 {
 /// boundary.
 fn plan_meta_layout(bodies: &[InodeBody], bs: u64) -> Vec<MetaSlot> {
     let mut slots = Vec::with_capacity(bodies.len());
+    // Blocks left behind with room in them, as (room in bytes, block).
+    // Room is always at a block's end, and a multiple of a slot.
+    let mut room: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
     let mut cursor: u64 = 0;
     for body in bodies {
-        cursor = cursor.div_ceil(COMPACT_INODE_SIZE) * COMPACT_INODE_SIZE;
         let span = body_span(body);
+        if span <= bs {
+            if let Some(&(free, block)) = room.range((span, 0)..).next() {
+                room.remove(&(free, block));
+                let used = bs - free;
+                slots.push(MetaSlot {
+                    start: block * bs + used,
+                    span,
+                });
+                let used = (used + span).next_multiple_of(COMPACT_INODE_SIZE);
+                if used < bs {
+                    room.insert((bs - used, block));
+                }
+                continue;
+            }
+        }
+        cursor = cursor.div_ceil(COMPACT_INODE_SIZE) * COMPACT_INODE_SIZE;
         let trailers = span - body.body_size;
         if trailers > 0 && cursor % bs + span > bs {
+            if !cursor.is_multiple_of(bs) {
+                room.insert((bs - cursor % bs, cursor / bs));
+            }
             cursor = cursor.div_ceil(bs) * bs;
         }
         slots.push(MetaSlot {
@@ -4907,7 +4940,10 @@ mod tests {
 
     #[test]
     fn meta_layout_slots_never_overlap() {
-        let slots = plan_meta_layout(&meta_layout_fixture(), 4096);
+        // In address order: an inode can fill room an earlier one left,
+        // so plan order is not address order.
+        let mut slots = plan_meta_layout(&meta_layout_fixture(), 4096);
+        slots.sort_by_key(|slot| slot.start);
         for pair in slots.windows(2) {
             assert!(
                 pair[0].end() <= pair[1].start,
@@ -5338,5 +5374,26 @@ mod tests {
         for name in ["+plus", "-minus", ",comma", "a"] {
             assert!(fs.lookup_path(&format!("/{name}")).is_ok(), "{name}");
         }
+    }
+
+    /// Tails that cannot share a block with each other leave room that
+    /// later, smaller ones fit in: 100 bodies with 2100-byte tails take a
+    /// block each and leave 1964 bytes, and 100 with 1900-byte tails
+    /// belong in those gaps, not in 50 blocks of their own. The root,
+    /// planned first, stays at NID 0, the only NID a 16-bit `root_nid`
+    /// is sure to reach.
+    #[test]
+    fn meta_layout_fills_the_room_earlier_blocks_left() {
+        let bs = 4096u64;
+        let mut bodies = vec![meta_body(COMPACT_INODE_SIZE, 0)];
+        bodies.extend((0..100).map(|_| meta_body(COMPACT_INODE_SIZE, 2100)));
+        bodies.extend((0..100).map(|_| meta_body(COMPACT_INODE_SIZE, 1900)));
+        let slots = plan_meta_layout(&bodies, bs);
+        assert_eq!(slots[0].start, 0);
+        let blocks = slots.iter().map(MetaSlot::end).max().unwrap().div_ceil(bs);
+        assert!(
+            blocks <= 101,
+            "{blocks} metadata blocks for 200 tails two to a block"
+        );
     }
 }
