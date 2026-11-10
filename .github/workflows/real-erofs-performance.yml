@@ -1,0 +1,77 @@
+name: real EROFS performance
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "benches/**"
+      - "src/**"
+      - "scripts/bench-real-erofs-lz4hc.sh"
+      - "tests/fixtures/download-android-erofs.sh"
+      - "tests/scripts/android-tree-manifest.py"
+      - ".github/workflows/real-erofs-performance.yml"
+  schedule:
+    - cron: "45 3 * * *"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CHORE_VERSION: "0.11.0"
+
+jobs:
+  benchmark:
+    name: real Android partition build comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install EROFS oracle tools
+        run: sudo apt-get update && sudo apt-get install --yes erofs-utils jq
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-real-erofs-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Name the fixture the cache is keyed on
+        id: fixture
+        run: |
+          set -euo pipefail
+          sha="$(sed -n 's/^SHA256="\([0-9a-f]*\)"$/\1/p' tests/fixtures/download-android-erofs.sh)"
+          [ "${#sha}" = 64 ] || { echo "::error::no SHA256= pin found in download-android-erofs.sh"; exit 1; }
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+      - name: Cache the fixture
+        id: cache-fixture
+        uses: actions/cache@v4
+        with:
+          path: tests/fixtures/android-system_dlkm.img
+          key: android-system_dlkm-${{ steps.fixture.outputs.sha256 }}
+      - name: Fetch the fixture
+        if: steps.cache-fixture.outputs.cache-hit != 'true'
+        run: tests/fixtures/download-android-erofs.sh
+      - name: Verify cached fixture
+        run: echo "${{ steps.fixture.outputs.sha256 }}  tests/fixtures/android-system_dlkm.img" | sha256sum -c -
+      - name: Run repeated real-image benchmarks and correctness oracle
+        run: scripts/bench-real-erofs-lz4hc.sh
+      - name: Add the report to the workflow summary
+        if: always() && hashFiles('tmp/real-erofs-lz4hc/benchmark.txt') != ''
+        run: cat tmp/real-erofs-lz4hc/benchmark.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep benchmark report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-erofs-lz4hc-benchmark
+          path: tmp/real-erofs-lz4hc/
+          if-no-files-found: error

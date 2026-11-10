@@ -389,7 +389,6 @@ Issues + PRs welcome. Before opening:
 |---|---|---|
 | [`rust-fs-core`](https://crates.io/crates/rust-fs-core) | MIT | Block-device traits (`BlockRead`, `FileDevice`, slice adapters) |
 | [`rust-fs-erofs`](https://crates.io/crates/rust-fs-erofs) (this) | MIT | EROFS read + write |
-| [`rust-fs-ext4`](https://crates.io/crates/rust-fs-ext4) | MIT | ext4 read + write (sister project) |
 
 ## Acknowledgements
 

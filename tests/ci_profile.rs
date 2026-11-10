@@ -1326,10 +1326,10 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
             ChoreCmd::Shell { keys, command }
                 if !carries_any(keys, &NON_GATING_CMD_KEYS)
                     && command.trim()
-                        == "cargo clippy --locked --all-targets --features cli -- -D warnings"
+                        == "cargo clippy --locked --all-targets --features cli,bench-reuse,bench-liblz4 -- -D warnings"
         )),
-        "chores.yml `lint` must run `cargo clippy --locked --all-targets --features cli -- -D \
-         warnings`: without the feature the command-line tools are not linted at all"
+        "chores.yml `lint` must run clippy with `cli`, `bench-reuse` and `bench-liblz4`: the CLI \
+         target and both benchmark encoder paths must be linted"
     );
 }
 
