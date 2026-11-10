@@ -3256,11 +3256,11 @@ fn encode_dir_blocks(
     all.push((".".to_string(), parent_nid, ftype::DIR));
     all.push(("..".to_string(), parent_parent_nid, ftype::DIR));
 
-    // Sort the real children byte-wise by name. ".", ".." stay at
-    // indexes 0/1 by EROFS convention; they're not part of the sorted
-    // run. fsck.erofs enforces strict strcmp-ascending order on the
-    // remaining entries within a block.
-    let mut sorted_children: Vec<(String, u64, u8)> = children
+    // Every entry, "." and ".." among them, in byte-wise order:
+    // fsck.erofs enforces strict strcmp-ascending order within a block,
+    // and the kernel binary-searches it. "." and ".." are not special
+    // here -- a name such as "+x" or "-x" sorts before both.
+    let sorted_children: Vec<(String, u64, u8)> = children
         .iter()
         .map(|(name, child_idx)| {
             let child = &plan[*child_idx as usize];
@@ -3268,8 +3268,8 @@ fn encode_dir_blocks(
             (name.clone(), nids[*child_idx as usize], ft)
         })
         .collect();
-    sorted_children.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     all.extend(sorted_children);
+    all.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
     let mut out: Vec<Vec<u8>> = Vec::new();
     let mut last_used = 0usize;
@@ -4541,7 +4541,7 @@ mod tests {
         let root = fs.root_inode().unwrap();
         let entries = fs.read_dir(&root).unwrap();
 
-        // First two entries must be ".", ".." per EROFS convention.
+        // These names all sort after "." and "..", so those two come first.
         assert_eq!(entries[0].name, b".");
         assert_eq!(entries[1].name, b"..");
 
@@ -5301,6 +5301,42 @@ mod tests {
                     "{label}: no header at {header}"
                 );
             }
+        }
+    }
+
+    /// "." and ".." are names like any other: a name that sorts before
+    /// them byte-wise -- `+x`, `-x`, `,x` and the like, which an Android
+    /// tree has -- must come before them in the block, or the block is
+    /// out of the order the kernel's binary search and `fsck.erofs` need.
+    #[test]
+    fn names_sorting_before_dot_come_before_dot_in_the_block() {
+        let tree = dir(vec![
+            ("+plus", file(b"+")),
+            ("-minus", file(b"-")),
+            (",comma", file(b",")),
+            ("a", file(b"a")),
+        ]);
+        let fs = open(build_image(tree, 12).unwrap());
+        let root = fs.root_inode().unwrap();
+        let names: Vec<Vec<u8>> = fs
+            .read_dir(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names,
+            sorted,
+            "{:?}",
+            names
+                .iter()
+                .map(|n| String::from_utf8_lossy(n))
+                .collect::<Vec<_>>()
+        );
+        for name in ["+plus", "-minus", ",comma", "a"] {
+            assert!(fs.lookup_path(&format!("/{name}")).is_ok(), "{name}");
         }
     }
 }
