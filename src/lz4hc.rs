@@ -9,7 +9,7 @@
 /// An LZ4HC encoder at one compression level.
 pub(crate) struct Lz4Hc {
     level: u8,
-    #[cfg(feature = "lz4hc-workspace")]
+    #[cfg(all(feature = "lz4hc-workspace", not(feature = "bench-liblz4-backend")))]
     table: lz4_flex_hc::block::CompressHcDestSizeTable,
 }
 
@@ -17,7 +17,7 @@ impl Lz4Hc {
     pub(crate) fn new(level: u8) -> Self {
         Self {
             level,
-            #[cfg(feature = "lz4hc-workspace")]
+            #[cfg(all(feature = "lz4hc-workspace", not(feature = "bench-liblz4-backend")))]
             table: lz4_flex_hc::block::CompressHcDestSizeTable::new(),
         }
     }
@@ -26,7 +26,12 @@ impl Lz4Hc {
     /// decodes on its own. Returns the input bytes it took and the output
     /// bytes it wrote; `(0, 0)` when not even one byte fits.
     pub(crate) fn compress_dest_size(&mut self, src: &[u8], dst: &mut [u8]) -> (usize, usize) {
-        #[cfg(feature = "lz4hc-workspace")]
+        #[cfg(feature = "bench-liblz4-backend")]
+        {
+            lzzzz::lz4_hc::compress_fill(src, dst, i32::from(self.level))
+                .expect("liblz4 fixed-output compression")
+        }
+        #[cfg(all(feature = "lz4hc-workspace", not(feature = "bench-liblz4-backend")))]
         {
             lz4_flex_hc::block::compress_hc_dest_size_with_table(
                 src,
@@ -35,7 +40,10 @@ impl Lz4Hc {
                 &mut self.table,
             )
         }
-        #[cfg(not(feature = "lz4hc-workspace"))]
+        #[cfg(all(
+            not(feature = "lz4hc-workspace"),
+            not(feature = "bench-liblz4-backend")
+        ))]
         {
             lz4_flex_hc::block::compress_hc_dest_size(src, dst, self.level)
         }

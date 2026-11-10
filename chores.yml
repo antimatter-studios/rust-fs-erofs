@@ -806,7 +806,7 @@ tasks:
       - bash ../rust-fs-core/scripts/family-check.sh
       # `--features cli`: the command-line tools' target requires it, and
       # clippy silently leaves out a target whose features are off.
-      - cargo clippy --locked --all-targets --features cli -- -D warnings
+      - cargo clippy --locked --all-targets --features cli,bench-reuse,bench-liblz4 -- -D warnings
 
   build:
     desc: Debug build

@@ -3,7 +3,7 @@
 Run the deterministic workload locally with:
 
 ```sh
-cargo bench --features bench-reuse --bench erofs_lz4hc
+cargo bench --features bench-reuse,bench-liblz4 --bench erofs_lz4hc
 ```
 
 To run the same fixed-output path over a directory of real uncompressed
@@ -61,6 +61,7 @@ against it. Both retain complete output as a GitHub Actions artifact; timing
 comparisons stay informational because hosted runner load varies, while the
 round-trip checks gate the EROFS CI aggregate.
 
-The benchmark's encoder dependency is bench-only. `lz4_flex` is MIT; the C
-reference uses `lzzzz` 2.0.0 (MIT) and its bundled liblz4 (BSD-2-Clause). Neither
-is included in the published library's dependency graph.
+The C backend is an explicit feature and is absent from the default build.
+`lz4_flex` is MIT; the C reference uses `lzzzz` 2.0.0 (MIT) and its bundled
+liblz4 (BSD-2-Clause). The EROFS driver has no runtime-selected codec or
+dynamic C-library dependency.

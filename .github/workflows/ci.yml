@@ -267,7 +267,7 @@ jobs:
           LZ4_FLEX_REV: 5de9839
         run: |
           set -o pipefail
-          cargo bench --locked --features bench-reuse --bench erofs_lz4hc 2>&1 | tee lz4hc-benchmark.txt
+          cargo bench --locked --features bench-reuse,bench-liblz4 --bench erofs_lz4hc 2>&1 | tee lz4hc-benchmark.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

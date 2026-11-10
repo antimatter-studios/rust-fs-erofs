@@ -503,6 +503,7 @@ dependencies = [
  "saphyr",
  "sha2",
  "tempfile",
+ "xattr",
 ]
 
 [[package]]
