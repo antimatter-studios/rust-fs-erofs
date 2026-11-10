@@ -352,7 +352,7 @@ dependencies = [
 [[package]]
 name = "lz4_flex"
 version = "0.14.0"
-source = "git+https://github.com/antimatter-studios/lz4_flex?rev=5de9839#5de98392e1159dbd41e91ad2aac5953350655d88"
+source = "git+https://github.com/antimatter-studios/lz4_flex?rev=f570a44#f570a444ec22df5d0dfb9a1d125e42307fff8bba"
 
 [[package]]
 name = "lzma-rs"

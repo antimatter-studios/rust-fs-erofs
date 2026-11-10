@@ -54,6 +54,30 @@ same workflow that records performance. These deterministic proxies support
 regressions and fast iteration; use an `--input-dir` corpus before drawing
 conclusions about a specific Android partition.
 
+## Real Android image comparison
+
+Run `scripts/bench-real-erofs-lz4hc.sh` to rebuild the pinned
+`tests/fixtures/android-system_dlkm.img` tree with the Rust and liblz4
+backends. The fixture is the `system_dlkm` partition from Google's Android
+16 (API 36) `aosp_atd` arm64 emulator image. Its source URL, archive hash,
+partition offset and length, partition hash, and extraction procedure are
+pinned and documented in `tests/fixtures/download-android-erofs.sh`; the
+image itself is downloaded and is not redistributed in this repository.
+
+The script extracts the source with `fsck.erofs --preserve`, compiles both
+backends into separate target directories, and alternates five builds with
+the same tree and LZ4HC level 12 / 32 KiB pcluster settings. It runs
+`fsck.erofs` on every output and compares extracted manifests for paths,
+contents, file types, permissions, ownership, timestamps, hardlink counts,
+and xattrs. The benchmark report records the source hash, EROFS and codec
+revisions, runner and Rust toolchain, repeated build time and throughput,
+peak RSS, and image size.
+
+GitHub runs this in the separate `real EROFS performance` workflow on code
+pull requests, nightly, and by manual dispatch. Its summary and artifact keep
+the measurements available without making timing variation part of the
+required filesystem correctness gate.
+
 The required `EROFS fixed-output LZ4HC performance` job in the `CI` workflow
 runs for code changes and merge groups. The lz4_flex fork's `EROFS workload
 benchmark` workflow checks out its pull-request revision and runs this suite

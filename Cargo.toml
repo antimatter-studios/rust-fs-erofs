@@ -94,7 +94,7 @@ clap = { version = "4.5", optional = true, default-features = false, features = 
 # PSeitz/lz4_flex#244. Pure Rust. A git dependency until that lands or the
 # fork is published under its own name, and the alias lets it sit beside the
 # 0.11 this crate decodes with.
-lz4_flex_hc = { git = "https://github.com/antimatter-studios/lz4_flex", rev = "5de9839", package = "lz4_flex", default-features = false, features = ["std", "safe-decode"] }
+lz4_flex_hc = { git = "https://github.com/antimatter-studios/lz4_flex", rev = "f570a44", package = "lz4_flex", default-features = false, features = ["std", "safe-decode"] }
 # Native C comparison is available only to explicit benchmark builds.
 lzzzz = { version = "=2.0.0", optional = true }
 
