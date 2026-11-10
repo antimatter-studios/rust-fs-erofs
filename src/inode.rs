@@ -62,6 +62,9 @@ pub mod compact_offsets {
     pub const MODE: Range<usize> = 0x04..0x06;
     pub const NLINK: Range<usize> = 0x06..0x08;
     pub const SIZE: Range<usize> = 0x08..0x0C;
+    /// Seconds after the superblock's build time. Reserved, and so zero,
+    /// in images from writers older than the field.
+    pub const MTIME: Range<usize> = 0x0C..0x10;
     /// The format-dependent union: block address, raw device, or inline
     /// tail offset.
     pub const RAW_U: Range<usize> = 0x10..0x14;
@@ -261,7 +264,15 @@ impl Inode {
         // after parsing, and a compact one simply ignores the tail.
         let mut buf = [0u8; EXTENDED_INODE_SIZE as usize];
         dev.read_at(off, &mut buf)?;
-        Inode::parse(nid, &buf)
+        let mut inode = Inode::parse(nid, &buf)?;
+        if inode.format.version == InodeVersion::Compact {
+            // A compact inode's mtime is relative to the build time, which
+            // only the superblock knows.
+            let since = u32::from_le_bytes(buf[compact_offsets::MTIME].try_into().unwrap()) as u64;
+            inode.mtime = sb.build_time.saturating_add(since);
+            inode.mtime_nsec = sb.build_time_nsec;
+        }
+        Ok(inode)
     }
 
     pub fn is_dir(&self) -> bool {
