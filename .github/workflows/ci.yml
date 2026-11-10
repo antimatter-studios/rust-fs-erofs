@@ -264,7 +264,7 @@ jobs:
         run: cargo test --locked --lib --no-default-features
       - name: Run benchmark and correctness checks
         env:
-          LZ4_FLEX_REV: f570a44
+          LZ4_FLEX_REV: 5de9839
         run: |
           set -o pipefail
           cargo bench --locked --features bench-reuse,bench-liblz4 --bench erofs_lz4hc 2>&1 | tee lz4hc-benchmark.txt
