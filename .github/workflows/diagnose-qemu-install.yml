@@ -24,10 +24,10 @@ jobs:
           set -euo pipefail
           mkdir -p diagnostics "$RUNNER_TEMP/apt-diagnostics"
           # Keep the harness's existing timeout/retry policy. Expose download
-          # activity and the dpkg command in its normally quiet apt logs.
+          # activity in its normally quiet apt logs. Package configuration
+          # output is captured from /var/log/apt/term.log below.
           sudo tee /etc/apt/apt.conf.d/99-erofs-diagnostics >/dev/null <<'EOF'
           Debug::Acquire::http "true";
-          Debug::pkgDPkgPM "true";
           Dpkg::Use-Pty "0";
           EOF
           snapshot() {
