@@ -80,6 +80,31 @@ grep -qw erofs /proc/filesystems || {
     exit 1
 }
 
+# The fetch of <ref> from origin into <dir>, tried again when it fails.
+# git.kernel.org answers HTTP 502 now and then, and a single answer used to
+# fail the fixtures job and take a pull request out of the merge queue
+# (#289). Each attempt is bounded by `timeout`, a failed one is tried again
+# after a pause that grows by VM_SETUP_FETCH_DELAY seconds (15) each time, up
+# to VM_SETUP_FETCH_ATTEMPTS attempts (4). Every failure says which attempt
+# it was, and the last one names the URL and the attempts it made.
+# tests/scripts/vm-setup-fetch-retry.sh runs this function against a stub git.
+fetch_pinned() {
+    local dir="$1" ref="$2" attempts="${VM_SETUP_FETCH_ATTEMPTS:-4}"
+    local delay="${VM_SETUP_FETCH_DELAY:-15}" n=1 rc url
+    url="$(git -C "$dir" remote get-url origin)"
+    while :; do
+        rc=0
+        timeout 300 git -C "$dir" fetch --quiet --depth 1 origin "$ref" || rc=$?
+        [ "$rc" -ne 0 ] || return 0
+        echo "vm-setup: fetching $ref from $url failed (exit $rc), attempt $n of $attempts" >&2
+        [ "$n" -lt "$attempts" ] || break
+        sleep $((delay * n))
+        n=$((n + 1))
+    done
+    echo "vm-setup: gave up fetching $ref from $url after $attempts attempts" >&2
+    return 1
+}
+
 # erofs-utils, at the pinned tag. Idempotent by the stamp, which holds
 # the tag that was built: a changed pin rebuilds, an unchanged one costs
 # a `cat`. The harness re-runs this whole script whenever it changes (it
@@ -93,7 +118,7 @@ if [ "$(cat "$stamp" 2>/dev/null || true)" != "$EROFS_UTILS_PIN" ]; then
         git init --quiet "$EROFS_UTILS_SRC"
         git -C "$EROFS_UTILS_SRC" remote add origin "$EROFS_UTILS_REPO"
     fi
-    git -C "$EROFS_UTILS_SRC" fetch --quiet --depth 1 origin "$EROFS_UTILS_PIN"
+    fetch_pinned "$EROFS_UTILS_SRC" "$EROFS_UTILS_PIN"
     git -C "$EROFS_UTILS_SRC" checkout --quiet FETCH_HEAD
 
     # --enable-fuse=no: erofsfuse is a third way to read an image and we
