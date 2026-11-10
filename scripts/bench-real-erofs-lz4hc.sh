@@ -17,7 +17,7 @@ command -v jq >/dev/null || fail "jq is required to locate the compiled benchmar
 
 mkdir -p "$OUT"
 SOURCE="$OUT/source"
-if [ -e "$SOURCE" ]; then rm -rf "$SOURCE"; fi
+if [ -e "$SOURCE" ]; then sudo rm -rf "$SOURCE"; fi
 mkdir -p "$SOURCE"
 sudo fsck.erofs --extract="$SOURCE" --preserve "$FIXTURE"
 
@@ -32,6 +32,11 @@ LZZZZ_MANIFEST="$(jq -r '.packages[] | select(.name == "lzzzz" and .version == "
 [ -n "$LZZZZ_MANIFEST" ] && [ "$LZZZZ_MANIFEST" != "null" ] || fail "could not locate lzzzz 2.0.0"
 LIBLZ4_DIR="$(dirname "$LZZZZ_MANIFEST")/vendor/liblz4"
 LIBLZ4_VERSION="$(sed -n 's/^#define LZ4_VERSION_MAJOR[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$LIBLZ4_DIR/lz4.h").$(sed -n 's/^#define LZ4_VERSION_MINOR[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$LIBLZ4_DIR/lz4.h").$(sed -n 's/^#define LZ4_VERSION_RELEASE[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$LIBLZ4_DIR/lz4.h")"
+CPU_MODEL="$(LC_ALL=C lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
+if [ -z "$CPU_MODEL" ]; then
+    CPU_MODEL="$(awk -F: '/^model name[[:space:]]*:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
+fi
+[ -n "$CPU_MODEL" ] || CPU_MODEL="$(uname -m)"
 
 REPORT="$OUT/benchmark.txt"
 {
@@ -42,7 +47,7 @@ REPORT="$OUT/benchmark.txt"
     echo "lzzzz_version=2.0.0"
     echo "runner=$(uname -srm)"
     echo "rustc=$(rustc --version)"
-    echo "cpu_model=$(awk -F: '/^model name[[:space:]]*:/ {gsub(/^[[:space:]]+/, \"\", $2); print $2; exit}' /proc/cpuinfo)"
+    echo "cpu_model=$CPU_MODEL"
     echo "samples=$SAMPLES"
     echo "sample_order=alternating"
 } > "$REPORT"
@@ -66,7 +71,7 @@ run_sample() {
     local codec="$1" executable="$2" sample="$3"
     local image="$OUT/$codec-$sample.erofs" extracted="$OUT/$codec-$sample-extracted"
     local time_log="$OUT/$codec-$sample.time" output_log="$OUT/$codec-$sample.log"
-    rm -rf "$extracted"
+    sudo rm -rf "$extracted"
     {
         sudo env LZ4_FLEX_REV="$LZ4_FLEX_REV" EROFS_REV="$EROFS_REV" \
             /usr/bin/time -f 'peak_rss_kib=%M' -o "$time_log" \
@@ -78,7 +83,8 @@ run_sample() {
         diff -u "$SOURCE_MANIFEST" "$OUT/$codec-$sample.manifest"
         echo "oracle_pass,codec=$codec,sample=$sample,metadata_and_contents_match=true,image_bytes=$(stat -c %s "$image")"
     } | tee -a "$REPORT" > "$output_log"
-    rm -rf "$image" "$extracted" "$OUT/$codec-$sample.manifest"
+    sudo rm -rf "$image" "$extracted"
+    rm -f "$OUT/$codec-$sample.manifest"
 }
 
 for sample in $(seq 1 "$SAMPLES"); do
