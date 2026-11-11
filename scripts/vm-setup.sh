@@ -57,8 +57,16 @@ export DEBIAN_FRONTEND=noninteractive
 # README's compatibility claims are written about it, and
 # tests/support/src/oracle.rs refuses a guest built from another one so
 # the two cannot drift.
+#
+# Where it is fetched from, in order. git.kernel.org is upstream.
+# github.com/erofs/erofs-utils is the erofs project's own repository on
+# GitHub, and serves the same v1.9.1 (tag object 750113ac, commit d3fbccba).
+# It is there because an outage at git.kernel.org outlasted every retry at
+# that one host (#292). EROFS_UTILS_COMMIT is the commit the tag must name
+# at either source; a fetch that answers any other commit is not used.
 EROFS_UTILS_PIN=v1.9.1
-EROFS_UTILS_REPO=https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git
+EROFS_UTILS_COMMIT=d3fbccba6e409c100843563b416c47cd82c87ca0
+EROFS_UTILS_REPOS="https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git https://github.com/erofs/erofs-utils.git"
 EROFS_UTILS_SRC=/var/lib/fs-erofs-utils
 EROFS_UTILS_PREFIX=/usr/local
 
@@ -80,6 +88,44 @@ grep -qw erofs /proc/filesystems || {
     exit 1
 }
 
+# fetch_pinned <dir> <ref> <commit> <url>...: fetches <ref> into <dir>'s
+# FETCH_HEAD from the first <url> that answers it with <commit>.
+# git.kernel.org answers HTTP 502 now and then, and a single answer used to
+# fail the fixtures job and take a pull request out of the merge queue
+# (#289). So each attempt is bounded by `timeout`, and a failed one is tried
+# again after a pause that grows by VM_SETUP_FETCH_DELAY seconds (15) each
+# time, up to VM_SETUP_FETCH_ATTEMPTS attempts (4) at each source. A source
+# that fails them all, or answers with another commit, is left for the next
+# (#292). Every failure says which attempt at which source it was, and the
+# last one names every source it tried.
+# tests/scripts/vm-setup-fetch-retry.sh runs this function against a stub git.
+fetch_pinned() {
+    local dir="$1" ref="$2" commit="$3" attempts="${VM_SETUP_FETCH_ATTEMPTS:-4}"
+    local delay="${VM_SETUP_FETCH_DELAY:-15}" n rc url got tried=""
+    shift 3
+    for url in "$@"; do
+        git -C "$dir" remote set-url origin "$url"
+        n=1
+        while :; do
+            rc=0
+            timeout 300 git -C "$dir" fetch --quiet --depth 1 origin "$ref" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+                got="$(git -C "$dir" rev-parse 'FETCH_HEAD^{commit}')"
+                [ "$got" != "$commit" ] || return 0
+                echo "vm-setup: $ref from $url is commit $got, not the pinned $commit; it is not used" >&2
+                break
+            fi
+            echo "vm-setup: fetching $ref from $url failed (exit $rc), attempt $n of $attempts" >&2
+            [ "$n" -lt "$attempts" ] || break
+            sleep $((delay * n))
+            n=$((n + 1))
+        done
+        tried="${tried:+$tried, }$url"
+    done
+    echo "vm-setup: gave up fetching $ref at commit $commit after $attempts attempts at each of: $tried" >&2
+    return 1
+}
+
 # erofs-utils, at the pinned tag. Idempotent by the stamp, which holds
 # the tag that was built: a changed pin rebuilds, an unchanged one costs
 # a `cat`. The harness re-runs this whole script whenever it changes (it
@@ -91,9 +137,10 @@ if [ "$(cat "$stamp" 2>/dev/null || true)" != "$EROFS_UTILS_PIN" ]; then
     if [ ! -d "$EROFS_UTILS_SRC/.git" ]; then
         rm -rf "$EROFS_UTILS_SRC"
         git init --quiet "$EROFS_UTILS_SRC"
-        git -C "$EROFS_UTILS_SRC" remote add origin "$EROFS_UTILS_REPO"
+        git -C "$EROFS_UTILS_SRC" remote add origin "${EROFS_UTILS_REPOS%% *}"
     fi
-    git -C "$EROFS_UTILS_SRC" fetch --quiet --depth 1 origin "$EROFS_UTILS_PIN"
+    # shellcheck disable=SC2086  # one URL per word, none with spaces
+    fetch_pinned "$EROFS_UTILS_SRC" "$EROFS_UTILS_PIN" "$EROFS_UTILS_COMMIT" $EROFS_UTILS_REPOS
     git -C "$EROFS_UTILS_SRC" checkout --quiet FETCH_HEAD
 
     # --enable-fuse=no: erofsfuse is a third way to read an image and we
