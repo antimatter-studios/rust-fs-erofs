@@ -940,13 +940,11 @@ fn assert_unconditional(job: &Yaml, name: &str, workflow: &str) {
 }
 
 /// As `assert_unconditional`, but the job may carry the one condition
-/// the event/profile contract allows: `if: needs.changes.outputs.code ==
-/// 'true' && needs.changes.outputs.profile == 'full'`, needing `changes`.
-/// It is skipped, with the jobs after it, for a change to documentation
-/// alone or on the quick profile a pull request runs; the merge queue, a
-/// push, a tag and a manual run choose the full profile, so the leg still
-/// runs before anything lands. ci-ok accepts those skips only. Any other
-/// condition, and `continue-on-error`, is still refused.
+/// the contract allows: `if: needs.changes.outputs.code == 'true'`,
+/// needing `changes`. It is skipped, with the jobs after it, for a change
+/// to documentation alone, and ci-ok accepts that skip only. Every event
+/// runs every leg -- a pull request too -- so a condition on the event or a
+/// profile is refused, as are any other condition and `continue-on-error`.
 fn assert_unconditional_or_skipped_for_documentation(job: &Yaml, name: &str, workflow: &str) {
     let keys = keys_of(job);
     assert!(
@@ -956,9 +954,8 @@ fn assert_unconditional_or_skipped_for_documentation(job: &Yaml, name: &str, wor
     if let Some(condition) = field(job, "if") {
         assert_eq!(
             condition.as_str(),
-            Some("needs.changes.outputs.code == 'true' && needs.changes.outputs.profile == 'full'"),
-            "{workflow} jobs.{name} may be skipped only for a change to documentation alone \
-             or on the quick profile"
+            Some("needs.changes.outputs.code == 'true'"),
+            "{workflow} jobs.{name} may be skipped only for a change to documentation alone"
         );
         assert!(
             needs_of(job).iter().any(|n| n == "changes"),
@@ -1151,22 +1148,22 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
     // jobs.fixtures
     let fixtures = job(&document, "fixtures", &path);
     assert_unconditional_or_skipped_for_documentation(fixtures, "fixtures", "ci.yml");
-    // A leg skipped on the quick profile is only safe while the merge queue
-    // and a manual run exist to take the full one, and the profile comes from
-    // the script its truth table holds.
+    // Every leg runs on every one of these events, a pull request included:
+    // the merge queue is never the first run of the oracle, kernel and CLI
+    // legs. ci-ok's judgement comes from the script its truth table holds.
     let on = field(&document, "on").or_else(|| field(&document, "true"));
     for event in ["merge_group", "workflow_dispatch", "pull_request", "push"] {
         assert!(
             on.is_some_and(|on| field(on, event).is_some()),
-            "ci.yml must trigger on {event}, or the quick/full profile contract has a hole"
+            "ci.yml must trigger on {event}"
         );
     }
-    let changes = job(&document, "changes", &path);
+    let ci_ok = job(&document, "ci-ok", &path);
     assert!(
-        steps_of(changes, "changes")
+        steps_of(ci_ok, "ci-ok")
             .iter()
-            .any(|step| run_of(step).contains("bash scripts/ci-profile.sh profile")),
-        "jobs.changes must choose the profile with scripts/ci-profile.sh"
+            .any(|step| run_of(step).contains("bash scripts/ci-verdict.sh")),
+        "jobs.ci-ok must judge the run with scripts/ci-verdict.sh"
     );
     let runner = field(fixtures, "runs-on")
         .and_then(Yaml::as_str)
@@ -3629,7 +3626,7 @@ fn the_chore_download_retries_a_transient_server_error() {
 }
 
 /// The merge-group planner, executed rather than read: the real
-/// `Classify the change` and `Choose the profile` steps from ci.yml run over
+/// `Classify the change` step from ci.yml runs over
 /// disposable base/head commits, with rust-fs-core's real code-changed.sh.
 mod merge_group_planner_runs {
     use super::*;
@@ -3685,12 +3682,6 @@ mod merge_group_planner_runs {
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::create_dir_all(repo.join("docs")).unwrap();
         std::fs::create_dir_all(repo.join("scripts")).unwrap();
-        // The profile step invokes the repository's real script as CI does.
-        std::fs::copy(
-            manifest_dir().join("scripts/ci-profile.sh"),
-            repo.join("scripts/ci-profile.sh"),
-        )
-        .expect("provide the real profile script in the planner checkout");
         let core = manifest_dir().join("../rust-fs-core");
         assert!(
             core.join("scripts/code-changed.sh").is_file(),
@@ -3771,18 +3762,8 @@ mod merge_group_planner_runs {
             "the emitted changed-path set"
         );
         assert_eq!(output, "code=true\n");
-        let (ok, profile, _) = run_step(
-            &repo,
-            &step_run("Choose the profile"),
-            &[("EVENT", "merge_group")],
-        );
-        assert!(ok);
-        assert_eq!(
-            profile, "profile=full\n",
-            "the merge queue runs the full profile"
-        );
-        // code=true and profile=full is exactly the fixtures leg's condition,
-        // the one the structured guard holds jobs.fixtures to.
+        // code=true is exactly the fixtures leg's condition, the one the
+        // structured guard holds jobs.fixtures to.
         std::fs::remove_dir_all(&root).unwrap();
     }
 
