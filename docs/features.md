@@ -40,7 +40,7 @@ would hide a removal that was really a regression to fix.
 | Feature | State | Since | Tracking | Checked by |
 |---|---|---|---|---|
 | Superblock, with its CRC32C verified at open | Supported | 0.1.1; checksum 0.2.0 (#52) | | `superblock_checksum.rs`, `oracle_compat.rs` |
-| Compact (32-byte) and extended (64-byte) inodes | Supported | 0.1.1 | | `oracle_compat.rs`, `fixture_matrix.rs` |
+| Compact (32-byte) and extended (64-byte) inodes | Supported; a compact inode's mtime is the build time | 0.1.1; mtime 0.6.0 (#252) | | `oracle_compat.rs`, `fixture_matrix.rs`, `mkfs::tests::mtime_is_build_time_makes_every_inode_compact_with_that_mtime` |
 | Layouts: `FLAT_PLAIN`, `FLAT_INLINE`, chunk-based with sparse holes | Supported | 0.1.1 | | `oracle_compat.rs`, `fixture_matrix.rs` |
 | Compressed layout, legacy and compacted-2B indexes | Supported | 0.1.1 | | `oracle_compat.rs`, `fixture_matrix.rs` |
 | Compacted-1B index | Unobservable: no published producer | | | |
@@ -76,8 +76,8 @@ would hide a removal that was really a regression to fix.
 | Library builder (`mkfs::build_image_with`): `FLAT_PLAIN`, `FLAT_INLINE`, chunk-based; compact and extended inodes | Supported | 0.1.1 | | `oracle_writer.rs`, `round_trip.rs` |
 | Library builder compression: LZ4, LZMA, DEFLATE, legacy and compacted-2B indexes, ztailpacking, multi-lcluster pclusters | Supported | 0.1.1 | | `oracle_writer.rs`, `round_trip.rs` |
 | Library builder: inline xattrs, POSIX ACLs, the prefix dictionary, `COMPR_CFGS` | Supported | 0.1.1 | | `oracle_writer.rs` |
-| Library builder: symlinks, special files, hash-sorted directories, accurate `nlink` | Supported | 0.1.1 | | `oracle_writer.rs`, `round_trip.rs`, `kernel_readback.rs` |
-| Byte-deterministic output | Supported | 0.1.1 | | |
+| Library builder: symlinks, special files, hash-sorted directories, accurate `nlink` | Supported; "." and ".." sorted among the names since 0.6.0 (#258) | 0.1.1 | | `oracle_writer.rs`, `round_trip.rs`, `kernel_readback.rs` |
+| Byte-deterministic output | Supported | 0.1.1 | | `lz4hc_writer.rs` (`the_same_tree_compresses_to_the_same_bytes`, `any_thread_count_builds_the_same_bytes`) |
 | ZSTD compression on write | Not supported | | | |
 | More than one codec in one image (`HEAD2` on write) | Not supported | | | |
 | Multi-device images on write | Not supported: the reference `--blobdev` is broken in 1.9 | | | |
@@ -85,6 +85,17 @@ would hide a removal that was really a regression to fix.
 | `mkfs.erofs` tool: symlinks, special files and non-UTF-8 names | Partial: left out and named in the report's `skipped` list | 0.3.0 | | `cli.rs` |
 | `mkfs.erofs --label` | Refused (exit 3) until the builder takes a volume name | 0.3.0 | | `cli.rs` |
 | Changing an existing image | Not supported: read-only by format | | | |
+| Library builder: an LZ4HC image within 2% of `mkfs.erofs -zlz4hc,12 -C 32768`, inodes with inline tails packed into the room earlier metadata blocks left | Supported | 0.6.0 (#259) | | `oracle_size_parity.rs`, `inline_tails.rs` |
+| Library builder: file contents that borrow (`Content<'a>`, `Node<'a>`), not `'static` | Supported | 0.6.0 (#263) | | `streaming_writer.rs`, `oracle_writer.rs` |
+| Library builder: an xattr from its full name (`XattrSpec::from_full_name`), unknown prefixes refused | Supported | 0.6.0 (#263) | | `mkfs::tests::a_full_name_converts_back_to_the_index_and_name_it_resolved_from` |
+| Library builder: hard links (`Node::HardLink`), each inode's `nlink` counting its names | Supported | 0.6.0 (#253) | | `mkfs::tests::hard_links_name_one_inode_and_count_every_name`, `hardlink_oracle.rs` |
+| Library builder: inline tails (`FLAT_INLINE`) for directories, symlinks and uncompressed files of any size | Supported | 0.6.0 (#257) | | `inline_tails.rs`, `oracle_writer.rs` |
+| Library builder: LZ4HC compression into big pclusters (`BuildOptions::compression`, as `-zlz4hc,12 -C 32768`), stored blocks and stored files where compression saves nothing | Supported | 0.6.0 (#256) | | `lz4hc_writer.rs`, `streaming_memory.rs` |
+| Library builder: big pclusters in the compacted index | Not supported: big pclusters use the legacy index | | | |
+| Library builder: parallel compression (`BuildOptions::threads`), the same bytes on any number of threads | Supported | 0.6.0 (#262) | | `lz4hc_writer.rs`, `streaming_memory.rs` |
+| Library builder: superblock UUID and build time; every mtime the build time (`-T`), with compact inodes | Supported | 0.6.0 (#252) | | `mkfs::tests::the_superblock_carries_the_requested_uuid_and_build_time`, `oracle_writer.rs` |
+| Library builder: shared xattrs for values two or more inodes carry (`share_xattrs`) | Supported | 0.6.0 (#254) | | `mkfs::tests::repeated_xattrs_are_shared_and_every_inode_reads_its_own_set`, `oracle_writer.rs` |
+| Library builder streaming: content from readers (`Node::StreamedFile`), the image to a `Write + Seek` sink (`build_image_to`), memory bounded by metadata | Supported | 0.6.0 (#255) | | `streaming_writer.rs`, `streaming_memory.rs`, `oracle_writer.rs` |
 
 ## Interfaces
 
@@ -99,10 +110,10 @@ would hide a removal that was really a regression to fix.
 | Release tarballs: darwin-arm64, linux-x86_64 | Supported | 0.3.0 | | `release_attestation.rs` |
 | Release zips for Windows: windows-x86_64, windows-arm64, each dotted name a copy of `rust-fs-erofs.exe` | Supported | 0.4.1 (#185) | | `release_attestation.rs` |
 | The tools tested on Windows, from the release zip (`cli-windows` job) | Supported | 0.4.1 (#185) | | `tests/cli/test-*.sh` |
-| The tools published to winget | Upcoming | | #185 | |
+| The tools published to winget | Upcoming: the release job submits each version, but the package is not registered with winget yet | | #281 | |
 | `fs.erofs` `export PATH DEST` | Supported: bounded single-file transfer, SHA-256, stdout, replacement refusal and atomic publication; directories, symlinks and special files refused | 0.5.0 (#226) | #224 | `cli_export_kernel.rs`, `cli_docs.rs` |
 | `fs.erofs` recursive export | Supported: shared TreeSource traversal, per-item reports, depth bound, directory merging and existing-file refusal; symlinks require `--preserve=links` and special files are skipped | 0.5.0 (#237) | #232 | `cli_export_tree_kernel.rs` |
-| `fs.erofs` recursive export policy regression coverage | Pending: exact depth bounds, directory merging, replacement refusal, image offsets and unchanged single-file commands | | #240, #236 | Follow-up to recursive export metadata preservation |
+| `fs.erofs` recursive export policy regression coverage | Supported: exact depth bounds, directory merging, replacement refusal, image offsets and unchanged single-file commands, against the kernel | 0.5.0 (#242) | | `cli_export_tree_kernel.rs` |
 | `fs.erofs` `import SOURCE PATH [--replace]` | Refused: "EROFS is read-only" (exit 3), before opening the image or source file or reading stdin | 0.5.0 (#228) | #215 | `cli_import.rs`, `cli_docs.rs` |
 | `fs.erofs ls --recursive`: byte-sorted depth-first paths and depths, finite bounds, partial reports and directory-loop safety (`--features cli`) | Supported | 0.5.0 (#219) | #211 | `cli_ls_recursive_kernel.rs`, `tests/cli/test-ls-recursive.sh` |
 | `fs.erofs` `rm`, `rmdir`, `mv`, `ln` (including `-s`), `truncate`, `mkdir --parents`, `write --at` | Refused: "EROFS is read-only" (exit 3), before opening the image or reading stdin | 0.5.0 (#221) | #212 | `tests/cli/test-fs.sh`, `cli_docs.rs` |
@@ -110,3 +121,5 @@ would hide a removal that was really a regression to fix.
 | `fs.erofs stat`: one path's identity, type, owner, links, sizes, effective mtime, symlink target, device numbers and inode metadata; unrecorded times are null (`--features cli`) | Supported | 0.5.0 (#217) | | `cli_stat_kernel.rs`, `tests/cli/test-stat.sh` |
 | `fs.erofs` `xattr PATH [NAME]` | Supported: byte-sorted JSON/text names and sizes, raw values, `-o`, missing-attribute refusals and inline/shared/prefix-dictionary storage | 0.5.0 (#222) | #213 | `tests/cli/test-xattr.sh`, `cli_xattr_kernel.rs`, `cli_docs.rs` |
 | `fs.erofs` reading verbs (`ls`, `ls -R`, `stat`, `read`, `export`, `export --recursive`) on a missing path: exit 1 with `"kind": "not_found"` in the JSON error, as the CLI contract has it | Supported | 0.5.1 (#251) | #251 | `cli::erofs::fs::tests::a_missing_path_is_the_not_found_kind`, `tests/cli/test-fs.sh`, `test-stat.sh`, `test-ls-recursive.sh` |
+| `fs.erofs ls --recursive` shared arguments, help, defaults and bound-reached errors (`--features cli`) | Supported: rust-fs-core supplies the CLI contract; the byte-sorted depth-first walk stays in the driver | 0.6.0 (#273) | antimatter-studios/rust-fs-core#406 | `cli_listing.rs`, `cli_ls_recursive_kernel.rs`, `tests/cli/test-ls-recursive.sh` |
+| `chore staticlib` with cargo's target directory moved | Supported | 0.6.0 (#283) | | `test-staticlib-target-dir.sh` |

@@ -9,6 +9,150 @@ pull request; a release gathers them into a section here.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-11
+
+### Added
+
+- **`XattrSpec::from_full_name` builds an xattr from a full name such as
+  `security.selinux` or `user.foo` (#263),** taking the namespace index
+  from the same prefix table the reader resolves names with, and
+  `xattr::split_full_name` is that inverse of `resolve_full_name`. The
+  POSIX ACL names map to their indices with an empty name; a name with no
+  known prefix is refused with `BadXattr`, not kept whole under the raw
+  namespace.
+
+- **The builder writes hard links (#253).** `Node::HardLink { target }`
+  is another name for the node at `target`, a path from the root: the
+  directory entry names that node's inode, and its `nlink` counts every
+  name. A link to nothing, to a directory or to another link is refused
+  with `BadInode`. An inode with more names than a compact inode's 16-bit
+  count holds is written extended.
+
+- **The builder compresses regular files as `mkfs.erofs -zlz4hc,12 -C
+  32768` does (#256).** `BuildOptions::compression` takes a `Compression`
+  -- an LZ4HC level and the most compressed bytes one pcluster holds,
+  `Compression::LZ4HC_12_32K` for that command -- and every `Node::File`
+  and `Node::StreamedFile` is compressed as it is read. Each pcluster
+  takes as much of the file as LZ4HC fits in it, so pclusters are big
+  (`BIG_PCLUSTER`) and need not start on a block; a block that would
+  save nothing compressed is stored as it is, and a file where that is
+  true throughout is stored uncompressed, without being read twice. The
+  index is the legacy (full) format.
+- **LZ4HC comes from `am-lz4-flex` (#256, #269),** a fork of `lz4_flex`
+  published until upstream releases PSeitz/lz4_flex#244, which adds the HC
+  and fixed-output modes a pcluster needs, so the crate stays pure Rust.
+
+- **The builder compresses on every core (#262).** `BuildOptions::threads`
+  sets how many threads compress, 0 for one per core, the default. Each
+  file is compressed in 4 MiB segments that start fresh pclusters, read
+  once in order and written in order, so any thread count builds the same
+  bytes; a segment boundary costs under 0.1% of image size. Each thread adds
+  about 8 MiB of memory; with one thread nothing is spawned.
+
+- **The builder sets the superblock's UUID and build time (#252).**
+  `BuildOptions` takes `uuid`, `build_time` and `build_time_nsec`, and
+  `mtime_is_build_time` gives every inode the build time as its mtime, as
+  `mkfs.erofs -T` does, so the same tree builds to the same bytes.
+
+- **The builder shares repeated xattrs (#254).** With
+  `BuildOptions::share_xattrs`, an xattr two or more inodes carry -- the
+  same namespace, name and value -- is written once in the shared xattr
+  area, and each of those inodes holds a 4-byte reference to it, as
+  `mkfs.erofs` does. Off by default, so existing callers build the same
+  bytes.
+
+- **The builder streams (#255).** `mkfs::build_image_to` writes an image
+  into any `Write + Seek` sink, and `Node::StreamedFile` takes a file's
+  bytes from a `Content`: its size, known up front, and a reader opened
+  once when the writer reaches it. Each file's bytes are copied through
+  one 128 KiB buffer into the image as they are read, so a build holds
+  the tree's metadata in memory and never its file data: 192 MiB of
+  file content builds with a peak heap under 24 MiB. Content that ends
+  before its size, or goes on past it, fails the build.
+
+### Changed
+
+- **`Content` and `Node` take a lifetime, `Content<'a>` and `Node<'a>`
+  (#263),** for which a file's opener and reader may borrow -- files read
+  out of another open image, say. Both must be `Send`, so a `Node` stays
+  `Send`. `build_image`, `build_image_with` and
+  `build_image_to` take a `Node` of any lifetime. A function that names
+  `Node` in its return type now names its lifetime, `Node<'static>` for
+  a tree that owns everything; nothing else changes for a caller.
+
+- **`mkfs::Node` has a new variant, `HardLink` (#253).** A `match` over it
+  needs an arm for the new variant.
+
+- **The builder puts the tail of a directory, a symlink and an
+  uncompressed file inline, after its inode (#257),** whenever it fits in
+  the metadata block the inode sits in (`FLAT_INLINE`), as `mkfs.erofs`
+  does. A small directory or a symlink took a whole data block, and a
+  file larger than a block one more for its last few bytes; 200
+  directories each holding a symlink and a 5000-byte file now take under
+  300 blocks where they took over 800. A file the compressor stores
+  uncompressed has its tail inline too, without being read twice.
+
+- `fs.erofs ls --recursive` uses rust-fs-core's shared recursive-listing arguments, help, defaults and bound-reached errors. The defaults remain depth 64 and 100000 entries, and the EROFS walk and partial reports are unchanged.
+
+- **A legacy compression index records `delta[1]` (#256),** the lclusters
+  from each NONHEAD entry to the next head, where it wrote zero.
+
+- **An inode with an inline tail fills the room an earlier metadata block
+  was left with (#259).** An inode and its tail must share one block, and
+  the builder placed each one after the last, starting a new block when
+  it did not fit, so a tree of small files wasted up to a block apiece.
+  It now puts each one in the block with the least room that still holds
+  it, as `mkfs.erofs` does: on about 2600 small files its image went from
+  6% larger than `mkfs.erofs -zlz4hc,12 -C 32768`'s to within 1%.
+
+- **An inode whose mtime is the build time is written compact (#252).**
+  A compact inode has no mtime of its own and reads as the build time, so
+  only a different mtime needs the 64-byte extended inode.
+
+- **File data comes before the metadata area (#255).** The data area now
+  starts at the block after the superblock, and the metadata area and
+  the directories follow it; the superblock's `meta_blkaddr` says where.
+  Every reader goes through that field, so images read as they did, but
+  the builder's bytes differ from earlier releases for the same tree.
+  `build_image` and `build_image_with` are `build_image_to` writing into
+  a `Vec`, and the same tree still builds to the same bytes.
+- **`mkfs::Node` has a new variant, `StreamedFile` (#255).**
+
+- The builder uses the faster LZ4HC encode path and a level-12 search budget
+  scaled to cluster capacity, with benchmark checks guarding compressed output
+  size against liblz4.
+
+### Fixed
+
+- **A compression map header is read and written at the 8-byte boundary
+  after the inode's xattrs (#256),** where the kernel and erofs-utils
+  place it. When the xattrs ended 4 bytes past a boundary -- a compressed
+  file with a small inline xattr, such as an SELinux label -- the reader
+  read half a header from the padding and the builder wrote one there,
+  so such a file failed to decompress.
+
+- **A compact inode's mtime reads as the superblock's build time (#252),**
+  plus the seconds in its `i_mtime` field, as the kernel reads it. It read
+  as zero.
+
+- **The crate can be published again (#269).** Its LZ4HC encoder came from a
+  git dependency on a fork of lz4_flex, which crates.io refuses, so no
+  release could be made after #252. The encoder now comes from that fork
+  published as `am-lz4-flex` 0.14.0, pinned exactly, until upstream releases
+  PSeitz/lz4_flex#244. Its fixed-output blocks are byte-identical to the
+  fork commit used before, so the images built do not change.
+
+- **A directory block holds "." and ".." in byte order among its other
+  names (#258).** The builder put them first, so a directory holding a
+  name that sorts before "." -- `+x`, `-x`, `,x`, as Android trees have
+  -- was refused by `fsck.erofs` ("wrong dirent name order") and could not
+  be searched by the kernel.
+
+- **`chore staticlib` copies the archive from where cargo built it.** The task
+  read a fixed `target/` while cargo honoured `CARGO_TARGET_DIR` and
+  `build.target-dir`, so the copy failed after a good build, or shipped an old
+  archive left in `target/` without an error (#282).
+
 ## [0.5.1] — 2026-11-02
 
 ### Changed
@@ -494,6 +638,7 @@ pull request; a release gathers them into a section here.
 
 - Package renamed to `am-fs-erofs`; the lib name stays `fs_erofs`.
 
+[0.6.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/antimatter-studios/rust-fs-erofs/compare/v0.4.0...v0.4.1
