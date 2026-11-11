@@ -26,8 +26,12 @@ sudo python3 "$REPO/tests/scripts/android-tree-manifest.py" "$SOURCE" > "$SOURCE
 SOURCE_SHA256="$(sha256sum "$FIXTURE" | cut -d' ' -f1)"
 EROFS_REV="$(git -C "$REPO" rev-parse --short HEAD)"
 METADATA="$(cargo metadata --locked --format-version 1 --features bench-liblz4-backend)"
-LZ4_FLEX_REV="$(jq -r '.packages[] | select(.name == "lz4_flex" and .version == "0.14.0") | .source | split("#")[-1]' <<< "$METADATA")"
-[ -n "$LZ4_FLEX_REV" ] && [ "$LZ4_FLEX_REV" != "null" ] || fail "could not read the lz4_flex git revision from Cargo metadata"
+# The LZ4HC encoder is the am-lz4-flex package (#269): its version, and its
+# commit when it comes from git rather than crates.io.
+LZ4_FLEX_REV="$(jq -r '[.packages[] | select(.name == "am-lz4-flex")
+    | "am-lz4-flex@\(.version)" + (if (.source // "") | startswith("git+") then "#" + (.source | split("#")[-1]) else "" end)]
+    | if length == 1 then .[0] else empty end' <<< "$METADATA")"
+[ -n "$LZ4_FLEX_REV" ] || fail "could not find exactly one am-lz4-flex package in Cargo metadata"
 LZZZZ_MANIFEST="$(jq -r '.packages[] | select(.name == "lzzzz" and .version == "2.0.0") | .manifest_path' <<< "$METADATA")"
 [ -n "$LZZZZ_MANIFEST" ] && [ "$LZZZZ_MANIFEST" != "null" ] || fail "could not locate lzzzz 2.0.0"
 LIBLZ4_DIR="$(dirname "$LZZZZ_MANIFEST")/vendor/liblz4"
