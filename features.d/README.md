@@ -7,8 +7,8 @@ will change ("Keep the features page current" in AGENTS.md).
 
 A fragment is named for its branch -- `fix/run-end-bound` writes
 `fix-run-end-bound.md` -- and holds one or more `## Section` headings the
-page has, each over rows in that section's columns, `remove: KEY` lines or
-`rename: KEY` lines followed by the row that replaces it:
+page has, each over rows in that section's columns, or `rename: KEY`
+lines followed by the row that replaces it:
 
     ## Reading
 
@@ -17,6 +17,14 @@ page has, each over rows in that section's columns, `remove: KEY` lines or
 A row's first cell is its key: an existing key replaces that row in place,
 a new key is appended to the section. One fragment writes a row; to change
 a row another unreleased fragment writes, edit that fragment.
+
+**A row is never deleted**, so this repository never uses `remove: KEY`
+(`scripts/features-keep-rows.sh`, in `chore lint`, fails on one). A
+feature that goes away keeps its row in the **Removed** state:
+
+    ## Building an image
+
+    | Feature name | Removed: why; supported from 0.3.0 to 0.5.1 | Unreleased (#N) | #M | |
 
 - `../rust-fs-core/scripts/features-check.sh` (run in place, in `chore
   lint`) refuses a fragment that does not apply, and an `Unreleased` row

@@ -263,11 +263,20 @@ like its changelog fragment (`fix/run-end-bound` writes
 headings of the page, each over rows in that section's columns, with the
 PR number under **Since** (`Unreleased (#N)`). A row whose first cell, the
 Feature, matches an existing row replaces it in place; a new one is
-appended to the section. `remove: KEY` deletes a row and `rename: KEY`
-followed by a row replaces it under a new key, both by the exact Feature
-text. One fragment writes a row: to change a row another unreleased
-fragment writes, edit that fragment. Pull requests open at the same time
-then never conflict over neighbouring rows of one table.
+appended to the section. `rename: KEY` followed by a row replaces it
+under a new key, by the exact Feature text. One fragment writes a row: to
+change a row another unreleased fragment writes, edit that fragment. Pull
+requests open at the same time then never conflict over neighbouring rows
+of one table.
+
+**A row is never deleted.** A feature that goes away keeps its row, set to
+**Removed**, with the release it went away in under **Since**
+(`Unreleased (#N)`), why, and which releases had it -- the issue to bring
+it back under **Tracking** if it should come back. A deleted row reads
+exactly like a feature that never existed, and hides a removal that was a
+regression. So no fragment uses `remove: KEY`, though rust-fs-core's
+format has it: `chore lint` runs `scripts/features-keep-rows.sh`, which
+fails on one. A row that was wrong is corrected in place, or renamed.
 
 A release applies them: `../rust-fs-core/scripts/features-gather.sh
 VERSION` writes every fragment into the page, turns every `Unreleased`
