@@ -805,6 +805,9 @@ tasks:
       - bash ../rust-fs-core/scripts/agents-core-check.sh
       - bash ../rust-fs-core/scripts/changelog-check.sh
       - bash ../rust-fs-core/scripts/features-check.sh
+      # No fragment deletes a features-page row: a feature that goes away is
+      # marked Removed (AGENTS.md, "Keep the features page current").
+      - bash scripts/features-keep-rows.sh
       # The family scripts are rust-fs-core's alone: fails on a committed copy,
       # or a call to a local copy.
       - bash ../rust-fs-core/scripts/family-check.sh

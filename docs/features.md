@@ -26,6 +26,14 @@ States:
 - **Upcoming**: an open issue with a plan.
 - **Unobservable**: no tool makes an image that shows it, so it cannot be
   tested against anything.
+- **Removed**: worked in an earlier release and no longer does. **Since**
+  is the release it went away in, and the row says why and which releases
+  had it.
+
+**A row is never deleted.** A feature that goes away keeps its row, in the
+**Removed** state, so the page still answers why it is missing. A row that
+vanished would look exactly like a feature that was never there, and
+would hide a removal that was really a regression to fix.
 
 ## Reading
 
