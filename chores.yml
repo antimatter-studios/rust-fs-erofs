@@ -256,23 +256,27 @@ vars:
   FS_CORE_REF: v0.4.3
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
-  # cargo through so a run gives the VM and the machine-wide slot back
-  # however it ends; v0.2.0 answers it with "unknown command".
-  # v0.5.5 lets a host admit more than one VM (FLTH_SLOT_COUNT). v0.5.6 gives
+  # cargo through so a run ends its use of the VM however it ends; v0.2.0
+  # answers it with "unknown command".
+  # v0.5.5 lets a host admit more than one VM. v0.5.6 gives
   # back what a guest deletes and says what stopped a lost guest.
   # v0.5.8: a signal to a session stops everything its command started, within
   # five seconds, before test.sh removes the scratch directory (#277, harness
   # #117), and leaves the shares of a VM that stays up (harness #130).
   # v0.6.1: the VM-free suite runs no real `sync` on the host (harness #191), so
   # this repository's script guards over the stub engine stop flushing the
-  # machine's disks, and suites can share one guest through FLTH_SHARED_ROOT
+  # machine's disks, and suites can share one guest
   # (harness #153). A macOS host now needs vagrant-notify-forwarder-christhomas
   # 0.7.7 or newer, which `chore vm:host:check` says (harness #164).
   # v0.6.2: an apt-get attempt after a stall moves to another Ubuntu mirror
   # (harness #204). On v0.6.1 the x86_64 job's QEMU install stalled on all
   # three attempts at one mirror and failed merge-queue runs 42809592787 and
   # 42812830322.
-  LINUX_HARNESS_REF: v0.6.2
+  # v0.7.0: one shared guest per host and no machine-wide slot (harness #220,
+  # #222). A run ends its own session and leaves the guest up for the next;
+  # `vm:down` stops it when nobody is using it. A consumer's [vm] sizes are
+  # ignored: the host sets FLTH_SHARED_MEMORY/CPUS/DISK (#300).
+  LINUX_HARNESS_REF: v0.7.0
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
@@ -370,8 +374,9 @@ tasks:
   fixtures:
     desc: Build every test-disks/erofs-*.img fixture (mkfs.erofs-made, in the fs-linux-test-harness VM)
     # Up to date while the recipe is unchanged and every image exists;
-    # --force rebuilds. The VM comes down when the build ends, however
-    # it ends (build-fixtures.sh sources the harness's vm-session.sh).
+    # --force rebuilds. The build's use of the shared guest ends
+    # when the build ends, however it ends (build-fixtures.sh sources the
+    # harness's vm-session.sh).
     #
     # THIS LIST AND IMAGES IN build-fixtures.sh MUST AGREE, and both must
     # agree with SPECS in test-disks/guest-build-images.sh.
@@ -391,7 +396,7 @@ tasks:
       - test-disks/erofs-bigpcluster.img
       - test-disks/erofs-ztailpacking.img
       - test-disks/erofs-chunked.img
-    # A hung boot must not hold the VM and the machine-wide slot for ever.
+    # A hung boot must not hold the shared guest for ever.
     timeout: 60m
     on_timeout:
       - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
@@ -471,8 +476,8 @@ tasks:
     # process brings the VM up (idempotent, milliseconds when it is
     # already running) and every later call rides one shared SSH
     # connection. scripts/test.sh runs cargo inside a harness session
-    # (`vm.sh session`), so the VM comes down and the machine-wide slot is
-    # released when the tier ends, however it ends and however it was
+    # (`vm.sh session`), so the run's use of the shared guest ends when
+    # the tier ends, however it ends and however it was
     # started — one boot for the tier. The `after_all` reaper is the net
     # for a run that never reached scripts/test.sh.
     cmds:
@@ -555,7 +560,7 @@ tasks:
     # scripts/guest-suite.sh, through the harness's [test] guest_command.
     # The toolchain and the build directory live on the VM's own disk, so
     # the first run pays a full build and later runs are incremental.
-    # FLTH_KEEP_VM=1 keeps the VM up for the next one.
+    # The shared guest stays up for the next run; `chore vm:down` stops it.
     timeout: 120m
     on_timeout:
       - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
