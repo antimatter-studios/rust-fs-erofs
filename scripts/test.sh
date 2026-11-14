@@ -47,7 +47,7 @@ trap cleanup EXIT
 # A SIGNAL STOPS THE RUN. Until the command exists there is nothing to pass it
 # to, so it is only recorded, and the command is not started. Once it does, it
 # goes to the command's process alone: with a session that is the session,
-# which passes it on and then brings the VM down, and whose teardown a signal to
+# which passes it on and then ends its run on the guest, and whose teardown a signal to
 # its whole process group would kill. stop_run deals with the rest of the group.
 CHILD_PID=""
 STOP_SIGNAL=""
@@ -79,7 +79,7 @@ gone_within() {
 # this shell, and is lost.
 #
 # THE LIMIT ON THE COMMAND IS LONG BECAUSE IT COVERS A SESSION'S TEARDOWN: killing
-# a session halfway through that leaves the VM up and the machine-wide slot taken,
+# a session halfway through leaves its run attached to the shared guest,
 # so only a process that is stuck should ever reach it. The harness ends what a
 # session's command started within five seconds, and what is left in this group
 # gets the same: TERM whichever signal began this, because a job a shell script
@@ -132,18 +132,14 @@ if [[ "${1:-}" == "--print-temp-dir" ]]; then
     exit 0
 fi
 
-# THE RUN OWNS THE VM ITS TESTS BOOT. An oracle or kernel test brings the
-# harness VM up from inside its own process, and that boot takes the
-# machine-wide slot, ONE for every repository on the machine. Left to
-# chore's `after_all` reaper, which runs only inside a chore invocation of
-# this repository, a run that reached cargo any other way (this script by
-# hand, ../rust-fs-core/scripts/tier.sh) exited with the VM idle and the slot held, and
-# every other repository's VM work queued behind it until the guest's idle
-# deadline. `vm.sh session` runs cargo inside a harness session: the VM
-# comes down and the slot is released when the run ends, passed, failed or
-# killed, and a VM held with `chore vm:up` is left up. In the guest, and on
-# a host that cannot run the VM, it runs cargo as it is. Without the
-# harness sibling no test can boot a VM, so there is none to own.
+# THE RUN OWNS ITS USE OF THE GUEST. An oracle or kernel test brings the
+# harness's shared guest up from inside its own process, and every repository
+# on the machine uses that one guest. `vm.sh session` runs cargo inside a
+# harness session: the run's files, mounts and processes in the guest are
+# ended when the run ends, passed, failed or killed, and the guest stays up
+# for the next run (`chore vm:down` stops it when nobody is using it). In the
+# guest, and on a host that cannot run the VM, it runs cargo as it is.
+# Without the harness sibling no test can boot a VM, so there is none to own.
 session=()
 HARNESS_VM="$REPO/../fs-linux-test-harness/scripts/vm.sh"
 [[ -x "$HARNESS_VM" ]] && session=("$HARNESS_VM" session)
