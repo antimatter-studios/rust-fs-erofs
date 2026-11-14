@@ -294,8 +294,11 @@ jobs:
           key: ${{ steps.vm-host.outputs.box-cache-key }}
       - name: chore fixtures
         run: chore fixtures
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: chore vm:down (no run is still using the guest)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: chore vm:down && ! chore vm:status
       - uses: actions/upload-artifact@v4
         with:
           name: fixtures
@@ -369,8 +372,11 @@ jobs:
           name: tier-logs-x86_64
           path: tmp/logs/*.log
           if-no-files-found: error
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: chore vm:down (no run is still using the guest)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: chore vm:down && ! chore vm:status
 
   test-arm64:
     name: test (aarch64, no KVM on this runner)
@@ -456,8 +462,11 @@ jobs:
           name: tier-logs-suite-in-vm
           path: tmp/logs/*.log
           if-no-files-found: error
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: chore vm:down (no run is still using the guest)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: chore vm:down && ! chore vm:status
 
   cli:
     name: cli (the installed tools, on PATH)
