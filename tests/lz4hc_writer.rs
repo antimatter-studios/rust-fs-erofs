@@ -373,6 +373,76 @@ fn the_index_holds_what_the_kernel_requires_of_it() {
     }
 }
 
+/// How an image ends each file's index: for every name, the last
+/// lcluster's type, its offset in the block, and for a head its block;
+/// having held that the file's last pcluster starts in an earlier block.
+fn index_ends(img: Vec<u8>, names: &[String]) -> Vec<(String, u8, u16, u32)> {
+    use fs_erofs::zmap::Z_EROFS_LCLUSTER_TYPE_NONHEAD as NONHEAD;
+    let dev = common::MemDev::new(img.clone());
+    let dev = &dev as &dyn BlockRead;
+    let fs = open_image(img);
+    names
+        .iter()
+        .map(|name| {
+            let inode = fs.lookup_path(&format!("/{name}")).unwrap();
+            let zmap = ZMap::open(dev, fs.superblock(), &inode).unwrap();
+            let last = zmap.n_lclusters() - 1;
+            let holds_the_end = zmap.pcluster_extent(dev, inode.size - 1).unwrap();
+            assert!(
+                holds_the_end.head_lcluster_idx < last,
+                "{name}: its last pcluster starts in its last block, which ends the index itself"
+            );
+            let entry = zmap.read_lcluster(dev, last).unwrap();
+            let block = if entry.cluster_type == NONHEAD {
+                0
+            } else {
+                entry.u_raw
+            };
+            (name.clone(), entry.cluster_type, entry.clusterofs, block)
+        })
+        .collect()
+}
+
+/// A file whose last pcluster is compressed ends its index as
+/// `mkfs.erofs -zlz4hc,12 -C32768 -Elegacy-compress` ends it: one that
+/// ends inside a block with a PLAIN head there, at the end of the file,
+/// naming block 0; one that ends on a block boundary with none.
+///
+/// Without that head a Linux 5.10 kernel decompresses the last pcluster
+/// to the end of the block the file ends in, which is more than its data
+/// holds, and the read fails with EIO. The kernel in the harness guest is
+/// newer and reads either, so it is `mkfs.erofs` this is held to.
+#[test]
+fn a_file_ending_inside_a_compressed_block_ends_its_index_as_mkfs_erofs_does() {
+    use fs_erofs::zmap::{
+        Z_EROFS_LCLUSTER_TYPE_NONHEAD as NONHEAD, Z_EROFS_LCLUSTER_TYPE_PLAIN as PLAIN,
+    };
+    let sizes = [5000usize, 8192, 12_000, 75_811, 100_000, 1_713_440];
+    let names: Vec<String> = sizes.iter().map(|s| format!("s{s}")).collect();
+    let tree = || {
+        dir(names
+            .iter()
+            .zip(sizes)
+            .map(|(n, s)| (n.as_str(), file(&text(s, s as u64))))
+            .collect())
+    };
+    let theirs = common::build_with_mkfs_erofs(
+        &["-b4096", "-zlz4hc,12", "-C32768", "-Elegacy-compress"],
+        &tree(),
+    );
+    let theirs = index_ends(theirs.bytes, &names);
+    // What `mkfs.erofs` writes, so that a change in it is seen as one.
+    for ((name, kind, clusterofs, block), size) in theirs.iter().zip(sizes) {
+        let want = match (size % 4096) as u16 {
+            0 => (NONHEAD, 0, 0),
+            tail => (PLAIN, tail, 0),
+        };
+        assert_eq!((*kind, *clusterofs, *block), want, "mkfs.erofs: {name}");
+    }
+    let ours = mkfs::build_image_with(tree(), 12, options()).unwrap();
+    assert_eq!(index_ends(ours, &names), theirs);
+}
+
 /// A file is compressed in 4 MiB segments, each starting a fresh pcluster
 /// at a block boundary, so they can be compressed on any thread and the
 /// image does not depend on how many there were: the lcluster at every
