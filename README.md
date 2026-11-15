@@ -182,6 +182,23 @@ let bytes = mkfs::build_image_to(tree, 12, options, &mut sink)?;  // 12: 4 KiB b
 memory, and `build_image` / `build_image_with` are `build_image_to` writing
 into a `Vec`.
 
+A file that comes from another image, unchanged, need not be compressed
+again. `Transplant::of` describes the LZ4 pclusters an open image stores it
+in, and `Node::TransplantedFile` writes them as they are, under an index of
+the new image's own; where it answers `None` -- another codec, ztailpacking,
+fragments, a deduplicated extent -- the file is read and written as any
+other:
+
+```rust
+use fs_erofs::mkfs::Transplant;
+
+let inode = source.lookup_path("/bin/toybox")?;
+let node = match Transplant::of(&source, &inode)? {
+    Some(data) => Node::TransplantedFile { mode: inode.mode, data, meta, xattrs },
+    None => Node::StreamedFile { mode: inode.mode, content, meta, xattrs },
+};
+```
+
 ## Command-line tools
 
 One binary, `rust-fs-erofs`, dispatching on the name it is started under, the way busybox does. Each tool is a symlink to it, and `rust-fs-erofs <verb> ...` reaches the same tool under the one name nothing else on `PATH` can shadow.

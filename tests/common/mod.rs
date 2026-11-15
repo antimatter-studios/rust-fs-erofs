@@ -141,7 +141,8 @@ pub fn materialize_tree(root: &Path, node: &mkfs::Node) {
         | mkfs::Node::ChunkedFile { .. }
         | mkfs::Node::CompressedFile(_)
         | mkfs::Node::HardLink { .. }
-        | mkfs::Node::StreamedFile { .. } => {
+        | mkfs::Node::StreamedFile { .. }
+        | mkfs::Node::TransplantedFile { .. } => {
             panic!("materialize_tree: non-regular Node kinds aren't supported in oracle staging");
         }
     }
@@ -173,7 +174,8 @@ fn materialize_node(path: &Path, node: &mkfs::Node) {
         | mkfs::Node::ChunkedFile { .. }
         | mkfs::Node::CompressedFile(_)
         | mkfs::Node::HardLink { .. }
-        | mkfs::Node::StreamedFile { .. } => {
+        | mkfs::Node::StreamedFile { .. }
+        | mkfs::Node::TransplantedFile { .. } => {
             panic!("materialize_node: non-regular Node kinds aren't supported in oracle staging");
         }
     }
