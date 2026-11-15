@@ -133,7 +133,8 @@ fn collect_files(node: &mkfs::Node, prefix: String, out: &mut Vec<(String, Vec<u
         | mkfs::Node::ChunkedFile { .. }
         | mkfs::Node::CompressedFile(_)
         | mkfs::Node::HardLink { .. }
-        | mkfs::Node::StreamedFile { .. } => {}
+        | mkfs::Node::StreamedFile { .. }
+        | mkfs::Node::TransplantedFile { .. } => {}
     }
 }
 

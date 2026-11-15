@@ -358,10 +358,16 @@ impl Filesystem {
         }
     }
 
+    /// The primary device as metadata is read from it: through the
+    /// metadata cache, when there is one.
+    pub(crate) fn metadata_device(&self) -> &dyn BlockRead {
+        &*self.primary
+    }
+
     /// [`Self::read_block`] for file contents: `device_id == 0` reads the
     /// primary device below the metadata cache rather than through it
     /// (#69).
-    fn read_data(&self, device_id: u16, offset: u64, buf: &mut [u8]) -> Result<()> {
+    pub(crate) fn read_data(&self, device_id: u16, offset: u64, buf: &mut [u8]) -> Result<()> {
         let dev = self.data_device_for(device_id)?;
         dev.read_at(offset, buf)?;
         Ok(())
