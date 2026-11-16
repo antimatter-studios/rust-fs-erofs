@@ -42,6 +42,7 @@ pub mod superblock;
 /// One in-memory device for every test in this crate.
 #[cfg(test)]
 pub(crate) mod test_device;
+pub mod transplant;
 pub mod xattr;
 pub mod zmap;
 
