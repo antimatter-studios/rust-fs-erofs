@@ -276,7 +276,9 @@ vars:
   # #222). A run ends its own session and leaves the guest up for the next;
   # `vm:down` stops it when nobody is using it. A consumer's [vm] sizes are
   # ignored: the host sets FLTH_SHARED_MEMORY/CPUS/DISK (#300).
-  LINUX_HARNESS_REF: v0.7.0
+  # v0.7.1: automatic guest updates are disabled on every boot, builds use
+  # one job by default, and transient destroy locks are retried safely.
+  LINUX_HARNESS_REF: v0.7.1
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
