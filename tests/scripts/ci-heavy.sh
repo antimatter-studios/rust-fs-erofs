@@ -78,7 +78,7 @@ for job in benchmark fixtures cli-windows; do
 done
 for job in test test-arm64 suite-in-vm; do
   awk -v j="  $job:" '$0 == j {f=1; next} f && /^  [a-z]/ {f=0} f' "$wf" |
-    grep -q '^    needs: fixtures' && ok || bad "$job needs fixtures, so it is skipped with it"
+    grep -q '^    needs: \[fixtures' && ok || bad "$job needs fixtures, so it is skipped with it"
 done
 
 [ "$fail" -eq 0 ] || { printf 'ci-heavy: %d passed, %d failed\n' "$pass" "$fail"; exit 1; }

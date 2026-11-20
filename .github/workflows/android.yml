@@ -28,12 +28,28 @@ env:
   CHORE_VERSION: "0.11.0"
 
 jobs:
+  android-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   android:
     name: a real Android EROFS image, read against the kernel and fsck.erofs
-    runs-on: ubuntu-24.04
+    needs: android-gate
+    runs-on: ${{ needs.android-gate.outputs.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings

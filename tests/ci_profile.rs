@@ -903,6 +903,21 @@ fn run_of<'a>(step: &'a Yaml) -> &'a str {
     field(step, "run").and_then(Yaml::as_str).unwrap_or("")
 }
 
+/// The class a job's `<job>-gate` asks the runner gate for (`runner-gate
+/// pick <class>`), or "" when the job has no gate or the gate picks nothing.
+/// A gated job's `runs-on:` is the gate's output, so the class is what says
+/// which kind of runner it gets.
+fn picked_class(document: &Yaml, name: &str, path: &Path) -> String {
+    let gate = job(document, &format!("{name}-gate"), path);
+    steps_of(gate, name)
+        .iter()
+        .filter_map(|step| run_of(step).strip_prefix("runner-gate pick "))
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 /// A job's `needs:`, which GitHub accepts as one name or a list of them.
 fn needs_of(job: &Yaml) -> Vec<String> {
     match field(job, "needs") {
@@ -1063,11 +1078,11 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
     // the kernel tests can run at all.
     let test = job(&document, "test", &path);
     assert_unconditional(test, "test", "ci.yml");
-    let runner = field(test, "runs-on").and_then(Yaml::as_str).unwrap_or("");
-    assert!(
-        runner.starts_with("ubuntu-") && !runner.contains("arm"),
-        "jobs.test must run on an x86_64 ubuntu runner: the oracle tools and the kernel \
-         oracles run in a VM, and only those runners have KVM; got {runner:?}"
+    let runner = picked_class(&document, "test", &path);
+    assert_eq!(
+        runner, "linux-x64-kvm",
+        "jobs.test must run on an x86_64 Linux runner with KVM, through test-gate: the \
+         oracle tools and the kernel oracles run in a VM"
     );
     assert!(
         needs_of(test).iter().any(|n| n == "fixtures"),
@@ -1116,9 +1131,9 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
     let arm = job(&document, "test-arm64", &path);
     assert_unconditional(arm, "test-arm64", "ci.yml");
     assert_eq!(
-        field(arm, "runs-on").and_then(Yaml::as_str),
-        Some("ubuntu-24.04-arm"),
-        "jobs.test-arm64 must run on GitHub's arm64 runner"
+        picked_class(&document, "test-arm64", &path),
+        "linux-arm64",
+        "jobs.test-arm64 must run on an arm64 Linux runner, through test-arm64-gate"
     );
     let arm_steps = steps_of(arm, "test-arm64");
     for task in ["lint", "test:unit", "test:images"] {
@@ -1172,13 +1187,10 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
             .any(|step| run_of(step).contains("bash scripts/ci-verdict.sh")),
         "jobs.ci-ok must judge the run with scripts/ci-verdict.sh"
     );
-    let runner = field(fixtures, "runs-on")
-        .and_then(Yaml::as_str)
-        .unwrap_or("");
-    assert!(
-        runner.starts_with("ubuntu-") && !runner.contains("arm"),
-        "jobs.fixtures must run on an x86_64 ubuntu runner, where KVM is available; got \
-         {runner:?}"
+    assert_eq!(
+        picked_class(&document, "fixtures", &path),
+        "linux-x64-kvm",
+        "jobs.fixtures must run on an x86_64 Linux runner with KVM, through fixtures-gate"
     );
     let steps = steps_of(fixtures, "fixtures");
     let setup = steps

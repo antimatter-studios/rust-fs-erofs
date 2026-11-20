@@ -340,7 +340,7 @@ fn the_release_submits_each_later_version_to_winget() {
         .nth(1)
         .expect("release.yml has no winget job");
     assert!(
-        job.contains("needs: [cli]"),
+        job.contains("needs: [cli, winget-gate]"),
         "the job does not wait for the zips"
     );
     for wanted in [

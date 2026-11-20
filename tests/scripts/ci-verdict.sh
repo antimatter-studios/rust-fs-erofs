@@ -16,7 +16,7 @@ bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
 command -v jq >/dev/null || { echo "ci-verdict: jq is required (apt-get install jq)"; exit 1; }
 
 # needs JSON: every job with one result, then the named jobs overridden.
-JOBS="changes below unit benchmark fixtures test test-arm64 suite-in-vm cli cli-windows semver"
+JOBS="changes-gate changes below-gate below unit-gate unit benchmark-gate benchmark fixtures-gate fixtures test-gate test test-arm64-gate test-arm64 suite-in-vm-gate suite-in-vm cli-gate cli cli-windows-gate cli-windows semver-gate semver"
 needs() {
   local over="$1" res="$2" out="{" sep="" j r
   for j in $JOBS; do

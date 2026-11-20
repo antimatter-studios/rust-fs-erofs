@@ -112,7 +112,7 @@ env:
   # documentation alone, and the heavy jobs below on a lower layer of a
   # stack -- and ci-ok still needs every job and rejects failures,
   # cancellations and any other skip (scripts/ci-verdict.sh).
-  CI_GATE_NON_GATING: "fixtures benchmark cli-windows"
+  CI_GATE_NON_GATING: "fixtures benchmark cli-windows benchmark-gate fixtures-gate cli-windows-gate ci-ok-gate"
   # FULL SUITE ON THE TOP OF A STACK, FAST CHECKS BELOW (owner-approved
   # trial, 2026-11-20). The jobs that run only when the changes job says
   # `heavy` (scripts/ci-heavy.sh): the merge queue, a push to main, a manual
@@ -120,9 +120,18 @@ env:
   # test-arm64 and suite-in-vm carry no condition of their own: they need
   # fixtures and are skipped with it. ci-ok accepts the skip of these jobs,
   # and no others, when heavy is false.
-  HEAVY_JOBS: "benchmark fixtures test test-arm64 suite-in-vm cli-windows"
+  HEAVY_JOBS: "benchmark fixtures test test-arm64 suite-in-vm cli-windows benchmark-gate fixtures-gate test-gate test-arm64-gate suite-in-vm-gate cli-windows-gate"
 
 jobs:
+  changes-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   # Does this change need the full pipeline? rust-fs-core's
   # scripts/code-changed.sh reads the change's paths and says false only when
   # every one is documentation. The change is the pull request's diff, the
@@ -133,7 +142,8 @@ jobs:
   # ci-ok accepts their skip when, and only when, it is false.
   changes:
     name: changes (does this need the full pipeline?)
-    runs-on: ubuntu-24.04
+    needs: changes-gate
+    runs-on: ${{ needs.changes-gate.outputs.runner }}
     # Reading which pull requests are stacked on this one, and its labels.
     permissions:
       contents: read
@@ -196,15 +206,31 @@ jobs:
           set -euo pipefail
           bash scripts/ci-heavy.sh >> "$GITHUB_OUTPUT"
 
+  unit-gate:
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   unit:
     name: unit (no tools, no VM)
     # Needs changes only so that re-running changes re-runs it too: that is
     # how scripts/ci-cancel-below.sh brings a layer's fast checks back after
     # cancelling its full run. It runs whatever changes says.
-    needs: changes
-    runs-on: ubuntu-24.04
+    needs: [changes, unit-gate]
+    runs-on: ${{ needs.unit-gate.outputs.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
       - name: Install chore
         # Pinned (CHORE_VERSION) and checked against the release's
         # checksums: the siblings, the tools and the tests all come
@@ -277,14 +303,31 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
-  benchmark:
-    name: EROFS fixed-output LZ4HC performance
+  benchmark-gate:
     needs: changes
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
+  benchmark:
+    name: EROFS fixed-output LZ4HC performance
+    needs: [changes, benchmark-gate]
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.heavy == 'true'
+    runs-on: ${{ needs.benchmark-gate.outputs.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -304,14 +347,31 @@ jobs:
           path: lz4hc-benchmark.txt
           if-no-files-found: error
 
-  fixtures:
-    name: fixtures (harness VM, x86_64 KVM)
+  fixtures-gate:
     needs: changes
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
+  fixtures:
+    name: fixtures (harness VM, x86_64 KVM)
+    needs: [changes, fixtures-gate]
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.heavy == 'true'
+    runs-on: ${{ needs.fixtures-gate.outputs.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -338,13 +398,29 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  test-gate:
+    needs: fixtures
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
   test:
     name: test (x86_64, oracles in the VM)
-    needs: fixtures
-    runs-on: ubuntu-24.04
+    needs: [fixtures, test-gate]
+    runs-on: ${{ needs.test-gate.outputs.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -410,13 +486,29 @@ jobs:
         # afterwards means a run leaked its session.
         run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
 
+  test-arm64-gate:
+    needs: fixtures
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-arm64
+
   test-arm64:
     name: test (aarch64, no KVM on this runner)
-    needs: fixtures
-    runs-on: ubuntu-24.04-arm
+    needs: [fixtures, test-arm64-gate]
+    runs-on: ${{ needs.test-arm64-gate.outputs.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -458,13 +550,29 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  suite-in-vm-gate:
+    needs: fixtures
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
   suite-in-vm:
     name: suite in the guest (the macOS path)
-    needs: fixtures
-    runs-on: ubuntu-24.04
+    needs: [fixtures, suite-in-vm-gate]
+    runs-on: ${{ needs.suite-in-vm-gate.outputs.runner }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -500,13 +608,29 @@ jobs:
         # afterwards means a run leaked its session.
         run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
 
+  cli-gate:
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   cli:
     name: cli (the installed tools, on PATH)
-    needs: changes
-    runs-on: ubuntu-24.04
+    needs: [changes, cli-gate]
+    runs-on: ${{ needs.cli-gate.outputs.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -551,6 +675,20 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  cli-windows-gate:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      windows-x86_64: ${{ steps.pick-x64.outputs.runner }}
+      windows-arm64: ${{ steps.pick-arm64.outputs.runner }}
+    steps:
+      - id: pick-x64
+        run: runner-gate pick windows-x64
+      - id: pick-arm64
+        run: runner-gate pick windows-arm64
+
   # The tools as a Windows user gets them (#185): built natively for
   # x86_64-pc-windows-msvc on windows-latest and for aarch64-pc-windows-msvc
   # on windows-11-arm, each packaged by rust-fs-core's package-cli into the
@@ -569,9 +707,9 @@ jobs:
   # meets the symlink it is meant to leave out.
   cli-windows:
     name: cli (Windows ${{ matrix.label }}, the release zip's tools on PATH)
-    needs: changes
+    needs: [changes, cli-windows-gate]
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ needs.cli-windows-gate.outputs[matrix.label] }}
     strategy:
       fail-fast: false
       matrix:
@@ -649,6 +787,16 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  semver-gate:
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   # ONE CHECK GATES A MERGE, AND IT STANDS FOR EVERY JOB (#123).
   #
   # Branch protection names checks, and a check is a job name. Naming
@@ -668,8 +816,8 @@ jobs:
     name: semver (public API against crates.io)
     # Needs changes so that re-running changes re-runs it
     # (scripts/ci-cancel-below.sh).
-    needs: changes
-    runs-on: ubuntu-latest
+    needs: [changes, semver-gate]
+    runs-on: ${{ needs.semver-gate.outputs.runner }}
     timeout-minutes: 30
     env:
       # The version ../rust-fs-core/scripts/semver-check.sh expects. A prebuilt binary,
@@ -680,6 +828,12 @@ jobs:
       OUTPUT_BUDGET_FAIL_TAIL: "200"
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -696,6 +850,16 @@ jobs:
         shell: bash
         run: chore check:semver
 
+  below-gate:
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   # A NEW TOP STOPS THE FULL RUN BELOW IT (owner-approved trial,
   # 2026-11-20). A pull request that is the top of its stack and is based on
   # another pull request's branch cancels that pull request's queued or
@@ -704,8 +868,8 @@ jobs:
   # it never fails.
   below:
     name: stack (stop the full run of the layer below)
-    needs: changes
-    runs-on: ubuntu-latest
+    needs: [changes, below-gate]
+    runs-on: ${{ needs.below-gate.outputs.runner }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -728,11 +892,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/ci-cancel-below.sh
 
+  ci-ok-gate:
+    needs: [changes-gate, changes, below-gate, below, unit-gate, unit, benchmark-gate, benchmark, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, cli-gate, cli, cli-windows-gate, cli-windows, semver-gate, semver]
+    if: always()
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, below, unit, benchmark, fixtures, test, test-arm64, suite-in-vm, cli, cli-windows, semver]
-    runs-on: ubuntu-latest
+    needs: [changes-gate, changes, below-gate, below, unit-gate, unit, benchmark-gate, benchmark, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, cli-gate, cli, cli-windows-gate, cli-windows, semver-gate, semver, ci-ok-gate]
+    runs-on: ${{ needs.ci-ok-gate.outputs.runner || 'ubuntu-latest' }}
     # Asking ci-heavy.sh again, below.
     permissions:
       contents: read
