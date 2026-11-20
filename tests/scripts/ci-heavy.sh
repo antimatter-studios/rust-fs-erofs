@@ -32,30 +32,32 @@ esac
 GH
 chmod +x "$stub/gh"
 
-heavy() { # want event [labels] [above] [fail]
-  local want="$1" event="$2" got
+heavy() { # want-heavy want-top event [labels] [above] [fail]
+  local want="heavy=$1
+top=$2" event="$3" got
   got="$(PATH="$stub:$PATH" EVENT="$event" HEAD_REF=feat/layer PR_NUMBER=7 REPO=o/r \
-    STUB_LABELS="${3:-}" STUB_ABOVE="${4:-0}" STUB_FAIL="${5:-}" bash scripts/ci-heavy.sh 2>/dev/null)"
-  [ "$got" = "heavy=$want" ] && ok ||
-    bad "event=$event labels=[${3:-}] above=${4:-0} fail=${5:-}: wanted heavy=$want, got '$got'"
+    STUB_LABELS="${4:-}" STUB_ABOVE="${5:-0}" STUB_FAIL="${6:-}" bash scripts/ci-heavy.sh 2>/dev/null)"
+  [ "$got" = "$want" ] && ok ||
+    bad "event=$event labels=[${4:-}] above=${5:-0} fail=${6:-}: wanted '$want', got '$got'"
 }
 
-heavy true  merge_group                      # the queue runs everything
-heavy true  push
-heavy true  workflow_dispatch
-heavy true  pull_request "" 0                # the top of its stack
-heavy false pull_request "" 1                # a lower layer: fast checks
-heavy false pull_request "" 3
-heavy false pull_request "other-label" 1     # only full-ci asks for the full suite
-heavy true  pull_request "full-ci" 1         # a labelled lower layer runs everything
-heavy true  pull_request "x
+heavy true  unknown merge_group                      # the queue runs everything
+heavy true  unknown push
+heavy true  unknown workflow_dispatch
+heavy true  true    pull_request "" 0                # the top of its stack
+heavy false false   pull_request "" 1                # a lower layer: fast checks
+heavy false false   pull_request "" 3
+heavy false false   pull_request "other-label" 1     # only full-ci asks for the full suite
+heavy true  false   pull_request "full-ci" 1         # a labelled lower layer runs everything, and is not the top
+heavy true  false   pull_request "x
 full-ci" 2
-heavy false pull_request "full-ci-not" 1     # the whole label, not a prefix
-heavy true  pull_request "" 1 view           # cannot read labels: full run
-heavy true  pull_request "" 1 list           # cannot list the stack: full run
-heavy true  pull_request "" "many"           # an answer that is not a count: full run
+heavy true  true    pull_request "full-ci" 0         # labelled and the top
+heavy false false   pull_request "full-ci-not" 1     # the whole label, not a prefix
+heavy true  false   pull_request "" 1 view           # cannot read labels: full run
+heavy true  unknown pull_request "" 1 list           # cannot list the stack: full run, top unknown
+heavy true  unknown pull_request "" "many"           # an answer that is not a count: full run
 
-out="$(PATH="$stub:$PATH" EVENT=pull_request HEAD_REF= PR_NUMBER= REPO= bash scripts/ci-heavy.sh 2>/dev/null)"
+out="$(PATH="$stub:$PATH" EVENT=pull_request HEAD_REF= PR_NUMBER= REPO= bash scripts/ci-heavy.sh 2>/dev/null | head -n 1)"
 [ "$out" = heavy=true ] && ok || bad "a pull request without its head branch runs everything, got '$out'"
 EVENT= bash scripts/ci-heavy.sh >/dev/null 2>&1 && bad "an empty EVENT is refused" || ok
 EVENT=push bash scripts/ci-heavy.sh extra >/dev/null 2>&1 && bad "an argument is refused" || ok
@@ -63,9 +65,12 @@ EVENT=push bash scripts/ci-heavy.sh extra >/dev/null 2>&1 && bad "an argument is
 # The workflow wires it: the changes job writes heavy, every heavy job is
 # gated on it or needs a job that is, and ci-ok hands HEAVY to the verdict.
 wf=.github/workflows/ci.yml
-grep -q 'heavy="$(bash scripts/ci-heavy.sh)"' "$wf" && ok || bad "the changes job runs ci-heavy.sh"
+[ "$(grep -cF 'bash scripts/ci-heavy.sh >> "$GITHUB_OUTPUT"' "$wf")" -eq 2 ] && ok ||
+  bad "the changes job and ci-ok both run ci-heavy.sh into their outputs"
 grep -q 'heavy: ${{ steps.h.outputs.heavy }}' "$wf" && ok || bad "the changes job outputs heavy"
 grep -q 'HEAVY: ${{ needs.changes.outputs.heavy }}' "$wf" && ok || bad "ci-ok passes HEAVY to the verdict"
+grep -q 'HEAVY_NOW: ${{ steps.now.outputs.heavy }}' "$wf" && ok || bad "ci-ok asks again and passes HEAVY_NOW"
+grep -q 'top: ${{ steps.h.outputs.top }}' "$wf" && ok || bad "the changes job outputs top"
 grep -q 'pull-requests: read' "$wf" && ok || bad "the changes job may read pull requests"
 for job in benchmark fixtures cli-windows; do
   awk -v j="  $job:" '$0 == j {f=1; next} f && /^  [a-z]/ {f=0} f' "$wf" |

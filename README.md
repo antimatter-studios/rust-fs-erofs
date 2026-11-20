@@ -400,12 +400,17 @@ legs. `scripts/ci-heavy.sh` decides:
 - the merge queue, a push to `main` and a manual run always run everything,
   so nothing reaches `main` less tested than before;
 - a pull request with no open pull request based on its branch is the top,
-  and runs everything on its own push; the layer below it keeps the results
-  it already has;
+  and runs everything on its own push;
+- when a new top is based on another pull request's branch, it cancels that
+  layer's queued or running pull-request CI and re-runs only its fast checks
+  (`scripts/ci-cancel-below.sh`), so pull requests opened one at a time do
+  not each keep a full run going. Merge-queue and push runs are never
+  cancelled;
 - a pull request labelled `full-ci` runs everything.
 
-`ci-ok` passes a lower layer whose heavy jobs were skipped by design, and
-fails on any job that ran and failed, and on any other skip.
+`ci-ok` passes a lower layer whose heavy jobs were skipped by design, or
+cancelled by the new top, and fails on any job that ran and failed, and on
+any other skip or cancellation.
 
 To find the layer that broke a stack whose top is red: label the middle
 layer `full-ci` and re-run its CI (`gh run rerun <run id>`, or push), then

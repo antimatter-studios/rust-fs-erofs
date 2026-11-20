@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Whether this run takes the full suite or the fast checks only.
 #
-#   ci-heavy.sh   prints `heavy=true` or `heavy=false`, and a reason on
-#                 stderr; the changes job writes it to its outputs
+#   ci-heavy.sh   prints `heavy=true|false` and `top=true|false|unknown`,
+#                 and a reason on stderr; the changes job and ci-ok write
+#                 them to their outputs
 #
 # Owner-approved trial, 2026-11-20: a stack of pull requests runs the full
 # suite on its TOP layer only. Every layer runs the fast tier (fmt, clippy,
@@ -22,8 +23,9 @@
 #     and halve towards the layer that broke.
 #
 # A layer pushed on top becomes the top and runs the full suite on its own
-# push; the layer below keeps the results it already has (nothing re-runs
-# it). If the pull requests cannot be listed, the answer is true: a run
+# push. A full run the layer below started while it was the top is
+# cancelled by the new top, and only its fast checks run again
+# (scripts/ci-cancel-below.sh); results it already has are kept. If the pull requests cannot be listed, the answer is true: a run
 # that cannot tell is a full run, never a fast one.
 #
 # Inputs, from the workflow's environment:
@@ -36,31 +38,39 @@ set -uo pipefail
 
 [ $# -eq 0 ] || { echo "usage: ci-heavy.sh   (configured by its environment)" >&2; exit 2; }
 
-say() { # heavy reason
+# Prints `heavy=` and `top=` (whether no open pull request is stacked on
+# this one; `top=unknown` outside a pull request or when it cannot be
+# told), and the reason on stderr.
+say() { # heavy top reason
   echo "heavy=$1"
-  echo "ci-heavy: heavy=$1 ($2)" >&2
+  echo "top=$2"
+  echo "ci-heavy: heavy=$1 top=$2 ($3)" >&2
   exit 0
 }
 
 case "${EVENT:-}" in
   pull_request) ;;
   "") echo "ci-heavy: EVENT is empty" >&2; exit 2 ;;
-  *) say true "event ${EVENT}: every leg runs" ;;
+  *) say true unknown "event ${EVENT}: every leg runs" ;;
 esac
 
 [ -n "${HEAD_REF:-}" ] && [ -n "${PR_NUMBER:-}" ] && [ -n "${REPO:-}" ] ||
-  say true "a pull request without HEAD_REF, PR_NUMBER or REPO"
-
-labels="$(gh pr view "$PR_NUMBER" -R "$REPO" --json labels --jq '.labels[].name' 2>/dev/null)" ||
-  say true "the labels of #$PR_NUMBER cannot be read"
-if printf '%s\n' "$labels" | grep -qx 'full-ci'; then
-  say true "#$PR_NUMBER carries full-ci"
-fi
+  say true unknown "a pull request without HEAD_REF, PR_NUMBER or REPO"
 
 above="$(gh pr list -R "$REPO" --base "$HEAD_REF" --state open --json number --jq 'length' 2>/dev/null)" ||
-  say true "the pull requests based on $HEAD_REF cannot be listed"
+  say true unknown "the pull requests based on $HEAD_REF cannot be listed"
 case "$above" in
-  0) say true "#$PR_NUMBER is the top of its stack" ;;
-  ''|*[!0-9]*) say true "the count of pull requests on $HEAD_REF is '$above'" ;;
-  *) say false "#$PR_NUMBER has $above open pull request(s) stacked on $HEAD_REF; the top runs the full suite" ;;
+  0) top=true ;;
+  ''|*[!0-9]*) say true unknown "the count of pull requests on $HEAD_REF is '$above'" ;;
+  *) top=false ;;
 esac
+
+labels="$(gh pr view "$PR_NUMBER" -R "$REPO" --json labels --jq '.labels[].name' 2>/dev/null)" ||
+  say true "$top" "the labels of #$PR_NUMBER cannot be read"
+if printf '%s\n' "$labels" | grep -qx 'full-ci'; then
+  say true "$top" "#$PR_NUMBER carries full-ci"
+fi
+if [ "$top" = true ]; then
+  say true true "#$PR_NUMBER is the top of its stack"
+fi
+say false false "#$PR_NUMBER has $above open pull request(s) stacked on $HEAD_REF; the top runs the full suite"
