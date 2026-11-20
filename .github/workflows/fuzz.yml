@@ -39,12 +39,28 @@ permissions:
   contents: read
 
 jobs:
+  fuzz-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   fuzz:
     name: fuzz every parser a hostile image reaches
-    runs-on: ubuntu-latest
+    needs: fuzz-gate
+    runs-on: ${{ needs.fuzz-gate.outputs.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
 
       # No rust-fs-core checkout: the fuzz crate takes core from crates.io
       # at the exact release fuzz/Cargo.toml pins, the same one the parent
