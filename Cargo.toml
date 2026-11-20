@@ -68,7 +68,17 @@ lz4hc-workspace = []
 cli = ["dep:clap", "rust-fs-core/cli"]
 
 [dependencies]
-rust-fs-core = { path = "../rust-fs-core", version = "0.4.3" }
+# THE CORE RELEASE THIS CRATE BUILDS AGAINST, by exact version from
+# crates.io and never by path, so what a pull request builds is what was
+# published. To build against a local ../rust-fs-core while working on both,
+# patch it in .cargo/config.toml, which is gitignored and never committed:
+#
+#   [patch.crates-io]
+#   rust-fs-core = { path = "../rust-fs-core" }
+#
+# The same release is named in fuzz/Cargo.toml, chores.yml (FS_CORE_REF) and
+# fuzz.yml; tests/ci_profile.rs fails when they disagree.
+rust-fs-core = { version = "=0.4.3" }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 lzma-rs = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

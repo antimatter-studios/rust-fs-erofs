@@ -3116,6 +3116,8 @@ fn am_fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
         }
         if line.contains("rust-fs-core") {
             if let Some(v) = quoted_value_after(line, "version") {
+                // `=0.4.3` is an exact requirement on the same release.
+                let v = v.strip_prefix('=').unwrap_or(&v).to_string();
                 found.push(("the rust-fs-core dependency's `version`".to_string(), v));
             }
         }
@@ -3167,13 +3169,10 @@ fn as_version(raw: &str) -> Option<String> {
 /// known to carry a pin, so one that stops carrying it is a failure
 /// rather than a file the walk no longer visits. `release.yml` is not
 /// here because it declares nothing: it runs `chore siblings`, which
-/// reads `FS_CORE_REF` from `chores.yml`.
-const FILES_THAT_PIN_AM_FS_CORE: &[&str] = &[
-    "Cargo.toml",
-    "fuzz/Cargo.toml",
-    "chores.yml",
-    ".github/workflows/fuzz.yml",
-];
+/// reads `FS_CORE_REF` from `chores.yml`. `fuzz.yml` left the list when
+/// the fuzz crate began taking core from crates.io by exact version: it
+/// no longer clones core at all.
+const FILES_THAT_PIN_AM_FS_CORE: &[&str] = &["Cargo.toml", "fuzz/Cargo.toml", "chores.yml"];
 
 /// Every file that names the `rust-fs-core` this crate is built against
 /// names the same one (#144).
@@ -3239,6 +3238,51 @@ fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
     );
 }
 
+/// Every manifest takes `rust-fs-core` from crates.io by exact version,
+/// never by path.
+///
+/// A committed path dependency builds against whatever happens to be
+/// checked out beside the repository, so two machines can build two
+/// different cores from one commit. A local override belongs in a
+/// gitignored `.cargo/config.toml` `[patch.crates-io]`, and this guard
+/// keeps it out of the committed manifests.
+#[test]
+fn every_manifest_pins_rust_fs_core_by_exact_version_and_not_by_path() {
+    let root = manifest_dir();
+    for rel in ["Cargo.toml", "fuzz/Cargo.toml"] {
+        let text = read_or_panic(&root.join(rel));
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#') && l.starts_with("rust-fs-core"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "{rel} declares the rust-fs-core dependency {} times: {lines:?}",
+            lines.len()
+        );
+        let line = lines[0];
+        assert!(
+            !line.contains("path"),
+            "{rel} names rust-fs-core by path ({line}); pin it by version and put a \
+             local override in a gitignored .cargo/config.toml [patch.crates-io]"
+        );
+        let version = quoted_value_after(line, "version")
+            .unwrap_or_else(|| panic!("{rel} gives rust-fs-core no version: {line}"));
+        assert!(
+            version.starts_with('='),
+            "{rel} asks for rust-fs-core {version}, a range; pin the release exactly with ={version}"
+        );
+    }
+    let ignore = read_or_panic(&root.join(".gitignore"));
+    assert!(
+        ignore.lines().any(|l| l.trim() == ".cargo/config.toml"),
+        ".gitignore must keep a local .cargo/config.toml, where the path override lives, \
+         out of the repository"
+    );
+}
+
 /// The oldest `rust-fs-core` release that carries the shared tree
 /// transfer: `TreeSource`, `TreeMetadata` and `export_tree`, with links
 /// and times preserved.
@@ -3285,6 +3329,18 @@ mod core_pin_parser {
         );
     }
 
+    /// An exact requirement, `=0.4.3`, names the release it pins.
+    #[test]
+    fn an_exact_version_requirement_declares_its_version() {
+        assert_eq!(
+            am_fs_core_versions_declared("rust-fs-core = { version = \"=0.4.3\" }\n"),
+            vec![(
+                "the rust-fs-core dependency's `version`".to_string(),
+                "0.4.3".to_string()
+            )],
+        );
+    }
+
     /// The chores.yml spelling, with and without the `v`.
     #[test]
     fn the_ref_variable_declares_its_version() {
@@ -3294,7 +3350,8 @@ mod core_pin_parser {
         );
     }
 
-    /// The clone spelling, which is how fuzz.yml carries its pin.
+    /// The clone spelling, which is how fuzz.yml carried its pin while
+    /// the fuzz crate built against a cloned sibling.
     #[test]
     fn a_clone_branch_declares_its_version() {
         let line = "run: git clone --depth 1 --branch v0.2.10 \

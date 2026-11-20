@@ -46,7 +46,7 @@ rust-fs-erofs = "0.4"
 ```toml
 [dependencies]
 fs-erofs = { path = "../rust-fs-erofs" }
-rust-fs-core = { path = "../rust-fs-core" }
+rust-fs-core = "=0.4.3"   # the release this crate pins, from crates.io
 ```
 
 ### Building locally
@@ -60,6 +60,8 @@ chore fixtures          # the mkfs.erofs-made images, built inside the VM
 cargo build --release
 chore test
 ```
+
+`rust-fs-core` comes from crates.io at the exact release `Cargo.toml` pins; `../rust-fs-core` is checked out only for its scripts. To build against a local core while changing both, put a `[patch.crates-io]` with `rust-fs-core = { path = "../rust-fs-core" }` in `.cargo/config.toml`, which is gitignored, and remove it before committing.
 
 The command-line tools are behind the `cli` feature, so the library a consumer links gains nothing from them: `chore cli:install` builds them and stages them under every name in `tmp/cli/bin` (it prints the `PATH` line to use), and `chore test:cli` tests them as installed.
 

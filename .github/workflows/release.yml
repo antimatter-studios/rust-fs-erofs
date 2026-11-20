@@ -23,7 +23,7 @@ jobs:
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
-        # rust-fs-core (the path dependency) and fs-linux-test-harness, at
+        # rust-fs-core (whose scripts run in place) and fs-linux-test-harness, at
         # the refs pinned in chores.yml.
         run: chore siblings
 
