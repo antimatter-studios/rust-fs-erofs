@@ -524,7 +524,9 @@ tasks:
       # #233 adds one declared case exporting a damaged tree.
       # 36 with the builder's own kernel tests, in hardlink_oracle.rs, writer_kernel.rs
       # and lz4hc_writer.rs (#252-#263), which kernel-floor.sh counts.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 36'
+      # 38 with damaged_images_kernel.rs: damaged plain and LZ4 images,
+      # read by the kernel and this crate path by path (#311).
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 38'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'

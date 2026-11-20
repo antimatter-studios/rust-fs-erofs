@@ -52,6 +52,27 @@ pub fn guest_kernel_read(image: &str, script: &str) -> Output {
     run(image, script, MountExpectation::Succeeds)
 }
 
+/// Mount `image` read-only in the guest and run `script` against it if
+/// the kernel accepts the image, or say what `mount` said if it refuses.
+///
+/// For damaged images, where whether Linux mounts the image at all is
+/// part of what the kernel is asked: a test compares the answer with the
+/// driver's rather than deciding it in advance. `Ok` holds the script's
+/// output exactly as [`guest_kernel_read`] returns it; `Err` holds the
+/// refusal `mount` printed.
+#[track_caller]
+pub fn guest_kernel_read_if_mounted(image: &str, script: &str) -> Result<Output, String> {
+    let out = run(image, script, MountExpectation::Either);
+    if out.status.code() == Some(MOUNT_REFUSED) {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(out)
+}
+
+/// The guest script's exit status when `MountExpectation::Either` met a
+/// refused mount. Outside the range `bash` and the coreutils use.
+const MOUNT_REFUSED: i32 = 213;
+
 /// Whether the mount itself is the thing under test.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MountExpectation {
@@ -60,6 +81,9 @@ enum MountExpectation {
     /// The mount must FAIL. The script is not run, and the call reports
     /// what `mount` said.
     Refused,
+    /// Either is an answer. The script runs when the mount succeeds;
+    /// a refusal exits `MOUNT_REFUSED`, with `mount`'s message on stderr.
+    Either,
 }
 
 #[track_caller]
@@ -107,6 +131,8 @@ fn run(image: &str, script: &str, expectation: MountExpectation) -> Output {
         (MountExpectation::Refused, n) => {
             format!("NOT refused — the kernel accepted it (guest script exit {n})")
         }
+        (MountExpectation::Either, MOUNT_REFUSED) => "refused by the kernel".to_string(),
+        (MountExpectation::Either, n) => format!("mounted, guest script exit {n}"),
     };
     println!("[kernel vm] mount -t erofs -o ro {image} -> {verdict}");
     Output {
@@ -148,6 +174,19 @@ if mount -t erofs -o ro "$loop" "$mnt" > {stdout} 2> {stderr}; then
 fi"#,
             stdout = guest_quote(&run.stdout.to_string_lossy()),
             stderr = guest_quote(&run.stderr.to_string_lossy()),
+        ),
+        MountExpectation::Either => format!(
+            r#"status=0
+if mount -t erofs -o ro "$loop" "$mnt" 2> {stderr}; then
+    MNT="$mnt" IMG="$IMG" bash -euo pipefail -c {script} > {stdout} 2>> {stderr} || status=$?
+    umount "$mnt"
+else
+    status={refused}
+fi"#,
+            script = guest_quote(script),
+            stdout = guest_quote(&run.stdout.to_string_lossy()),
+            stderr = guest_quote(&run.stderr.to_string_lossy()),
+            refused = MOUNT_REFUSED,
         ),
     };
     format!(
