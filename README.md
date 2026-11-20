@@ -67,6 +67,8 @@ The command-line tools are behind the `cli` feature, so the library a consumer l
 
 ## Library usage
 
+[docs/three-layer-api.md](docs/three-layer-api.md) maps the API onto the three layers every rust-fs driver shares (VolumeAPI, PrimitiveAPI with the salvage verbs, FileAPI), and says what is still to come.
+
 ```rust
 use std::sync::Arc;
 use fs_core::{BlockRead, FileDevice};
