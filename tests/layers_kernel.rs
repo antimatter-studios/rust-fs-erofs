@@ -94,40 +94,6 @@ fn open(bytes: &[u8]) -> ErofsVolume {
     ErofsVolume::open(source).expect("open")
 }
 
-/// Whether an image shape lets one stored unit serve several files:
-/// fragments put many files' tails in one packed pcluster, and dedupe
-/// shares a pcluster between files.
-fn shares_stored_units(args: &[&str]) -> bool {
-    args.iter()
-        .any(|a| a.contains("fragments") || a.contains("dedupe"))
-}
-
-/// The one way `primitive.walks` may fail on such an image, filed on
-/// rust-fs-core#453: a walk maps more stored bytes than the file claims,
-/// because the encoded unit holding its bytes also holds other files'.
-/// Every listed walk must still be complete, inside the source, in file
-/// order, within the claim, and rebuild exactly the claimed bytes.
-fn only_shared_units_overmap(check: &fs_core::layers::conformance::Check) -> bool {
-    if check.name != "primitive.walks" {
-        return false;
-    }
-    let walks: Vec<&str> = check.detail.split("\"Extent").skip(1).collect();
-    !walks.is_empty()
-        && walks.iter().all(|walk| {
-            let number = |after: &str, before: &str| -> Option<u64> {
-                let rest = walk.split_once(after)?.1;
-                rest.split_once(before)?.0.trim().parse().ok()
-            };
-            let claimed = number(" of ", " claimed");
-            let mapped = number("mapped ", " of ");
-            let plan = number("plan Some(", ")");
-            walk.contains("end Complete, inside true, in file order true, within the claim true")
-                && claimed.is_some()
-                && plan == claimed
-                && mapped > claimed
-        })
-}
-
 const SHAPES: [&[&str]; 4] = [
     &["-b4096"],
     &["-b4096", "--chunksize=8192"],
@@ -179,10 +145,7 @@ fn the_layers_read_mkfs_erofs_images_as_the_kernel_reads_them() {
         }
         expected.push(Expected::absent("/not-there"));
         let report = check_healthy(&volume, &expected, &limits);
-        let failed: Vec<_> = report
-            .failures()
-            .filter(|check| !(shares_stored_units(args) && only_shared_units_overmap(check)))
-            .collect();
+        let failed: Vec<_> = report.failures().collect();
         assert!(failed.is_empty(), "{args:?}: {report}");
 
         // FileAPI lists each path at the kernel's inode and size.

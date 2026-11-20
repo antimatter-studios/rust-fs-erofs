@@ -18,4 +18,4 @@
 
 ### Changed
 
-- rust-fs-core is pinned at 0.5.0 with its `layers` feature.
+- rust-fs-core is pinned at 0.5.1 with its `layers` feature.
