@@ -939,12 +939,15 @@ fn assert_unconditional(job: &Yaml, name: &str, workflow: &str) {
     assert_steps_unconditional(job, name, workflow);
 }
 
-/// As `assert_unconditional`, but the job may carry the one condition
-/// the contract allows: `if: needs.changes.outputs.code == 'true'`,
-/// needing `changes`. It is skipped, with the jobs after it, for a change
-/// to documentation alone, and ci-ok accepts that skip only. Every event
-/// runs every leg -- a pull request too -- so a condition on the event or a
-/// profile is refused, as are any other condition and `continue-on-error`.
+/// As `assert_unconditional`, but the job may carry the condition the
+/// contract allows, needing `changes`: `needs.changes.outputs.code ==
+/// 'true'`, so it is skipped, with the jobs after it, for a change to
+/// documentation alone; joined, in the owner-approved trial of 2026-11-20,
+/// with `needs.changes.outputs.heavy == 'true'`, so a lower layer of a
+/// stack skips it and the top layer, a `full-ci` layer and the merge queue
+/// run it (scripts/ci-heavy.sh). ci-ok accepts those skips only. A
+/// condition on the event or a profile is refused, as are any other
+/// condition and `continue-on-error`.
 fn assert_unconditional_or_skipped_for_documentation(job: &Yaml, name: &str, workflow: &str) {
     let keys = keys_of(job);
     assert!(
@@ -952,10 +955,14 @@ fn assert_unconditional_or_skipped_for_documentation(job: &Yaml, name: &str, wor
         "{workflow} jobs.{name} must not be allowed to fail"
     );
     if let Some(condition) = field(job, "if") {
-        assert_eq!(
-            condition.as_str(),
-            Some("needs.changes.outputs.code == 'true'"),
-            "{workflow} jobs.{name} may be skipped only for a change to documentation alone"
+        let allowed = [
+            "needs.changes.outputs.code == 'true'",
+            "needs.changes.outputs.code == 'true' && needs.changes.outputs.heavy == 'true'",
+        ];
+        assert!(
+            condition.as_str().is_some_and(|c| allowed.contains(&c)),
+            "{workflow} jobs.{name} may be skipped only for a change to documentation alone, \
+             or on a lower layer of a stack; it carries `if: {condition:?}`"
         );
         assert!(
             needs_of(job).iter().any(|n| n == "changes"),

@@ -109,9 +109,18 @@ env:
   CHORE_VERSION: "0.11.0"
   # Declare conditional jobs to core's static ci-gate contract. This permits
   # their scheduling condition only -- fixtures is skipped for a change to
-  # documentation alone -- and ci-ok still needs every job and rejects
-  # failures, cancellations and any other skip (scripts/ci-verdict.sh).
-  CI_GATE_NON_GATING: "fixtures"
+  # documentation alone, and the heavy jobs below on a lower layer of a
+  # stack -- and ci-ok still needs every job and rejects failures,
+  # cancellations and any other skip (scripts/ci-verdict.sh).
+  CI_GATE_NON_GATING: "fixtures benchmark cli-windows"
+  # FULL SUITE ON THE TOP OF A STACK, FAST CHECKS BELOW (owner-approved
+  # trial, 2026-11-20). The jobs that run only when the changes job says
+  # `heavy` (scripts/ci-heavy.sh): the merge queue, a push to main, a manual
+  # run, the top layer of a stack, and a layer labelled `full-ci`. test,
+  # test-arm64 and suite-in-vm carry no condition of their own: they need
+  # fixtures and are skipped with it. ci-ok accepts the skip of these jobs,
+  # and no others, when heavy is false.
+  HEAVY_JOBS: "benchmark fixtures test test-arm64 suite-in-vm cli-windows"
 
 jobs:
   # Does this change need the full pipeline? rust-fs-core's
@@ -125,8 +134,14 @@ jobs:
   changes:
     name: changes (does this need the full pipeline?)
     runs-on: ubuntu-24.04
+    # Reading which pull requests are stacked on this one, and its labels.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       code: ${{ steps.c.outputs.code }}
+      heavy: ${{ steps.h.outputs.heavy }}
+      top: ${{ steps.h.outputs.top }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -169,9 +184,24 @@ jobs:
           fi
           echo "code=$code ($EVENT${range:+ $range})"
           echo "code=$code" >> "$GITHUB_OUTPUT"
+      - name: Full suite, or fast checks? (the top of a stack runs everything)
+        id: h
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci-heavy.sh >> "$GITHUB_OUTPUT"
 
   unit:
     name: unit (no tools, no VM)
+    # Needs changes only so that re-running changes re-runs it too: that is
+    # how scripts/ci-cancel-below.sh brings a layer's fast checks back after
+    # cancelling its full run. It runs whatever changes says.
+    needs: changes
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -214,6 +244,8 @@ jobs:
           set -euo pipefail
           command -v jq >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
           bash tests/scripts/ci-verdict.sh
+          bash tests/scripts/ci-heavy.sh
+          bash tests/scripts/ci-cancel-below.sh
       - name: A signal to scripts/test.sh alone stops the run
         # Here because the shell tier runs after every test tier, and some of
         # its guards need fixtures. This one needs neither,
@@ -248,7 +280,7 @@ jobs:
   benchmark:
     name: EROFS fixed-output LZ4HC performance
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -275,7 +307,7 @@ jobs:
   fixtures:
     name: fixtures (harness VM, x86_64 KVM)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -538,6 +570,7 @@ jobs:
   cli-windows:
     name: cli (Windows ${{ matrix.label }}, the release zip's tools on PATH)
     needs: changes
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -633,6 +666,9 @@ jobs:
     # not declare. Why, and what it cannot see, is at the top of
     # ../rust-fs-core/scripts/semver-check.sh.
     name: semver (public API against crates.io)
+    # Needs changes so that re-running changes re-runs it
+    # (scripts/ci-cancel-below.sh).
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -660,17 +696,71 @@ jobs:
         shell: bash
         run: chore check:semver
 
+  # A NEW TOP STOPS THE FULL RUN BELOW IT (owner-approved trial,
+  # 2026-11-20). A pull request that is the top of its stack and is based on
+  # another pull request's branch cancels that pull request's queued or
+  # running CI and re-runs only its fast checks (scripts/ci-cancel-below.sh).
+  # Its own job, so the wait for the cancel never delays this run's legs;
+  # it never fails.
+  below:
+    name: stack (stop the full run of the layer below)
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: write
+    steps:
+      # A job holding a write token runs only code fixed by commit, and
+      # leaves no token on disk (tests/scripts/test-write-jobs-pinned.sh).
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Cancel the layer below's full run, re-run its fast checks
+        env:
+          EVENT: ${{ github.event_name }}
+          TOP: ${{ needs.changes.outputs.top }}
+          BASE_REF: ${{ github.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ci.yml
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci-cancel-below.sh
+
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, unit, benchmark, fixtures, test, test-arm64, suite-in-vm, cli, cli-windows, semver]
+    needs: [changes, below, unit, benchmark, fixtures, test, test-arm64, suite-in-vm, cli, cli-windows, semver]
     runs-on: ubuntu-latest
+    # Asking ci-heavy.sh again, below.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
+      - name: Is this still the top of its stack?
+        id: now
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci-heavy.sh >> "$GITHUB_OUTPUT"
       - name: Every job ran and succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
-          # false only for a change to documentation alone: then, and only
-          # then, a skipped job is not a failed one (scripts/ci-verdict.sh).
+          # false only for a change to documentation alone: then a skipped
+          # job is not a failed one (scripts/ci-verdict.sh).
           CODE: ${{ needs.changes.outputs.code }}
+          # false only on a lower layer of a stack: then a skipped job named
+          # in HEAVY_JOBS is not a failed one, and no other skip is accepted.
+          HEAVY: ${{ needs.changes.outputs.heavy }}
+          # The same question asked now: false when a pull request pushed on
+          # top has cancelled this run's heavy jobs, which are then accepted
+          # as cancelled by design (scripts/ci-cancel-below.sh).
+          HEAVY_NOW: ${{ steps.now.outputs.heavy }}
         run: echo "$NEEDS" | bash scripts/ci-verdict.sh

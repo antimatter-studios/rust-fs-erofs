@@ -387,6 +387,35 @@ Issues + PRs welcome. Before opening:
 - New features should land with both unit tests and an oracle test against `erofs-utils` where applicable.
 - Maintain coverage ≥ 94% line.
 
+### What CI runs on a stack of pull requests
+
+Pull requests land as one stack (AGENTS.md). In a trial the owner approved
+on 2026-11-20, only the **top** of the stack runs the full suite on its
+pull request; every layer below it runs the fast checks (fmt, clippy, the
+unit tier, the CLI, semver, the shell guards). The full suite is the
+harness-VM fixtures and everything that reads them (oracle and kernel tiers,
+aarch64, the suite in the guest), the LZ4HC benchmark and the Windows CLI
+legs. `scripts/ci-heavy.sh` decides:
+
+- the merge queue, a push to `main` and a manual run always run everything,
+  so nothing reaches `main` less tested than before;
+- a pull request with no open pull request based on its branch is the top,
+  and runs everything on its own push;
+- when a new top is based on another pull request's branch, it cancels that
+  layer's queued or running pull-request CI and re-runs only its fast checks
+  (`scripts/ci-cancel-below.sh`), so pull requests opened one at a time do
+  not each keep a full run going. Merge-queue and push runs are never
+  cancelled;
+- a pull request labelled `full-ci` runs everything.
+
+`ci-ok` passes a lower layer whose heavy jobs were skipped by design, or
+cancelled by the new top, and fails on any job that ran and failed, and on
+any other skip or cancellation.
+
+To find the layer that broke a stack whose top is red: label the middle
+layer `full-ci` and re-run its CI (`gh run rerun <run id>`, or push), then
+halve towards the failure.
+
 ## Crate map
 
 | Crate | License | Purpose |
