@@ -529,16 +529,22 @@ impl Filesystem {
 
     /// Look up a single name in a directory.
     ///
-    /// Linear scan. EROFS sorts dirents by name hash on disk so a
-    /// binary search is possible; this does not do it, which is a cost
-    /// on very large directories and nothing else.
+    /// BY BINARY SEARCH OVER THE DIRECTORY'S BLOCKS, AS THE KERNEL LOOKS IT
+    /// UP (#311). EROFS keeps a directory's entries sorted by name across
+    /// all its blocks, so the block that can hold a name is the last one
+    /// whose first name is not greater than it. Linux finds it by bisecting
+    /// on each block's first name (`erofs_find_target_block`) and reads
+    /// only the blocks the bisection touches. This used to scan and
+    /// validate every block, so one destroyed block lost every name in the
+    /// directory, where the kernel loses only the names in that block and
+    /// any the bisection must pass through it to reach.
     ///
-    /// NOT BY LISTING (#61). This called `read_dir`, which gives every
-    /// entry an owned copy of its name, and then compared one of them: one
-    /// allocation per entry per path component. It now walks the same
-    /// blocks with [`visit_block`], comparing borrowed names. Every block is
-    /// still read and validated, so a malformed directory is refused exactly
-    /// as a listing would refuse it, and the first match wins as before.
+    /// Every block the search reads is still validated whole, and a
+    /// malformed one refuses the lookup, as the kernel refuses a block it
+    /// cannot read.
+    ///
+    /// NOT BY LISTING (#61): names are compared borrowed from the block
+    /// buffer, one buffer per lookup, with no allocation per entry.
     pub fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Inode> {
         if !dir.is_dir() {
             return Err(Error::NotADirectory);
@@ -546,24 +552,41 @@ impl Filesystem {
         let bs = self.sb.block_size();
         let total_blocks = dir.size.div_ceil(bs);
         let zmap = self.zmap_for(dir)?;
-        let mut remaining = dir.size;
-        let mut block_idx: u64 = 0;
-        let mut found: Option<u64> = None;
         let mut buf = Vec::new();
-        while remaining > 0 {
-            let this_block = remaining.min(bs);
+        // The blocks still in play are `head..end`; `found` is the match in
+        // the last block whose first name sorted below `name`.
+        let mut head: u64 = 0;
+        let mut end: u64 = total_blocks;
+        let mut found: Option<u64> = None;
+        while head < end {
+            let mid = head + (end - 1 - head) / 2;
+            let this_block = (dir.size - mid * bs).min(bs);
             buf.clear();
             buf.resize(this_block as usize, 0);
-            self.read_data_block(dir, block_idx, total_blocks, zmap.as_ref(), &mut buf)?;
+            self.read_data_block(dir, mid, total_blocks, zmap.as_ref(), &mut buf)?;
             // Padded back to bs for the NUL scan, as in `read_dir`.
             buf.resize(bs as usize, 0);
+            let mut first: Option<std::cmp::Ordering> = None;
+            let mut hit: Option<u64> = None;
             visit_block(&buf, |nid, _, entry| {
-                if found.is_none() && entry == name {
-                    found = Some(nid);
+                if first.is_none() {
+                    first = Some(name.cmp(entry));
+                }
+                if hit.is_none() && entry == name {
+                    hit = Some(nid);
                 }
             })?;
-            remaining -= this_block;
-            block_idx += 1;
+            match first {
+                None => return Err(Error::BadDirent("directory block holds no entries")),
+                Some(std::cmp::Ordering::Less) => end = mid,
+                Some(std::cmp::Ordering::Equal) => {
+                    return self.read_inode(hit.expect("the first entry matched"));
+                }
+                Some(std::cmp::Ordering::Greater) => {
+                    found = hit;
+                    head = mid + 1;
+                }
+            }
         }
         match found {
             Some(nid) => self.read_inode(nid),
