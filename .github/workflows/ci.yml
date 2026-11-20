@@ -42,7 +42,8 @@ name: CI
 #                the first time it is put together. No VM here: what erofs-utils
 #                and the kernel make of the tools' images is judged in the
 #                oracle and kernel tiers, in the `test` job.
-#   cli-windows  the same suite on windows-latest, against the tools from
+#   cli-windows-x86_64, cli-windows-arm64
+#                the same suite on windows-latest and windows-11-arm, against the tools from
 #                the .zip a release attaches for Windows, unpacked as a user
 #                unpacks it (#185).
 #   EVERY LEG    runs on every event: a pull request, the merge queue, a
@@ -112,7 +113,7 @@ env:
   # documentation alone, and the heavy jobs below on a lower layer of a
   # stack -- and ci-ok still needs every job and rejects failures,
   # cancellations and any other skip (scripts/ci-verdict.sh).
-  CI_GATE_NON_GATING: "fixtures benchmark cli-windows benchmark-gate fixtures-gate cli-windows-gate ci-ok-gate"
+  CI_GATE_NON_GATING: "fixtures benchmark cli-windows-x86_64 cli-windows-arm64 benchmark-gate fixtures-gate cli-windows-x86_64-gate cli-windows-arm64-gate ci-ok-gate"
   # FULL SUITE ON THE TOP OF A STACK, FAST CHECKS BELOW (owner-approved
   # trial, 2026-11-20). The jobs that run only when the changes job says
   # `heavy` (scripts/ci-heavy.sh): the merge queue, a push to main, a manual
@@ -120,7 +121,7 @@ env:
   # test-arm64 and suite-in-vm carry no condition of their own: they need
   # fixtures and are skipped with it. ci-ok accepts the skip of these jobs,
   # and no others, when heavy is false.
-  HEAVY_JOBS: "benchmark fixtures test test-arm64 suite-in-vm cli-windows benchmark-gate fixtures-gate test-gate test-arm64-gate suite-in-vm-gate cli-windows-gate"
+  HEAVY_JOBS: "benchmark fixtures test test-arm64 suite-in-vm cli-windows-x86_64 cli-windows-arm64 benchmark-gate fixtures-gate test-gate test-arm64-gate suite-in-vm-gate cli-windows-x86_64-gate cli-windows-arm64-gate"
 
 jobs:
   changes-gate:
@@ -675,20 +676,6 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
-  cli-windows-gate:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: antimatter-vps-gate
-    timeout-minutes: 1
-    outputs:
-      windows-x86_64: ${{ steps.pick-x64.outputs.runner }}
-      windows-arm64: ${{ steps.pick-arm64.outputs.runner }}
-    steps:
-      - id: pick-x64
-        run: runner-gate pick windows-x64
-      - id: pick-arm64
-        run: runner-gate pick windows-arm64
-
   # The tools as a Windows user gets them (#185): built natively for
   # x86_64-pc-windows-msvc on windows-latest and for aarch64-pc-windows-msvc
   # on windows-11-arm, each packaged by rust-fs-core's package-cli into the
@@ -705,19 +692,22 @@ jobs:
   # since cargo cannot read /d/a/.../Cargo.toml. A native symlink needs
   # winsymlinks:nativestrict, or `ln -s` copies the file and mkfs never
   # meets the symlink it is meant to leave out.
-  cli-windows:
-    name: cli (Windows ${{ matrix.label }}, the release zip's tools on PATH)
-    needs: [changes, cli-windows-gate]
+  cli-windows-x86_64-gate:
+    needs: [changes]
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ${{ needs.cli-windows-gate.outputs[matrix.label] }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: windows-latest
-            label: windows-x86_64
-          - runner: windows-11-arm
-            label: windows-arm64
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick windows-x64
+
+  cli-windows-x86_64:
+    name: cli (Windows windows-x86_64, the release zip's tools on PATH)
+    needs: [changes, cli-windows-x86_64-gate]
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ${{ needs.cli-windows-x86_64-gate.outputs.runner }}
     timeout-minutes: 45
     defaults:
       run:
@@ -761,7 +751,7 @@ jobs:
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           mkdir -p tmp/package
           cd tmp/package
-          zip="$(bash ../../../rust-fs-core/scripts/package-cli.sh "$version" "${{ matrix.label }}" | tail -n 1)"
+          zip="$(bash ../../../rust-fs-core/scripts/package-cli.sh "$version" "windows-x86_64" | tail -n 1)"
           echo "zip=tmp/package/$zip" >> "$GITHUB_OUTPUT"
       - name: Unpacked as a Windows user would, first on PATH
         shell: pwsh
@@ -783,7 +773,92 @@ jobs:
         if: always() && steps.tier.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
-          name: tier-logs-cli-${{ matrix.label }}
+          name: tier-logs-cli-windows-x86_64
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  cli-windows-arm64-gate:
+    needs: [changes]
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick windows-arm64
+
+  cli-windows-arm64:
+    name: cli (Windows windows-arm64, the release zip's tools on PATH)
+    needs: [changes, cli-windows-arm64-gate]
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ${{ needs.cli-windows-arm64-gate.outputs.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      MSYS: winsymlinks:nativestrict
+    steps:
+      - uses: actions/checkout@v4
+      - name: The rust-fs-core sibling, at chores.yml's pin
+        run: |
+          set -euo pipefail
+          url="$(sed -n 's/^  FS_CORE_URL: *//p' chores.yml)"
+          ref="$(sed -n 's/^  FS_CORE_REF: *//p' chores.yml)"
+          [ -n "$url" ] && [ -n "$ref" ] || { echo "::error::no FS_CORE_URL/FS_CORE_REF in chores.yml" >&2; exit 1; }
+          git init --quiet ../rust-fs-core
+          git -C ../rust-fs-core remote add origin "$url"
+          git -C ../rust-fs-core fetch --quiet --depth 1 origin "$ref"
+          git -C ../rust-fs-core checkout --quiet FETCH_HEAD
+          echo "rust-fs-core at $ref ($(git -C ../rust-fs-core rev-parse --short HEAD))"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cli-cargo-
+      # As the release builds them. package-cli.sh refuses a binary that imports
+      # VCRUNTIME140.dll, so this job proves the flag removes the import.
+      - name: Build the tools
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --locked --release --features cli --bin rust-fs-erofs --quiet
+      - name: The release zip, packaged and its layout checked
+        id: pack
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          mkdir -p tmp/package
+          cd tmp/package
+          zip="$(bash ../../../rust-fs-core/scripts/package-cli.sh "$version" "windows-arm64" | tail -n 1)"
+          echo "zip=tmp/package/$zip" >> "$GITHUB_OUTPUT"
+      - name: Unpacked as a Windows user would, first on PATH
+        shell: pwsh
+        env:
+          ZIP: ${{ steps.pack.outputs.zip }}
+        run: |
+          $prefix = Join-Path $PWD 'tmp\cli-windows'
+          Expand-Archive -Path $env:ZIP -DestinationPath $prefix -Force
+          Join-Path $prefix 'bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: test:cli, the tools from the zip
+        id: tier
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set -euo pipefail
+          bash ../rust-fs-core/scripts/tier.sh test:cli cli 31 1100 -- scripts/test-cli.sh
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 644
+      - name: Keep the tier logs
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-cli-windows-arm64
           path: tmp/logs/*.log
           if-no-files-found: error
 
@@ -893,7 +968,7 @@ jobs:
         run: bash scripts/ci-cancel-below.sh
 
   ci-ok-gate:
-    needs: [changes-gate, changes, below-gate, below, unit-gate, unit, benchmark-gate, benchmark, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, cli-gate, cli, cli-windows-gate, cli-windows, semver-gate, semver]
+    needs: [changes-gate, changes, below-gate, below, unit-gate, unit, benchmark-gate, benchmark, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, cli-gate, cli, cli-windows-x86_64-gate, cli-windows-x86_64, cli-windows-arm64-gate, cli-windows-arm64, semver-gate, semver]
     if: always()
     runs-on: antimatter-vps-gate
     timeout-minutes: 1
@@ -906,7 +981,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes-gate, changes, below-gate, below, unit-gate, unit, benchmark-gate, benchmark, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, cli-gate, cli, cli-windows-gate, cli-windows, semver-gate, semver, ci-ok-gate]
+    needs: [changes-gate, changes, below-gate, below, unit-gate, unit, benchmark-gate, benchmark, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, cli-gate, cli, cli-windows-x86_64-gate, cli-windows-x86_64, cli-windows-arm64-gate, cli-windows-arm64, semver-gate, semver, ci-ok-gate]
     runs-on: ${{ needs.ci-ok-gate.outputs.runner || 'ubuntu-latest' }}
     # Asking ci-heavy.sh again, below.
     permissions:
