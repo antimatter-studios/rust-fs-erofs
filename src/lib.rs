@@ -38,6 +38,7 @@ pub mod inode;
 pub mod layout;
 mod lz4hc;
 pub mod mkfs;
+pub mod primitives;
 pub mod superblock;
 /// One in-memory device for every test in this crate.
 #[cfg(test)]
