@@ -39,6 +39,13 @@ pub enum Structure {
         /// The inode's NID.
         nid: u64,
     },
+    /// One block of a directory's entries.
+    DirBlock {
+        /// The directory's NID.
+        dir: u64,
+        /// The block's index within the directory.
+        index: u64,
+    },
 }
 
 /// One thing found wrong with a structure, and where.
@@ -511,6 +518,223 @@ pub fn inspect_inode<R: BlockRead + ?Sized>(
     evidence
 }
 
+/// One directory entry as found in a block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirentEvidence {
+    /// The NID the entry names.
+    pub nid: u64,
+    /// The entry's `file_type` byte, as stored.
+    pub file_type: u8,
+    /// The name, as stored.
+    pub name: Vec<u8>,
+}
+
+/// One block of a directory's entries, whatever state it is in.
+#[derive(Debug, Clone)]
+pub struct DirBlockEvidence {
+    /// The directory's NID.
+    pub dir: u64,
+    /// The block's index within the directory.
+    pub index: u64,
+    /// Source byte offset of the block's first byte.
+    pub offset: u64,
+    /// Every entry whose header and name are in bounds and well formed,
+    /// in block order. An entry that is not is left out and reported.
+    pub entries: Vec<DirentEvidence>,
+    /// Everything wrong with it.
+    pub findings: Vec<Finding>,
+}
+
+/// Read one directory block's entries, keeping every entry that is sound
+/// when others in the block are not.
+///
+/// `block` is the block's bytes: a whole block, or the inline tail, which
+/// is padded with zeros to the block size here, as the kernel reads it.
+/// `offset` is where it was read, for the findings. Checked:
+///
+/// - the first entry's name offset gives a whole number of 12-byte
+///   entries inside the block (otherwise nothing in it can be placed);
+/// - each entry's name lies after the entry array and inside the block,
+///   and does not start before the previous name ends;
+/// - each name is not empty and holds no NUL or `/`;
+/// - each NID names an inode inside the source;
+/// - the names are in byte order, which the kernel's lookup relies on.
+pub fn inspect_dir_block(
+    block: &[u8],
+    offset: u64,
+    dir: u64,
+    index: u64,
+    geometry: &Geometry,
+) -> DirBlockEvidence {
+    let mut evidence = DirBlockEvidence {
+        dir,
+        index,
+        offset,
+        entries: Vec::new(),
+        findings: Vec::new(),
+    };
+    let mut padded;
+    let block = if (block.len() as u64) < geometry.block_size {
+        padded = block.to_vec();
+        padded.resize(geometry.block_size as usize, 0);
+        &padded[..]
+    } else {
+        block
+    };
+    let finding = |at: usize, len: usize, detail: String| Finding {
+        structure: Structure::DirBlock { dir, index },
+        offset: offset + at as u64,
+        len: len as u64,
+        detail,
+    };
+    let size = crate::dir::EROFS_DIRENT_SIZE;
+    let nameoff =
+        |i: usize| u16::from_le_bytes([block[i * size + 8], block[i * size + 9]]) as usize;
+
+    let first = nameoff(0);
+    if first < size || first > block.len() || !first.is_multiple_of(size) {
+        evidence.findings.push(finding(
+            8,
+            2,
+            format!("the first name offset is {first}, which places no whole entry array"),
+        ));
+        return evidence;
+    }
+    let count = first / size;
+    let mut previous_end = first;
+    let mut previous_name: Option<Vec<u8>> = None;
+    for i in 0..count {
+        let header = i * size;
+        let start = nameoff(i);
+        if start < previous_end || start >= block.len() {
+            evidence.findings.push(finding(
+                header + 8,
+                2,
+                format!("entry {i}'s name offset {start} is outside its block or overlaps the name before"),
+            ));
+            continue;
+        }
+        // A name runs to the next name offset that is sound: the next
+        // entry's, or past a broken one, the one after. The last runs to
+        // its first NUL, or the block's end.
+        let nul_end = || {
+            block[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map_or(block.len(), |n| start + n)
+        };
+        let end = (i + 1..count)
+            .map(nameoff)
+            .find(|&next| next > start && next <= block.len())
+            .unwrap_or_else(nul_end);
+        let name = &block[start..end];
+        previous_end = end;
+        if name.is_empty() || name.contains(&0) || name.contains(&b'/') {
+            evidence.findings.push(finding(
+                start,
+                name.len().max(1),
+                format!("entry {i}'s name is empty or holds a NUL or '/'"),
+            ));
+            continue;
+        }
+        let nid = u64::from_le_bytes(block[header..header + 8].try_into().unwrap());
+        if geometry
+            .inode_offset(nid)
+            .saturating_add(COMPACT_INODE_SIZE)
+            > geometry.source_len
+        {
+            evidence.findings.push(finding(
+                header,
+                8,
+                format!("entry {i} names nid {nid}, past the source's end"),
+            ));
+        }
+        if previous_name.as_deref().is_some_and(|p| p >= name) {
+            evidence.findings.push(finding(
+                start,
+                name.len(),
+                format!("entry {i}'s name sorts before the name of the entry ahead of it"),
+            ));
+        }
+        previous_name = Some(name.to_vec());
+        evidence.entries.push(DirentEvidence {
+            nid,
+            file_type: block[header + 10],
+            name: name.to_vec(),
+        });
+    }
+    evidence
+}
+
+/// Read every block of a directory, keeping each block's sound entries.
+///
+/// Reads the `FLAT_PLAIN` and `FLAT_INLINE` layouts, which are how
+/// `mkfs.erofs` stores directories. A block that cannot be read is a
+/// finding and the next is read; a directory in another layout is one
+/// finding and no blocks.
+pub fn inspect_directory<R: BlockRead + ?Sized>(
+    source: &R,
+    geometry: &Geometry,
+    dir: &Inode,
+) -> Vec<DirBlockEvidence> {
+    let bs = geometry.block_size;
+    let mut out = Vec::new();
+    let inline = match dir.format.layout {
+        DataLayout::FlatPlain => false,
+        DataLayout::FlatInline => true,
+        other => {
+            out.push(DirBlockEvidence {
+                dir: dir.nid,
+                index: 0,
+                offset: geometry.inode_offset(dir.nid),
+                entries: Vec::new(),
+                findings: vec![Finding {
+                    structure: Structure::Inode { nid: dir.nid },
+                    offset: geometry.inode_offset(dir.nid),
+                    len: 2,
+                    detail: format!("a directory laid out {other:?}, which this does not read"),
+                }],
+            });
+            return out;
+        }
+    };
+    let blocks = dir.size.div_ceil(bs);
+    for index in 0..blocks {
+        let len = (dir.size - index * bs).min(bs);
+        let tail = inline && index + 1 == blocks && !dir.size.is_multiple_of(bs);
+        let offset = if tail {
+            let xattrs = if dir.xattr_icount == 0 {
+                0
+            } else {
+                12 + (u64::from(dir.xattr_icount) - 1) * 4
+            };
+            geometry.inode_offset(dir.nid) + u64::from(dir.on_disk_size) + xattrs
+        } else {
+            (u64::from(dir.raw_u) + index).saturating_mul(bs)
+        };
+        let mut block = vec![0u8; len as usize];
+        match source.read_at(offset, &mut block) {
+            Ok(()) => out.push(inspect_dir_block(&block, offset, dir.nid, index, geometry)),
+            Err(error) => out.push(DirBlockEvidence {
+                dir: dir.nid,
+                index,
+                offset,
+                entries: Vec::new(),
+                findings: vec![Finding {
+                    structure: Structure::DirBlock {
+                        dir: dir.nid,
+                        index,
+                    },
+                    offset,
+                    len,
+                    detail: format!("the block cannot be read: {error}"),
+                }],
+            }),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +979,102 @@ mod tests {
         let evidence = inspect_inode(&SliceDevice::new(bytes), &geometry, 1 << 40);
         assert!(evidence.inode.is_none());
         assert!(evidence.findings[0].detail.contains("the source ends"));
+    }
+
+    fn wide_image() -> Vec<u8> {
+        use crate::mkfs::{Node, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE};
+        let mut entries = std::collections::BTreeMap::new();
+        for i in 0..400 {
+            entries.insert(
+                format!("entry-{i:03}"),
+                Node::File {
+                    mode: DEFAULT_FILE_MODE,
+                    data: format!("{i}\n").into_bytes(),
+                    meta: Default::default(),
+                    xattrs: Vec::new(),
+                },
+            );
+        }
+        let root = Node::Dir {
+            mode: DEFAULT_DIR_MODE,
+            entries,
+            meta: Default::default(),
+            xattrs: Vec::new(),
+        };
+        crate::mkfs::build_image(root, 12).expect("build_image")
+    }
+
+    fn root_dir(bytes: &[u8]) -> (Geometry, Inode) {
+        let geometry = geometry_of(bytes);
+        let root = inspect_inode(
+            &SliceDevice::new(bytes.to_vec()),
+            &geometry,
+            geometry.root_nid,
+        )
+        .inode
+        .expect("root");
+        (geometry, root)
+    }
+
+    #[test]
+    fn a_healthy_directory_lists_as_the_reader_lists_it() {
+        let bytes = wide_image();
+        let (geometry, root) = root_dir(&bytes);
+        let blocks = inspect_directory(&SliceDevice::new(bytes.clone()), &geometry, &root);
+        assert!(blocks.len() > 1, "fixture: more than one block");
+        assert!(blocks.iter().all(|b| b.findings.is_empty()));
+        let fs = crate::Filesystem::open(std::sync::Arc::new(SliceDevice::new(bytes))).unwrap();
+        let want: Vec<(u64, Vec<u8>)> = fs
+            .read_dir(&fs.root_inode().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.nid, e.name))
+            .collect();
+        let got: Vec<(u64, Vec<u8>)> = blocks
+            .into_iter()
+            .flat_map(|b| b.entries)
+            .map(|e| (e.nid, e.name))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_destroyed_block_is_a_finding_and_the_other_blocks_keep_their_entries() {
+        let mut bytes = wide_image();
+        let (geometry, root) = root_dir(&bytes);
+        let healthy = inspect_directory(&SliceDevice::new(bytes.clone()), &geometry, &root);
+        let first = healthy[0].offset as usize;
+        bytes[first..first + 4096].fill(0xFF);
+        let damaged = inspect_directory(&SliceDevice::new(bytes), &geometry, &root);
+        assert!(damaged[0].entries.is_empty());
+        assert_eq!(damaged[0].findings[0].offset, healthy[0].offset + 8);
+        for (got, want) in damaged.iter().zip(&healthy).skip(1) {
+            assert_eq!(got.entries, want.entries, "block {}", want.index);
+            assert!(got.findings.is_empty());
+        }
+    }
+
+    #[test]
+    fn one_bad_entry_is_reported_and_its_neighbours_are_kept() {
+        let bytes = wide_image();
+        let (geometry, root) = root_dir(&bytes);
+        let healthy = inspect_directory(&SliceDevice::new(bytes.clone()), &geometry, &root);
+        let mut block = bytes[healthy[1].offset as usize..][..4096].to_vec();
+        // Entry 5's name offset points into the entry array.
+        block[5 * 12 + 8..5 * 12 + 10].copy_from_slice(&12u16.to_le_bytes());
+        let evidence = inspect_dir_block(&block, healthy[1].offset, root.nid, 1, &geometry);
+        assert_eq!(evidence.findings.len(), 1, "{:?}", evidence.findings);
+        assert_eq!(evidence.findings[0].offset, healthy[1].offset + 5 * 12 + 8);
+        // Entry 4 now runs to entry 6's name; every other entry is kept.
+        let kept: Vec<&DirentEvidence> = healthy[1]
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 4 && *i != 5)
+            .map(|(_, e)| e)
+            .collect();
+        for entry in kept {
+            assert!(evidence.entries.contains(entry), "{:?} lost", entry.name);
+        }
     }
 }
