@@ -50,6 +50,8 @@ pub enum Structure {
         /// The inode's NID.
         nid: u64,
     },
+    /// A stretch of the source a scan could not read.
+    Source,
     /// One block of a directory's entries.
     DirBlock {
         /// The directory's NID.
@@ -1460,6 +1462,125 @@ pub fn inspect_xattrs<R: BlockRead + ?Sized>(
         });
     }
     evidence
+}
+
+/// What a scan covered and where to resume it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanReport {
+    /// The first NID not examined: the end of the range asked for, or
+    /// where the sink stopped the scan. Pass it as the next range's start
+    /// to resume.
+    pub next: u64,
+    /// How many candidates were handed to the sink.
+    pub candidates: u64,
+    /// Stretches of the source that could not be read, skipped.
+    pub findings: Vec<Finding>,
+}
+
+/// A read-only view of one window of the source, so a scan reads the
+/// source in large pieces instead of once per slot.
+struct Window<'a> {
+    base: u64,
+    bytes: &'a [u8],
+    source_len: u64,
+}
+
+impl BlockRead for Window<'_> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        let start = offset.checked_sub(self.base);
+        match start.and_then(|s| self.bytes.get(s as usize..s as usize + buf.len())) {
+            Some(bytes) => {
+                buf.copy_from_slice(bytes);
+                Ok(())
+            }
+            None => Err(fs_core::Error::ShortRead {
+                offset,
+                want: buf.len(),
+                got: 0,
+            }),
+        }
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.source_len
+    }
+}
+
+/// Every 32-byte slot in `nids` that holds a plausible inode: one that
+/// decodes with no findings, names a file type and has a link. Each is
+/// handed to `sink` as evidence, in NID order; the sink returns
+/// `ControlFlow::Break` to stop, and the report says where to resume.
+///
+/// A candidate is a slot that looks like an inode, not proof that one
+/// was written there: inline data, or the second half of an extended
+/// inode, can look like one too. What makes it a file is a directory
+/// naming it, which is for the caller to establish. Every slot is
+/// examined, including those inside a candidate: skipping a candidate's
+/// body would let one false candidate hide the real inodes after it. With the
+/// superblock destroyed, scan a [`Geometry::hypothesis`] whose metadata
+/// area starts at block 0: every inode is then at its byte offset / 32.
+pub fn scan_inodes<R: BlockRead + ?Sized>(
+    source: &R,
+    geometry: &Geometry,
+    nids: std::ops::Range<u64>,
+    mut sink: impl FnMut(InodeEvidence) -> std::ops::ControlFlow<()>,
+) -> ScanReport {
+    const WINDOW: u64 = 1 << 20;
+    let slot = crate::inode::EROFS_INODE_SLOT_SIZE;
+    let mut report = ScanReport {
+        next: nids.start,
+        candidates: 0,
+        findings: Vec::new(),
+    };
+    let mut nid = nids.start;
+    while nid < nids.end {
+        let base = geometry.inode_offset(nid);
+        if base >= geometry.source_len {
+            break;
+        }
+        let window_nids = (WINDOW / slot).min(nids.end - nid);
+        // One extended inode past the window's last slot, so every slot in
+        // it can be read whole.
+        let len = (window_nids * slot + EXTENDED_INODE_SIZE).min(geometry.source_len - base);
+        let mut bytes = vec![0u8; len as usize];
+        if let Err(error) = source.read_at(base, &mut bytes) {
+            report.findings.push(Finding {
+                structure: Structure::Source,
+                offset: base,
+                len,
+                detail: format!(
+                    "{len} bytes cannot be read, so their slots were not examined: {error}"
+                ),
+            });
+            nid += window_nids;
+            report.next = nid;
+            continue;
+        }
+        let window = Window {
+            base,
+            bytes: &bytes,
+            source_len: geometry.source_len,
+        };
+        let end = nid + window_nids;
+        while nid < end {
+            let evidence = inspect_inode(&window, geometry, nid);
+            let plausible = evidence.findings.is_empty()
+                && evidence.inode.as_ref().is_some_and(|inode| inode.nlink > 0);
+            if !plausible {
+                nid += 1;
+                continue;
+            }
+            report.candidates += 1;
+            if sink(evidence).is_break() {
+                report.next = nid + 1;
+                return report;
+            }
+            nid += 1;
+        }
+        report.next = nid;
+    }
+    report.next = report.next.max(nid.min(nids.end));
+    report
 }
 
 #[cfg(test)]
