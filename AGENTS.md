@@ -308,16 +308,26 @@ Two things about the local build, because they cost time otherwise: erofs-utils
 1.9.1 is built without root, and it **defaults to 16K pages** — pass `-b4096`
 where a 4 KiB block is meant. A missing tool **fails** the job; it does not skip.
 
-## The rust-fs-core pin is declared in four places
+## The rust-fs-core pin is declared in three places
 
-`Cargo.toml`, `fuzz/Cargo.toml`, `chores.yml` (`FS_CORE_REF`) and `fuzz.yml`
-(the `git clone --branch` ref) each name the core release this crate builds
-against. A bump moves all four;
-`every_declaration_of_the_am_fs_core_pin_names_the_same_version` in
+`Cargo.toml` and `fuzz/Cargo.toml` take core from crates.io by exact version
+(`version = "=X.Y.Z"`), never by path, and `chores.yml` (`FS_CORE_REF`) checks
+out the same release beside the repository for its scripts. A bump moves all
+three; `every_declaration_of_the_am_fs_core_pin_names_the_same_version` in
 `tests/ci_profile.rs` fails, naming the file left behind, when one is missed
-(#144). The nightly fuzz run was red from the 22nd to the 26th of September on
-a `CachingDevice` overflow core had already fixed, because its clone lagged the
-rest of the crate; it was never a defect here.
+(#144), and `every_manifest_pins_rust_fs_core_by_exact_version_and_not_by_path`
+fails on a committed path dependency.
+
+To build against a local `../rust-fs-core` while changing both, patch it in a
+`.cargo/config.toml`, which is gitignored and never committed:
+
+```toml
+[patch.crates-io]
+rust-fs-core = { path = "../rust-fs-core" }
+```
+
+Remove it, and let `Cargo.lock` return to the registry entry, before
+committing: CI builds `--locked` against the published release.
 
 `fuzz.yml` is nightly cron plus dispatch, so it never reports on a pull request
 and must never be required.

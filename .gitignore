@@ -53,3 +53,9 @@ tests/fixtures/*.zip
 # without them that suite has nothing to run and says so only once CI
 # has already gone red.
 !fuzz/corpus/**
+
+# A LOCAL PATH OVERRIDE OF rust-fs-core, never committed. The manifests pin
+# core by exact version from crates.io; to build against a sibling checkout,
+# put `[patch.crates-io] rust-fs-core = { path = "../rust-fs-core" }` here
+# (or in fuzz/.cargo/config.toml). Unanchored so the fuzz crate's is covered.
+.cargo/config.toml

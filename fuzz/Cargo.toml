@@ -26,7 +26,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 rust-fs-erofs = { path = ".." }
-rust-fs-core = { path = "../../rust-fs-core", version = "0.4.3" }
+# By exact version, as in the parent crate; a local path override goes in
+# a gitignored .cargo/config.toml `[patch.crates-io]`, never here.
+rust-fs-core = { version = "=0.4.3" }
 
 [[bin]]
 name = "image"
