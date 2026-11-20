@@ -712,7 +712,11 @@ jobs:
       pull-requests: read
       actions: write
     steps:
-      - uses: actions/checkout@v4
+      # A job holding a write token runs only code fixed by commit, and
+      # leaves no token on disk (tests/scripts/test-write-jobs-pinned.sh).
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - name: Cancel the layer below's full run, re-run its fast checks
         env:
           EVENT: ${{ github.event_name }}
