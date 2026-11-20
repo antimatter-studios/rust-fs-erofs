@@ -387,11 +387,6 @@ jobs:
           key: ${{ steps.vm-host.outputs.box-cache-key }}
       - name: chore fixtures
         run: chore fixtures
-      - name: Stop the shared guest (no run is still using it)
-        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
-        # stops it only when no suite is using it, so a guest still up
-        # afterwards means a run leaked its session.
-        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
       - uses: actions/upload-artifact@v4
         with:
           name: fixtures
@@ -481,11 +476,6 @@ jobs:
           name: tier-logs-x86_64
           path: tmp/logs/*.log
           if-no-files-found: error
-      - name: Stop the shared guest (no run is still using it)
-        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
-        # stops it only when no suite is using it, so a guest still up
-        # afterwards means a run leaked its session.
-        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
 
   test-arm64-gate:
     needs: fixtures
@@ -603,11 +593,6 @@ jobs:
           name: tier-logs-suite-in-vm
           path: tmp/logs/*.log
           if-no-files-found: error
-      - name: Stop the shared guest (no run is still using it)
-        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
-        # stops it only when no suite is using it, so a guest still up
-        # afterwards means a run leaked its session.
-        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
 
   cli-gate:
     needs: changes
