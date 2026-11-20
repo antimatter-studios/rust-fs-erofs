@@ -109,9 +109,18 @@ env:
   CHORE_VERSION: "0.11.0"
   # Declare conditional jobs to core's static ci-gate contract. This permits
   # their scheduling condition only -- fixtures is skipped for a change to
-  # documentation alone -- and ci-ok still needs every job and rejects
-  # failures, cancellations and any other skip (scripts/ci-verdict.sh).
-  CI_GATE_NON_GATING: "fixtures"
+  # documentation alone, and the heavy jobs below on a lower layer of a
+  # stack -- and ci-ok still needs every job and rejects failures,
+  # cancellations and any other skip (scripts/ci-verdict.sh).
+  CI_GATE_NON_GATING: "fixtures benchmark cli-windows"
+  # FULL SUITE ON THE TOP OF A STACK, FAST CHECKS BELOW (owner-approved
+  # trial, 2026-11-20). The jobs that run only when the changes job says
+  # `heavy` (scripts/ci-heavy.sh): the merge queue, a push to main, a manual
+  # run, the top layer of a stack, and a layer labelled `full-ci`. test,
+  # test-arm64 and suite-in-vm carry no condition of their own: they need
+  # fixtures and are skipped with it. ci-ok accepts the skip of these jobs,
+  # and no others, when heavy is false.
+  HEAVY_JOBS: "benchmark fixtures test test-arm64 suite-in-vm cli-windows"
 
 jobs:
   # Does this change need the full pipeline? rust-fs-core's
@@ -125,8 +134,13 @@ jobs:
   changes:
     name: changes (does this need the full pipeline?)
     runs-on: ubuntu-24.04
+    # Reading which pull requests are stacked on this one, and its labels.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       code: ${{ steps.c.outputs.code }}
+      heavy: ${{ steps.h.outputs.heavy }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -169,6 +183,18 @@ jobs:
           fi
           echo "code=$code ($EVENT${range:+ $range})"
           echo "code=$code" >> "$GITHUB_OUTPUT"
+      - name: Full suite, or fast checks? (the top of a stack runs everything)
+        id: h
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          heavy="$(bash scripts/ci-heavy.sh)"
+          echo "$heavy" >> "$GITHUB_OUTPUT"
 
   unit:
     name: unit (no tools, no VM)
@@ -214,6 +240,7 @@ jobs:
           set -euo pipefail
           command -v jq >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
           bash tests/scripts/ci-verdict.sh
+          bash tests/scripts/ci-heavy.sh
       - name: A signal to scripts/test.sh alone stops the run
         # Here because the shell tier runs after every test tier, and some of
         # its guards need fixtures. This one needs neither,
@@ -248,7 +275,7 @@ jobs:
   benchmark:
     name: EROFS fixed-output LZ4HC performance
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -275,7 +302,7 @@ jobs:
   fixtures:
     name: fixtures (harness VM, x86_64 KVM)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -538,6 +565,7 @@ jobs:
   cli-windows:
     name: cli (Windows ${{ matrix.label }}, the release zip's tools on PATH)
     needs: changes
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -670,7 +698,10 @@ jobs:
       - name: Every job ran and succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
-          # false only for a change to documentation alone: then, and only
-          # then, a skipped job is not a failed one (scripts/ci-verdict.sh).
+          # false only for a change to documentation alone: then a skipped
+          # job is not a failed one (scripts/ci-verdict.sh).
           CODE: ${{ needs.changes.outputs.code }}
+          # false only on a lower layer of a stack: then a skipped job named
+          # in HEAVY_JOBS is not a failed one, and no other skip is accepted.
+          HEAVY: ${{ needs.changes.outputs.heavy }}
         run: echo "$NEEDS" | bash scripts/ci-verdict.sh

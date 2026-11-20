@@ -26,12 +26,15 @@ needs() {
   done
   echo "$out}"
 }
-verdict() { # want code over res
-  local want="$1" code="$2" over="$3" res="$4" got
-  needs "$over" "$res" | CODE="$code" bash scripts/ci-verdict.sh >/dev/null 2>&1
+HEAVY_JOBS="$(sed -n 's/^  HEAVY_JOBS: *"\(.*\)"$/\1/p' .github/workflows/ci.yml)"
+[ -n "$HEAVY_JOBS" ] && ok || bad "ci.yml declares HEAVY_JOBS in its top-level env"
+verdict() { # want code over res [heavy]
+  local want="$1" code="$2" over="$3" res="$4" heavy="${5:-true}" got
+  needs "$over" "$res" | CODE="$code" HEAVY="$heavy" HEAVY_JOBS="$HEAVY_JOBS" \
+    bash scripts/ci-verdict.sh >/dev/null 2>&1
   got=$?
   if { [ "$want" = green ] && [ $got -eq 0 ]; } || { [ "$want" = red ] && [ $got -ne 0 ]; }; then ok
-  else bad "code=$code [$over]=$res: wanted $want, exit $got"; fi
+  else bad "code=$code heavy=$heavy [$over]=$res: wanted $want, exit $got"; fi
 }
 
 verdict green true "" success
@@ -42,12 +45,35 @@ for j in $JOBS; do
   verdict red false "$j" failure        # documentation only still fails a failure
 done
 verdict green false "benchmark fixtures test test-arm64 suite-in-vm" skipped   # documentation only
+
+# THE TOP OF A STACK RUNS EVERYTHING, A LOWER LAYER THE FAST CHECKS
+# (owner-approved trial, 2026-11-20). With HEAVY=false the heavy jobs'
+# skips are accepted -- all of them, or any of them -- and nothing else is.
+verdict green true "$HEAVY_JOBS" skipped false        # a lower layer: heavy jobs skipped by design
+verdict red   true "$HEAVY_JOBS" skipped true         # the top skipping them is a failure
+for j in $JOBS; do
+  verdict red true "$j" failure false                 # a job that ran and failed still fails
+  verdict red true "$j" cancelled false
+  case " $HEAVY_JOBS " in
+    *" $j "*) verdict green true "$j" skipped false ;;
+    *) verdict red true "$j" skipped false ;;         # a fast job's skip is never by design
+  esac
+done
+for j in $HEAVY_JOBS; do
+  case " $JOBS " in *" $j "*) ok ;; *) bad "HEAVY_JOBS names $j, which ci-ok does not need" ;; esac
+done
+needs "" success | CODE=true HEAVY=maybe HEAVY_JOBS="$HEAVY_JOBS" bash scripts/ci-verdict.sh >/dev/null 2>&1 \
+  && bad "HEAVY other than true or false is refused" || ok
+needs "fixtures" skipped | CODE=true HEAVY=false HEAVY_JOBS="" bash scripts/ci-verdict.sh >/dev/null 2>&1 \
+  && bad "HEAVY=false with no HEAVY_JOBS is refused" || ok
 verdict red   ""    "" success                                                  # no CODE, no verdict
+needs "" success | CODE=true bash scripts/ci-verdict.sh >/dev/null 2>&1 && bad "no HEAVY, no verdict" || ok
 verdict red   bogus "" success
 echo '{}' | CODE=true bash scripts/ci-verdict.sh extra >/dev/null 2>&1 && bad "an argument is refused" || ok
 
-# The workflow: ci-ok judges with the script, the unit job runs this
-# test, and no job is gated on the event, so a pull request runs every leg.
+# The workflow: ci-ok judges with the script, the unit job runs this test,
+# and no job is gated on the event itself: which legs a pull request runs is
+# decided by scripts/ci-heavy.sh alone, and the merge queue runs them all.
 wf=.github/workflows/ci.yml
 grep -q 'bash scripts/ci-verdict.sh' "$wf" && ok || bad "ci-ok judges with ci-verdict.sh"
 grep -q 'bash tests/scripts/ci-verdict.sh' "$wf" && ok || bad "the unit job runs this test"
