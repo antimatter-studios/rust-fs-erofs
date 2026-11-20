@@ -359,14 +359,13 @@ impl Superblock {
         if bytes.len() < EROFS_SUPER_BLOCK_SIZE {
             return Err(Error::BadSuperblock("buffer shorter than 128 bytes"));
         }
+        let sb = Self::decode(bytes);
 
-        let magic = u32::from_le_bytes(bytes[offsets::MAGIC].try_into().unwrap());
-        if magic != EROFS_SUPER_MAGIC_V1 {
+        if sb.magic != EROFS_SUPER_MAGIC_V1 {
             return Err(Error::NotErofs);
         }
 
-        let blkszbits = bytes[offsets::BLKSZBITS];
-        if !(MIN_BLKSZBITS..=MAX_BLKSZBITS).contains(&blkszbits) {
+        if !is_valid_blkszbits(sb.blkszbits) {
             return Err(Error::BadSuperblock("blkszbits out of range"));
         }
 
@@ -377,23 +376,43 @@ impl Superblock {
         // `2^(2 * blkszbits)` bytes, not the filesystem block; accepting it
         // read such an image at the wrong granularity. The kernel refuses
         // every nonzero value too.
-        let dirblkbits = bytes[offsets::DIRBLKBITS];
-        if dirblkbits != 0 {
+        if sb.dirblkbits != 0 {
             return Err(Error::BadSuperblock(
                 "dirblkbits is nonzero; only a directory block equal to the filesystem block is supported",
             ));
         }
 
+        Ok(sb)
+    }
+
+    /// Every field of a 128-byte superblock, exactly as stored, checked
+    /// for nothing.
+    ///
+    /// [`Superblock::parse`] is this plus the checks a reader needs before
+    /// trusting the image. A damaged superblock still says something --
+    /// a block size that is wrong, a magic that is gone, fields that are
+    /// fine -- and `crate::primitives::inspect_superblock` reports it
+    /// field by field from here.
+    ///
+    /// # Panics
+    ///
+    /// When `bytes` is shorter than [`EROFS_SUPER_BLOCK_SIZE`].
+    pub fn decode(bytes: &[u8]) -> Self {
+        assert!(
+            bytes.len() >= EROFS_SUPER_BLOCK_SIZE,
+            "a superblock is {EROFS_SUPER_BLOCK_SIZE} bytes, and {} were given",
+            bytes.len()
+        );
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&bytes[offsets::UUID]);
         let mut volume_name = [0u8; 16];
         volume_name.copy_from_slice(&bytes[offsets::VOLUME_NAME]);
 
-        Ok(Superblock {
-            magic,
+        Superblock {
+            magic: u32::from_le_bytes(bytes[offsets::MAGIC].try_into().unwrap()),
             checksum: u32::from_le_bytes(bytes[offsets::CHECKSUM].try_into().unwrap()),
             feature_compat: u32::from_le_bytes(bytes[offsets::FEATURE_COMPAT].try_into().unwrap()),
-            blkszbits,
+            blkszbits: bytes[offsets::BLKSZBITS],
             sb_extslots: bytes[offsets::SB_EXTSLOTS],
             root_nid: u16::from_le_bytes(bytes[offsets::ROOT_NID].try_into().unwrap()),
             inos: u64::from_le_bytes(bytes[offsets::INOS].try_into().unwrap()),
@@ -412,13 +431,13 @@ impl Superblock {
             u1: u16::from_le_bytes(bytes[offsets::U1].try_into().unwrap()),
             extra_devices: u16::from_le_bytes(bytes[offsets::EXTRA_DEVICES].try_into().unwrap()),
             devt_slotoff: u16::from_le_bytes(bytes[offsets::DEVT_SLOTOFF].try_into().unwrap()),
-            dirblkbits,
+            dirblkbits: bytes[offsets::DIRBLKBITS],
             xattr_prefix_count: bytes[offsets::XATTR_PREFIX_COUNT],
             xattr_prefix_start: u32::from_le_bytes(
                 bytes[offsets::XATTR_PREFIX_START].try_into().unwrap(),
             ),
             packed_nid: u64::from_le_bytes(bytes[offsets::PACKED_NID].try_into().unwrap()),
-        })
+        }
     }
 
     pub fn block_size(&self) -> u64 {
