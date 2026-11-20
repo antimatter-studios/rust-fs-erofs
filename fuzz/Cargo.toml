@@ -28,7 +28,7 @@ libfuzzer-sys = "0.4"
 rust-fs-erofs = { path = ".." }
 # By exact version, as in the parent crate; a local path override goes in
 # a gitignored .cargo/config.toml `[patch.crates-io]`, never here.
-rust-fs-core = { version = "=0.4.3" }
+rust-fs-core = { version = "=0.5.0", features = ["layers"] }
 
 [[bin]]
 name = "image"

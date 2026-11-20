@@ -9,12 +9,12 @@ Every rust-fs driver exposes the same three layers (rust-fs-core#453):
   structures, plus the format-neutral salvage verbs.
 - **FileAPI**: browse, stat, read and copy on a healthy volume.
 
-This page maps what rust-fs-erofs exposes today onto those layers, names
-what is missing, and says what each missing piece will do. It is the plan
-for #311. Until rust-fs-core publishes the shared traits, the layers are
-built here as ordinary types; when core's release is out they implement
-its traits, and the public API this page lists as "today" stays one release
-as a deprecated wrapper.
+This page maps the API onto those layers. It was the plan for #311; the
+layers are now `src/layers.rs` (`ErofsVolume`, `ErofsSalvage`) over the
+EROFS primitives in `src/primitives.rs`, on rust-fs-core 0.5's
+`fs_core::layers`. Nothing was renamed or removed: `Filesystem` is the
+strict reader `FileAPI` wraps, so there is no deprecated wrapper to keep.
+The trait misfits found doing this are on rust-fs-core#453.
 
 ## What makes EROFS different
 
