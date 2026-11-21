@@ -35,6 +35,7 @@ pub mod dir;
 pub mod error;
 pub mod fs;
 pub mod inode;
+pub mod layers;
 pub mod layout;
 mod lz4hc;
 pub mod mkfs;

@@ -77,8 +77,9 @@ cli = ["dep:clap", "rust-fs-core/cli"]
 #   rust-fs-core = { path = "../rust-fs-core" }
 #
 # The same release is named in fuzz/Cargo.toml, chores.yml (FS_CORE_REF) and
-# fuzz.yml; tests/ci_profile.rs fails when they disagree.
-rust-fs-core = { version = "=0.4.3" }
+# fuzz.yml; tests/ci_profile.rs fails when they disagree. The `layers`
+# feature is the three driver API layers (src/layers.rs).
+rust-fs-core = { version = "=0.5.1", features = ["layers"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 lzma-rs = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
