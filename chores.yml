@@ -499,11 +499,11 @@ tasks:
     # deliberate corruption the kernel has to refuse.
     cmds:
       - scripts/tools.sh --check
-      # BUDGET: tests/primitive_inode_kernel.rs joined; measured 464 lines, 36,181 bytes
+      # BUDGET: tests/primitive_dir_kernel.rs joined; measured 496 lines, 39,299 bytes
       # (main at a25af53 printed 404 lines, 30,253 bytes in CI run 44689909094;
       # each stacked test file measured in the harness guest, its section of the
       # tier's output). The budget leaves about 5% for the next test.
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 490 38000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 520 41300 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
     # 5: the 3 measured on main at ca0c577 (CI run 36351672753) -- the
     # third being the readlink kernel oracle #139 added -- plus the two
     # #125 added: the deduplicated images read back through the kernel,
@@ -531,7 +531,8 @@ tasks:
       # primitive_superblock_oracle.rs: superblock evidence against
       # dump.erofs, and damage fsck.erofs or the kernel refuses. 42 with
       # primitive_inode_kernel.rs: inode evidence against the kernel's stat.
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 42'
+      # 44 with primitive_dir_kernel.rs: directory blocks against ls -ai.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 44'
 
   test:android:
     desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
