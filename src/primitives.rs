@@ -1464,6 +1464,26 @@ pub fn inspect_xattrs<R: BlockRead + ?Sized>(
     evidence
 }
 
+/// Whether the bits a writer leaves zero are zero: the format word above
+/// the version and layout (bit 4, the one-link flag of newer images, is
+/// allowed), and the reserved tail of the inode (4 bytes at 0x1C of a
+/// compact inode, 16 at 0x30 of an extended one). Data that happens to
+/// decode as an inode rarely clears all of them; an inode a writer wrote
+/// always does.
+fn reserved_fields_are_clear(raw: &[u8]) -> bool {
+    let format = u16::from_le_bytes([raw[0], raw[1]]);
+    if format >> 5 != 0 {
+        return false;
+    }
+    let reserved = if format & 1 == 0 {
+        0x1C..0x20
+    } else {
+        0x30..0x40
+    };
+    raw.get(reserved)
+        .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
+}
+
 /// What a scan covered and where to resume it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanReport {
@@ -1507,7 +1527,10 @@ impl BlockRead for Window<'_> {
 }
 
 /// Every 32-byte slot in `nids` that holds a plausible inode: one that
-/// decodes with no findings, names a file type and has a link. Each is
+/// decodes, names a file type, has a link, and leaves the format's
+/// reserved bits and fields zero. A plausible inode with findings (data
+/// past the source, an inline tail across a block) is still a candidate:
+/// its findings travel with it. Each is
 /// handed to `sink` as evidence, in NID order; the sink returns
 /// `ControlFlow::Break` to stop, and the report says where to resume.
 ///
@@ -1564,8 +1587,11 @@ pub fn scan_inodes<R: BlockRead + ?Sized>(
         let end = nid + window_nids;
         while nid < end {
             let evidence = inspect_inode(&window, geometry, nid);
-            let plausible = evidence.findings.is_empty()
-                && evidence.inode.as_ref().is_some_and(|inode| inode.nlink > 0);
+            // A damaged inode is still a candidate -- its findings say what
+            // is wrong with it -- as long as it decodes as an inode at all.
+            let plausible = evidence.inode.as_ref().is_some_and(|inode| {
+                inode.nlink > 0 && inode.file_type() != crate::inode::FileType::Unknown
+            }) && reserved_fields_are_clear(&evidence.raw);
             if !plausible {
                 nid += 1;
                 continue;
