@@ -72,13 +72,13 @@ grep -q 'HEAVY: ${{ needs.changes.outputs.heavy }}' "$wf" && ok || bad "ci-ok pa
 grep -q 'HEAVY_NOW: ${{ steps.now.outputs.heavy }}' "$wf" && ok || bad "ci-ok asks again and passes HEAVY_NOW"
 grep -q 'top: ${{ steps.h.outputs.top }}' "$wf" && ok || bad "the changes job outputs top"
 grep -q 'pull-requests: read' "$wf" && ok || bad "the changes job may read pull requests"
-for job in benchmark fixtures cli-windows; do
+for job in benchmark fixtures cli-windows-x86_64 cli-windows-arm64; do
   awk -v j="  $job:" '$0 == j {f=1; next} f && /^  [a-z]/ {f=0} f' "$wf" |
     grep -q "needs.changes.outputs.heavy == 'true'" && ok || bad "$job is gated on heavy"
 done
 for job in test test-arm64 suite-in-vm; do
   awk -v j="  $job:" '$0 == j {f=1; next} f && /^  [a-z]/ {f=0} f' "$wf" |
-    grep -q '^    needs: fixtures' && ok || bad "$job needs fixtures, so it is skipped with it"
+    grep -q '^    needs: \[fixtures' && ok || bad "$job needs fixtures, so it is skipped with it"
 done
 
 [ "$fail" -eq 0 ] || { printf 'ci-heavy: %d passed, %d failed\n' "$pass" "$fail"; exit 1; }

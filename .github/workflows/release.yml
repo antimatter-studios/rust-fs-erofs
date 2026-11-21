@@ -13,12 +13,28 @@ env:
   CHORE_VERSION: "0.11.0"
 
 jobs:
+  test-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
   test:
     name: test
-    runs-on: ubuntu-24.04
+    needs: test-gate
+    runs-on: ${{ needs.test-gate.outputs.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
 
       - name: Install chore
         run: scripts/ci-install-chore.sh
@@ -115,6 +131,16 @@ jobs:
       # tarballs (#185); the cli-windows job in ci.yml tests the same zip.
       windows: true
 
+  winget-gate:
+    needs: [cli]
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick windows-x64
+
   # WINGET, after the release holds the zips it will point at. The first
   # version is submitted by hand (winget/README.md); every later one is
   # submitted from here, by wingetcreate, as a pull request from the fork the
@@ -122,8 +148,8 @@ jobs:
   # release is not failed for a submission nobody configured.
   winget:
     name: submit the new version to winget
-    needs: [cli]
-    runs-on: windows-latest
+    needs: [cli, winget-gate]
+    runs-on: ${{ needs.winget-gate.outputs.runner }}
     permissions:
       contents: read
     env:
@@ -144,10 +170,20 @@ jobs:
             --urls "$base/rust-fs-erofs-$version-windows-x86_64.zip|x64" "$base/rust-fs-erofs-$version-windows-arm64.zip|arm64" `
             --submit --token $env:WINGET_TOKEN
 
+  publish-gate:
+    needs: test
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   publish:
     name: publish to crates.io
-    needs: test
-    runs-on: ubuntu-latest
+    needs: [test, publish-gate]
+    runs-on: ${{ needs.publish-gate.outputs.runner }}
     environment: release
     # The only job with any write grant, because it is the only one that
     # needs one: an OIDC token for crates.io trusted publishing and for
@@ -161,6 +197,12 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
 
       - name: Install chore
         run: scripts/ci-install-chore.sh
