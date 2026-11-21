@@ -15,6 +15,11 @@
 
 use fs_core::BlockRead;
 
+use crate::inode::{
+    Inode, COMPACT_INODE_SIZE, EXTENDED_INODE_SIZE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK,
+    S_IFMT, S_IFREG, S_IFSOCK,
+};
+use crate::layout::DataLayout;
 use crate::superblock::{
     is_valid_blkszbits, Superblock, EROFS_FEATURE_COMPAT_SB_CHKSUM,
     EROFS_FEATURE_INCOMPAT_SUPPORTED, EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_MAGIC_V1,
@@ -28,6 +33,12 @@ pub enum Structure {
     /// The 128-byte superblock at byte 1024, and the checksum span after
     /// it.
     Superblock,
+    /// The inode with this NID: its 32 or 64 bytes, inline xattrs and
+    /// inline tail.
+    Inode {
+        /// The inode's NID.
+        nid: u64,
+    },
 }
 
 /// One thing found wrong with a structure, and where.
@@ -320,6 +331,186 @@ pub fn inspect_superblock<R: BlockRead + ?Sized>(source: &R) -> SuperblockEviden
     evidence
 }
 
+/// An inode as found at a NID, whatever state it is in.
+#[derive(Debug, Clone)]
+pub struct InodeEvidence {
+    /// The NID asked for.
+    pub nid: u64,
+    /// Where it was read: [`Geometry::inode_offset`].
+    pub offset: u64,
+    /// The bytes read there: 64, or fewer when the source ends sooner.
+    pub raw: Vec<u8>,
+    /// The inode, decoded field by field, when its format word names a
+    /// version and a data layout this crate knows -- whether or not the
+    /// fields make sense. [`InodeEvidence::findings`] says which do not.
+    /// A compact inode's `mtime` is left as stored, relative to the
+    /// image's build time, which only the superblock holds.
+    pub inode: Option<Inode>,
+    /// Everything wrong with it.
+    pub findings: Vec<Finding>,
+}
+
+/// Read the inode at `nid` of a source that may be damaged.
+///
+/// Never fails. Checked, in the order reported:
+///
+/// - the inode can be read, compact (32 bytes) or extended (64);
+/// - its format word names a data layout;
+/// - its mode names a file type;
+/// - a directory is not empty, and a symlink's target is no longer than
+///   a block;
+/// - for `FLAT_INLINE`, its tail lies in one block, as the kernel
+///   requires;
+/// - for `FLAT_PLAIN` and `FLAT_INLINE`, the data blocks lie inside the
+///   source.
+pub fn inspect_inode<R: BlockRead + ?Sized>(
+    source: &R,
+    geometry: &Geometry,
+    nid: u64,
+) -> InodeEvidence {
+    let offset = geometry.inode_offset(nid);
+    let mut evidence = InodeEvidence {
+        nid,
+        offset,
+        raw: Vec::new(),
+        inode: None,
+        findings: Vec::new(),
+    };
+    let finding = |at: u64, len: u64, detail: String| Finding {
+        structure: Structure::Inode { nid },
+        offset: at,
+        len,
+        detail,
+    };
+
+    let available = geometry
+        .source_len
+        .saturating_sub(offset)
+        .min(EXTENDED_INODE_SIZE);
+    if available < COMPACT_INODE_SIZE {
+        evidence.findings.push(finding(
+            offset,
+            COMPACT_INODE_SIZE,
+            format!(
+                "the inode is at byte {offset}, and the source ends at {}",
+                geometry.source_len
+            ),
+        ));
+        return evidence;
+    }
+    let mut raw = vec![0u8; available as usize];
+    if let Err(error) = source.read_at(offset, &mut raw) {
+        evidence.findings.push(finding(
+            offset,
+            available,
+            format!("the inode cannot be read: {error}"),
+        ));
+        return evidence;
+    }
+    evidence.raw = raw;
+
+    let raw_format = u16::from_le_bytes([evidence.raw[0], evidence.raw[1]]);
+    if raw_format & 1 == 1 && available < EXTENDED_INODE_SIZE {
+        evidence.findings.push(finding(
+            offset,
+            EXTENDED_INODE_SIZE,
+            format!("the inode is extended, and the source ends {available} bytes into it"),
+        ));
+        return evidence;
+    }
+    let inode = match Inode::parse(nid, &evidence.raw) {
+        Ok(inode) => inode,
+        Err(_) => {
+            evidence.findings.push(finding(
+                offset,
+                2,
+                format!(
+                    "the format word {raw_format:#06x} names data layout {}, which EROFS does not have",
+                    (raw_format >> 1) & 0b111
+                ),
+            ));
+            return evidence;
+        }
+    };
+    let findings = &mut evidence.findings;
+    let body = u64::from(inode.on_disk_size);
+
+    if !matches!(
+        inode.mode & S_IFMT,
+        S_IFREG | S_IFDIR | S_IFLNK | S_IFCHR | S_IFBLK | S_IFIFO | S_IFSOCK
+    ) {
+        findings.push(finding(
+            offset + 4,
+            2,
+            format!("mode {:#08o} names no file type", inode.mode),
+        ));
+    }
+    if inode.is_dir() && inode.size == 0 {
+        findings.push(finding(
+            offset + 8,
+            4,
+            "a directory with no entries, not even . and ..".into(),
+        ));
+    }
+    if inode.is_symlink() && inode.size > geometry.block_size {
+        findings.push(finding(
+            offset + 8,
+            4,
+            format!(
+                "a symlink target of {} bytes, longer than a block",
+                inode.size
+            ),
+        ));
+    }
+
+    let xattr_size = if inode.xattr_icount == 0 {
+        0
+    } else {
+        12 + (u64::from(inode.xattr_icount) - 1) * 4
+    };
+    let body_end = offset + body + xattr_size;
+    match inode.format.layout {
+        DataLayout::FlatPlain | DataLayout::FlatInline => {
+            let whole_blocks = if inode.format.layout == DataLayout::FlatInline {
+                inode.size / geometry.block_size
+            } else {
+                inode.size.div_ceil(geometry.block_size)
+            };
+            let start = u64::from(inode.raw_u).saturating_mul(geometry.block_size);
+            let end = start.saturating_add(whole_blocks.saturating_mul(geometry.block_size));
+            if whole_blocks > 0 && end > geometry.source_len {
+                findings.push(finding(
+                    offset + 0x10,
+                    4,
+                    format!(
+                        "data blocks {} to {} run past the source's end",
+                        inode.raw_u,
+                        u64::from(inode.raw_u) + whole_blocks - 1
+                    ),
+                ));
+            }
+            if inode.format.layout == DataLayout::FlatInline {
+                // The kernel's rule (erofs_map_blocks_flatmode): the tail
+                // starts where the inode and its xattrs end, and must lie
+                // in one block -- that one, not the inode's, which an
+                // extended inode at a block's end leaves behind.
+                let tail = inode.size % geometry.block_size;
+                if tail > 0 && body_end % geometry.block_size + tail > geometry.block_size {
+                    findings.push(finding(
+                        offset + 8,
+                        4,
+                        format!("an inline tail of {tail} bytes runs past the end of its block"),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    evidence.inode = Some(inode);
+    evidence
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +632,128 @@ mod tests {
         assert_eq!(g.inode_offset(36), 4096 + 36 * 32);
         assert!(Geometry::hypothesis(3000, 1, 0, 1 << 20).is_none());
         assert!(Geometry::hypothesis(256, 1, 0, 1 << 20).is_none());
+    }
+
+    fn tree_image() -> Vec<u8> {
+        use crate::mkfs::{Node, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE};
+        let file = |data: Vec<u8>| Node::File {
+            mode: DEFAULT_FILE_MODE,
+            data,
+            meta: Default::default(),
+            xattrs: Vec::new(),
+        };
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert("small.txt".to_string(), file(b"small\n".to_vec()));
+        entries.insert("big.bin".to_string(), file(vec![7u8; 3 * 4096]));
+        let root = Node::Dir {
+            mode: DEFAULT_DIR_MODE,
+            entries,
+            meta: Default::default(),
+            xattrs: Vec::new(),
+        };
+        crate::mkfs::build_image(root, 12).expect("build_image")
+    }
+
+    fn geometry_of(bytes: &[u8]) -> Geometry {
+        inspect_superblock(&SliceDevice::new(bytes.to_vec()))
+            .geometry()
+            .expect("geometry")
+    }
+
+    fn nid_of(bytes: &[u8], path: &str) -> u64 {
+        let fs = crate::Filesystem::open(std::sync::Arc::new(SliceDevice::new(bytes.to_vec())))
+            .expect("open");
+        fs.lookup_path(path).expect("lookup").nid
+    }
+
+    #[test]
+    fn every_healthy_inode_decodes_as_the_reader_reads_it_with_no_findings() {
+        let bytes = tree_image();
+        let geometry = geometry_of(&bytes);
+        let fs = crate::Filesystem::open(std::sync::Arc::new(SliceDevice::new(bytes.clone())))
+            .expect("open");
+        for path in ["/", "/small.txt", "/big.bin"] {
+            let want = fs.lookup_path(path).expect("lookup");
+            let evidence = inspect_inode(&SliceDevice::new(bytes.clone()), &geometry, want.nid);
+            assert_eq!(evidence.findings, Vec::new(), "{path}");
+            let got = evidence.inode.expect("decoded");
+            assert_eq!(
+                (got.mode, got.size, got.nlink, got.raw_u),
+                (want.mode, want.size, want.nlink, want.raw_u),
+                "{path}"
+            );
+            assert_eq!(evidence.offset, geometry.inode_offset(want.nid));
+        }
+    }
+
+    #[test]
+    fn an_unknown_data_layout_is_a_finding_and_keeps_the_raw_bytes() {
+        let mut bytes = tree_image();
+        let geometry = geometry_of(&bytes);
+        let nid = nid_of(&bytes, "/small.txt");
+        let at = geometry.inode_offset(nid) as usize;
+        bytes[at] = (bytes[at] & 0b1) | (7 << 1);
+        let evidence = inspect_inode(&SliceDevice::new(bytes), &geometry, nid);
+        assert!(evidence.inode.is_none());
+        assert_eq!(evidence.raw.len(), 64);
+        assert_eq!(evidence.findings[0].offset, at as u64);
+        assert!(evidence.findings[0].detail.contains("data layout 7"));
+        assert_eq!(evidence.findings[0].structure, Structure::Inode { nid });
+    }
+
+    #[test]
+    fn a_mode_without_a_file_type_is_a_finding_and_the_fields_are_kept() {
+        let mut bytes = tree_image();
+        let geometry = geometry_of(&bytes);
+        let nid = nid_of(&bytes, "/small.txt");
+        let at = geometry.inode_offset(nid) as usize;
+        bytes[at + 4..at + 6].copy_from_slice(&0o644u16.to_le_bytes());
+        let evidence = inspect_inode(&SliceDevice::new(bytes), &geometry, nid);
+        assert_eq!(evidence.inode.as_ref().expect("decoded").size, 6);
+        assert!(evidence.findings[0].detail.contains("names no file type"));
+    }
+
+    #[test]
+    fn data_past_the_source_and_an_inline_tail_past_its_block_are_findings() {
+        let bytes = tree_image();
+        let geometry = geometry_of(&bytes);
+        let big = nid_of(&bytes, "/big.bin");
+        let mut moved = bytes.clone();
+        let at = geometry.inode_offset(big) as usize;
+        moved[at + 0x10..at + 0x14].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+        let evidence = inspect_inode(&SliceDevice::new(moved), &geometry, big);
+        assert!(
+            evidence
+                .findings
+                .iter()
+                .any(|f| f.detail.contains("past the source's end")),
+            "{:?}",
+            evidence.findings
+        );
+
+        let small = nid_of(&bytes, "/small.txt");
+        let mut long = bytes.clone();
+        let at = geometry.inode_offset(small) as usize;
+        let inline = crate::inode::Inode::parse(small, &long[at..at + 64]).unwrap();
+        assert_eq!(inline.format.layout, DataLayout::FlatInline, "fixture");
+        long[at + 8..at + 12].copy_from_slice(&4095u32.to_le_bytes());
+        let evidence = inspect_inode(&SliceDevice::new(long), &geometry, small);
+        assert!(
+            evidence
+                .findings
+                .iter()
+                .any(|f| f.detail.contains("inline tail")),
+            "{:?}",
+            evidence.findings
+        );
+    }
+
+    #[test]
+    fn an_inode_past_the_source_is_a_finding_not_an_error() {
+        let bytes = tree_image();
+        let geometry = geometry_of(&bytes);
+        let evidence = inspect_inode(&SliceDevice::new(bytes), &geometry, 1 << 40);
+        assert!(evidence.inode.is_none());
+        assert!(evidence.findings[0].detail.contains("the source ends"));
     }
 }
