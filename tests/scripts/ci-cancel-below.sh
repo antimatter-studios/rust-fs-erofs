@@ -106,15 +106,18 @@ EVENT=push bash scripts/ci-cancel-below.sh extra >/dev/null 2>&1 && bad "an argu
 
 # The workflow: its own job, after changes, allowed to write actions,
 # needed by ci-ok; unit needs changes, so re-running changes re-runs it.
+# grep without -q: with -q it exits at its first match, and a block longer than
+# one pipe buffer then kills its writer with SIGPIPE, which pipefail reports as
+# a failed check on a runner whose awk flushes in chunks.
 wf=.github/workflows/ci.yml
 block() { awk -v j="  $1:" '$0 == j {f=1; next} f && /^  [a-z]/ {f=0} f' "$wf"; }
-block below | grep -q 'bash scripts/ci-cancel-below.sh' && ok || bad "the below job runs ci-cancel-below.sh"
-block below | grep -q 'actions: write' && ok || bad "the below job may cancel and re-run"
-block below | grep -q '^    needs: \[changes' && ok || bad "the below job needs changes for its top answer"
-block ci-ok | grep -q 'needs: \[changes-gate, changes, below-gate, below,' && ok || bad "ci-ok needs the below job"
-block unit | grep -q '^    needs: \[changes' && ok || bad "unit needs changes, so the re-run brings it back"
+block below | grep 'bash scripts/ci-cancel-below.sh' >/dev/null && ok || bad "the below job runs ci-cancel-below.sh"
+block below | grep 'actions: write' >/dev/null && ok || bad "the below job may cancel and re-run"
+block below | grep '^    needs: \[changes' >/dev/null && ok || bad "the below job needs changes for its top answer"
+block ci-ok | grep 'needs: \[changes-gate, changes, below-gate, below,' >/dev/null && ok || bad "ci-ok needs the below job"
+block unit | grep '^    needs: \[changes' >/dev/null && ok || bad "unit needs changes, so the re-run brings it back"
 for j in cli semver; do
-  block "$j" | grep -q '^    needs: \[changes' && ok || bad "$j needs changes, so the re-run brings it back"
+  block "$j" | grep '^    needs: \[changes' >/dev/null && ok || bad "$j needs changes, so the re-run brings it back"
 done
 
 [ "$fail" -eq 0 ] || { printf 'ci-cancel-below: %d passed, %d failed\n' "$pass" "$fail"; exit 1; }
