@@ -39,6 +39,12 @@ pub enum Structure {
         /// The inode's NID.
         nid: u64,
     },
+    /// The map from a file's bytes to the source: a chunk index or a
+    /// compressed file's cluster map.
+    DataMap {
+        /// The file's NID.
+        nid: u64,
+    },
     /// One block of a directory's entries.
     DirBlock {
         /// The directory's NID.
@@ -735,6 +741,344 @@ pub fn inspect_directory<R: BlockRead + ?Sized>(
     out
 }
 
+/// Where one run of a file's bytes is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtentSource {
+    /// Stored as is, starting at this source byte of `device` (0 is the
+    /// primary device, `k` the `k`th extra device).
+    Plain {
+        /// Device the bytes are on.
+        device: u16,
+        /// Source byte offset of the run's first byte.
+        offset: u64,
+    },
+    /// Stored as is inside the metadata area, after the inode: a
+    /// `FLAT_INLINE` tail, or a compressed file's inline (ztailpacked)
+    /// pcluster when it is stored uncompressed.
+    Inline {
+        /// Source byte offset of the run's first byte.
+        offset: u64,
+    },
+    /// Declared absent: a chunk with no block, read as zeros.
+    Hole,
+    /// One physical cluster that decodes to the file bytes
+    /// `decoded_start..decoded_end`, of which this extent is the part
+    /// from its `logical` offset on.
+    Pcluster {
+        /// Device the pcluster is on.
+        device: u16,
+        /// Source byte offset of the pcluster's first byte.
+        offset: u64,
+        /// The pcluster's stored length, in bytes. For a file's last
+        /// pcluster this is an upper bound, as the cluster map gives none.
+        stored_len: u64,
+        /// The codec, or `None` when the pcluster is stored uncompressed.
+        algorithm: Option<crate::decompress::Algorithm>,
+        /// True when the pcluster is inline, in the metadata area after
+        /// the inode (ztailpacking), rather than in data blocks.
+        inline: bool,
+        /// First file byte the pcluster decodes to.
+        decoded_start: u64,
+        /// File byte after the last one it decodes to.
+        decoded_end: u64,
+    },
+    /// Stored in the packed inode's data (a fragment), from this byte of
+    /// the packed inode's contents.
+    Fragment {
+        /// NID of the packed inode.
+        packed_nid: u64,
+        /// Offset in the packed inode's contents.
+        offset: u64,
+    },
+}
+
+/// One run of a file's bytes and where it is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataExtent {
+    /// First file byte of the run.
+    pub logical: u64,
+    /// Length of the run, in file bytes.
+    pub len: u64,
+    /// Where it is.
+    pub source: ExtentSource,
+}
+
+/// Why a walk of a file's data stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalkEnd {
+    /// Every byte of the file is mapped.
+    Complete,
+    /// The map could not be followed past the last extent; the finding
+    /// says where and why. The bytes after it are unmapped, not zero.
+    Broken(Finding),
+}
+
+/// A file's data, mapped as far as the map can be followed.
+#[derive(Debug, Clone)]
+pub struct DataWalk {
+    /// The file's NID.
+    pub nid: u64,
+    /// The runs mapped, in file order, with no gaps between them.
+    pub extents: Vec<DataExtent>,
+    /// Why the walk stopped.
+    pub end: WalkEnd,
+}
+
+/// Map a file's bytes to where they are stored, as far as its map can be
+/// followed.
+///
+/// Reads every layout: `FLAT_PLAIN`, `FLAT_INLINE`, `CHUNK_BASED` and the
+/// two compressed ones. A compressed file needs the superblock's fields
+/// (its feature bits say how the cluster map is laid out), so it takes
+/// `superblock`, decoded however damaged; without one a compressed or
+/// chunked file's walk is broken at its start. Nothing is decompressed:
+/// this says where bytes are, not what they are. An extent that runs past
+/// the source's end ends the walk as broken, before that extent.
+pub fn walk_data<R: BlockRead + ?Sized>(
+    source: &R,
+    geometry: &Geometry,
+    superblock: Option<&Superblock>,
+    inode: &Inode,
+) -> DataWalk {
+    let nid = inode.nid;
+    let bs = geometry.block_size;
+    let mut walk = DataWalk {
+        nid,
+        extents: Vec::new(),
+        end: WalkEnd::Complete,
+    };
+    let inode_at = geometry.inode_offset(nid);
+    let broken = |detail: String| {
+        WalkEnd::Broken(Finding {
+            structure: Structure::DataMap { nid },
+            offset: inode_at,
+            len: u64::from(inode.on_disk_size),
+            detail,
+        })
+    };
+    let in_source = |offset: u64, len: u64| offset.saturating_add(len) <= geometry.source_len;
+    let push = |walk: &mut DataWalk, logical: u64, len: u64, source: ExtentSource| {
+        // Coalesce a run that continues the one before it.
+        if let Some(last) = walk.extents.last_mut() {
+            let continues = match (&last.source, &source) {
+                (ExtentSource::Hole, ExtentSource::Hole) => true,
+                (
+                    ExtentSource::Plain {
+                        device: d0,
+                        offset: o0,
+                    },
+                    ExtentSource::Plain {
+                        device: d1,
+                        offset: o1,
+                    },
+                ) => d0 == d1 && o0 + last.len == *o1,
+                _ => false,
+            };
+            if continues && last.logical + last.len == logical {
+                last.len += len;
+                return;
+            }
+        }
+        walk.extents.push(DataExtent {
+            logical,
+            len,
+            source,
+        });
+    };
+    if inode.size == 0 {
+        return walk;
+    }
+
+    match inode.format.layout {
+        DataLayout::FlatPlain | DataLayout::FlatInline => {
+            let inline = inode.format.layout == DataLayout::FlatInline;
+            let tail = if inline { inode.size % bs } else { 0 };
+            let plain = inode.size - tail;
+            let start = u64::from(inode.raw_u).saturating_mul(bs);
+            if plain > 0 {
+                if !in_source(start, plain.div_ceil(bs) * bs) {
+                    walk.end = broken(format!(
+                        "data blocks from {} run past the source's end",
+                        inode.raw_u
+                    ));
+                    return walk;
+                }
+                push(
+                    &mut walk,
+                    0,
+                    plain,
+                    ExtentSource::Plain {
+                        device: 0,
+                        offset: start,
+                    },
+                );
+            }
+            if tail > 0 {
+                let xattrs = if inode.xattr_icount == 0 {
+                    0
+                } else {
+                    12 + (u64::from(inode.xattr_icount) - 1) * 4
+                };
+                let offset = inode_at + u64::from(inode.on_disk_size) + xattrs;
+                if !in_source(offset, tail) {
+                    walk.end = broken("the inline tail runs past the source's end".into());
+                    return walk;
+                }
+                push(&mut walk, plain, tail, ExtentSource::Inline { offset });
+            }
+        }
+        DataLayout::ChunkBased => {
+            let Some(sb) = superblock else {
+                walk.end = broken("a chunk index cannot be read without the superblock".into());
+                return walk;
+            };
+            let info = match crate::chunked::chunk_info(sb, inode) {
+                Ok(info) => info,
+                Err(error) => {
+                    walk.end = broken(format!("the chunk format does not decode: {error}"));
+                    return walk;
+                }
+            };
+            for chunk in 0..info.n_chunks {
+                let logical = chunk * info.chunk_size;
+                let len = info.chunk_size.min(inode.size - logical);
+                match crate::chunked::lookup_chunk_blkaddr(source, sb, inode, chunk) {
+                    Ok((crate::chunked::EROFS_NULL_ADDR, _)) => {
+                        push(&mut walk, logical, len, ExtentSource::Hole)
+                    }
+                    Ok((blkaddr, device)) => {
+                        let offset = u64::from(blkaddr).saturating_mul(bs);
+                        if device == 0 && !in_source(offset, len.div_ceil(bs) * bs) {
+                            walk.end = broken(format!(
+                                "chunk {chunk} at block {blkaddr} runs past the source's end"
+                            ));
+                            return walk;
+                        }
+                        push(
+                            &mut walk,
+                            logical,
+                            len,
+                            ExtentSource::Plain { device, offset },
+                        );
+                    }
+                    Err(error) => {
+                        walk.end = broken(format!("chunk {chunk}'s index cannot be read: {error}"));
+                        return walk;
+                    }
+                }
+            }
+        }
+        DataLayout::Compression | DataLayout::CompressionLegacy => {
+            let Some(sb) = superblock else {
+                walk.end = broken("a cluster map cannot be read without the superblock".into());
+                return walk;
+            };
+            walk_compressed(source, geometry, sb, inode, &mut walk, &broken);
+        }
+    }
+    walk
+}
+
+fn walk_compressed<R: BlockRead + ?Sized>(
+    source: &R,
+    geometry: &Geometry,
+    sb: &Superblock,
+    inode: &Inode,
+    walk: &mut DataWalk,
+    broken: &dyn Fn(String) -> WalkEnd,
+) {
+    use crate::zmap::{ZMap, Z_EROFS_LCLUSTER_TYPE_PLAIN};
+    let bs = geometry.block_size;
+    let zmap = match ZMap::open(source, sb, inode) {
+        Ok(zmap) => zmap,
+        Err(error) => {
+            walk.end = broken(format!("the cluster map header does not decode: {error}"));
+            return;
+        }
+    };
+    let fragment = match zmap.fragment_range(source) {
+        Ok(fragment) => fragment,
+        Err(error) => {
+            walk.end = broken(format!("the fragment does not decode: {error}"));
+            return;
+        }
+    };
+    let inline_tail = zmap.tail_inline_offset_and_size();
+    let mut cursor = 0u64;
+    while cursor < inode.size {
+        if let Some((fragment_off, start, end)) = fragment {
+            if cursor >= start && cursor < end {
+                walk.extents.push(DataExtent {
+                    logical: cursor,
+                    len: end - cursor,
+                    source: ExtentSource::Fragment {
+                        packed_nid: sb.packed_nid,
+                        offset: u64::from(fragment_off) + (cursor - start),
+                    },
+                });
+                cursor = end;
+                continue;
+            }
+        }
+        let extent = match zmap.pcluster_extent(source, cursor) {
+            Ok(extent) => extent,
+            Err(error) => {
+                walk.end = broken(format!("the cluster map cannot map byte {cursor}: {error}"));
+                return;
+            }
+        };
+        let end = extent.source_end_byte.min(inode.size);
+        if cursor < extent.source_start_byte || end <= cursor {
+            walk.end = broken(format!(
+                "the cluster map maps byte {cursor} to {}..{}, which does not hold it",
+                extent.source_start_byte, extent.source_end_byte
+            ));
+            return;
+        }
+        let algorithm = if extent.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN {
+            None
+        } else {
+            match zmap.header_algo(extent.cluster_type) {
+                Ok(algorithm) => Some(algorithm),
+                Err(error) => {
+                    walk.end = broken(format!(
+                        "the pcluster at byte {cursor} names no codec: {error}"
+                    ));
+                    return;
+                }
+            }
+        };
+        let (offset, stored_len, inline) = match inline_tail {
+            Some((offset, len)) if extent.is_last_pcluster => (offset, u64::from(len), true),
+            _ => (
+                u64::from(extent.pcluster_blkaddr).saturating_mul(bs),
+                extent.pcluster_block_count.saturating_mul(bs),
+                false,
+            ),
+        };
+        if (inline || extent.device_id == 0) && offset >= geometry.source_len {
+            walk.end = broken(format!(
+                "the pcluster for byte {cursor} is at byte {offset}, past the source's end"
+            ));
+            return;
+        }
+        walk.extents.push(DataExtent {
+            logical: cursor,
+            len: end - cursor,
+            source: ExtentSource::Pcluster {
+                device: if inline { 0 } else { extent.device_id },
+                offset,
+                stored_len,
+                algorithm,
+                inline,
+                decoded_start: extent.source_start_byte,
+                decoded_end: extent.source_end_byte,
+            },
+        });
+        cursor = end;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,5 +1420,54 @@ mod tests {
         for entry in kept {
             assert!(evidence.entries.contains(entry), "{:?} lost", entry.name);
         }
+    }
+
+    #[test]
+    fn a_plain_file_and_an_inline_tail_are_mapped_whole() {
+        let bytes = tree_image();
+        let geometry = geometry_of(&bytes);
+        let source = SliceDevice::new(bytes.clone());
+        for (path, size) in [("/big.bin", 3 * 4096u64), ("/small.txt", 6)] {
+            let nid = nid_of(&bytes, path);
+            let inode = inspect_inode(&source, &geometry, nid).inode.unwrap();
+            let walk = walk_data(&source, &geometry, None, &inode);
+            assert_eq!(walk.end, WalkEnd::Complete, "{path}");
+            assert_eq!(
+                walk.extents.iter().map(|e| e.len).sum::<u64>(),
+                size,
+                "{path}"
+            );
+            let fs = crate::Filesystem::open(std::sync::Arc::new(SliceDevice::new(bytes.clone())))
+                .unwrap();
+            let mut want = vec![0u8; size as usize];
+            fs.read_file(&fs.lookup_path(path).unwrap(), 0, &mut want)
+                .unwrap();
+            let mut got = Vec::new();
+            for extent in &walk.extents {
+                let offset = match extent.source {
+                    ExtentSource::Plain { offset, .. } | ExtentSource::Inline { offset } => offset,
+                    ref other => panic!("{path}: {other:?}"),
+                };
+                got.extend_from_slice(&bytes[offset as usize..][..extent.len as usize]);
+            }
+            assert_eq!(got, want, "{path}: the mapped bytes are the file");
+        }
+    }
+
+    #[test]
+    fn a_map_past_the_source_breaks_the_walk_with_nothing_invented() {
+        let mut bytes = tree_image();
+        let geometry = geometry_of(&bytes);
+        let nid = nid_of(&bytes, "/big.bin");
+        let at = geometry.inode_offset(nid) as usize;
+        bytes[at + 0x10..at + 0x14].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+        let source = SliceDevice::new(bytes);
+        let inode = inspect_inode(&source, &geometry, nid).inode.unwrap();
+        let walk = walk_data(&source, &geometry, None, &inode);
+        assert!(walk.extents.is_empty());
+        let WalkEnd::Broken(finding) = walk.end else {
+            panic!("not broken")
+        };
+        assert_eq!(finding.structure, Structure::DataMap { nid });
     }
 }
