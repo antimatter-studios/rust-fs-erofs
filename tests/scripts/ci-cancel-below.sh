@@ -110,11 +110,11 @@ wf=.github/workflows/ci.yml
 block() { awk -v j="  $1:" '$0 == j {f=1; next} f && /^  [a-z]/ {f=0} f' "$wf"; }
 block below | grep -q 'bash scripts/ci-cancel-below.sh' && ok || bad "the below job runs ci-cancel-below.sh"
 block below | grep -q 'actions: write' && ok || bad "the below job may cancel and re-run"
-block below | grep -q '^    needs: changes' && ok || bad "the below job needs changes for its top answer"
-block ci-ok | grep -q 'needs: \[changes, below,' && ok || bad "ci-ok needs the below job"
-block unit | grep -q '^    needs: changes' && ok || bad "unit needs changes, so the re-run brings it back"
+block below | grep -q '^    needs: \[changes' && ok || bad "the below job needs changes for its top answer"
+block ci-ok | grep -q 'needs: \[changes-gate, changes, below-gate, below,' && ok || bad "ci-ok needs the below job"
+block unit | grep -q '^    needs: \[changes' && ok || bad "unit needs changes, so the re-run brings it back"
 for j in cli semver; do
-  block "$j" | grep -q '^    needs: changes' && ok || bad "$j needs changes, so the re-run brings it back"
+  block "$j" | grep -q '^    needs: \[changes' && ok || bad "$j needs changes, so the re-run brings it back"
 done
 
 [ "$fail" -eq 0 ] || { printf 'ci-cancel-below: %d passed, %d failed\n' "$pass" "$fail"; exit 1; }
