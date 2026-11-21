@@ -781,6 +781,12 @@ pub enum ExtentSource {
         decoded_start: u64,
         /// File byte after the last one it decodes to.
         decoded_end: u64,
+        /// True when only a prefix of what the pcluster decodes to is
+        /// this file's (a deduplicated pcluster shared with another).
+        partial: bool,
+        /// True when a pcluster stored uncompressed is interlaced: its
+        /// bytes rotated by where its first one falls in a block.
+        interlaced: bool,
     },
     /// Stored in the packed inode's data (a fragment), from this byte of
     /// the packed inode's contents.
@@ -1073,10 +1079,215 @@ fn walk_compressed<R: BlockRead + ?Sized>(
                 inline,
                 decoded_start: extent.source_start_byte,
                 decoded_end: extent.source_end_byte,
+                partial: extent.partial_ref,
+                interlaced: algorithm.is_none() && zmap.has_interlaced_pcluster(),
             },
         });
         cursor = end;
     }
+}
+
+/// Read the file bytes one extent holds, without trusting anything
+/// beyond it.
+///
+/// Bytes stored as is are copied; a hole is zeros, because the format
+/// declares it so; a pcluster is read and decompressed whole and the
+/// extent's part of it returned; a fragment is read from the packed
+/// inode, through its own walk. Anything that cannot be read or does not
+/// decode is an `Err` naming the extent's source range: those bytes are
+/// missing, and are never returned as zeros or as whatever a decoder
+/// left in its buffer. An extent on an extra device is refused, as only
+/// the primary source is given.
+pub fn read_extent<R: BlockRead + ?Sized>(
+    source: &R,
+    geometry: &Geometry,
+    superblock: Option<&Superblock>,
+    nid: u64,
+    extent: &DataExtent,
+) -> Result<Vec<u8>, Finding> {
+    let len = usize::try_from(extent.len).map_err(|_| Finding {
+        structure: Structure::DataMap { nid },
+        offset: 0,
+        len: 0,
+        detail: format!("an extent of {} bytes cannot be held in memory", extent.len),
+    })?;
+    let bs = geometry.block_size;
+    let fail = |offset: u64, span: u64, detail: String| Finding {
+        structure: Structure::DataMap { nid },
+        offset,
+        len: span,
+        detail,
+    };
+    let read = |offset: u64, buf: &mut [u8]| {
+        if offset.saturating_add(buf.len() as u64) > geometry.source_len {
+            return Err(fail(
+                offset,
+                buf.len() as u64,
+                format!("bytes {offset}..+{} run past the source's end", buf.len()),
+            ));
+        }
+        source.read_at(offset, buf).map_err(|error| {
+            fail(
+                offset,
+                buf.len() as u64,
+                format!("the bytes cannot be read: {error}"),
+            )
+        })
+    };
+    let mut out = vec![0u8; len];
+    match &extent.source {
+        ExtentSource::Plain { device, offset } => {
+            if *device != 0 {
+                return Err(fail(
+                    *offset,
+                    extent.len,
+                    format!("the bytes are on extra device {device}, which was not given"),
+                ));
+            }
+            read(*offset, &mut out)?;
+        }
+        ExtentSource::Inline { offset } => read(*offset, &mut out)?,
+        ExtentSource::Hole => {}
+        ExtentSource::Fragment { packed_nid, offset } => {
+            let sb = superblock.ok_or_else(|| {
+                fail(
+                    0,
+                    0,
+                    "a fragment cannot be read without the superblock".into(),
+                )
+            })?;
+            let packed = inspect_inode(source, geometry, *packed_nid);
+            let Some(packed) = packed.inode else {
+                return Err(fail(
+                    packed.offset,
+                    COMPACT_INODE_SIZE,
+                    format!("the packed inode (nid {packed_nid}) does not decode"),
+                ));
+            };
+            let walk = walk_data(source, geometry, Some(sb), &packed);
+            let wanted = *offset..offset.saturating_add(extent.len);
+            for part in &walk.extents {
+                let have = part.logical..part.logical + part.len;
+                let from = wanted.start.max(have.start);
+                let to = wanted.end.min(have.end);
+                if from >= to {
+                    continue;
+                }
+                let bytes = read_extent(source, geometry, superblock, *packed_nid, part)?;
+                out[(from - wanted.start) as usize..(to - wanted.start) as usize].copy_from_slice(
+                    &bytes[(from - have.start) as usize..(to - have.start) as usize],
+                );
+            }
+            let mapped = walk.extents.last().map_or(0, |e| e.logical + e.len);
+            if mapped < wanted.end {
+                return Err(match walk.end {
+                    WalkEnd::Broken(finding) => finding,
+                    WalkEnd::Complete => fail(
+                        0,
+                        0,
+                        format!("the packed inode holds {mapped} bytes, short of the fragment"),
+                    ),
+                });
+            }
+        }
+        ExtentSource::Pcluster {
+            device,
+            offset,
+            stored_len,
+            algorithm,
+            inline,
+            decoded_start,
+            decoded_end,
+            partial,
+            interlaced,
+        } => {
+            if *device != 0 {
+                return Err(fail(
+                    *offset,
+                    *stored_len,
+                    format!("the pcluster is on extra device {device}, which was not given"),
+                ));
+            }
+            let span = crate::fs::pcluster_span(*decoded_start, *decoded_end)
+                .map_err(|error| fail(*offset, *stored_len, error.to_string()))?;
+            let skip = (extent.logical - decoded_start) as usize;
+            if skip + len > span {
+                return Err(fail(
+                    *offset,
+                    *stored_len,
+                    "the extent runs past what its pcluster decodes to".into(),
+                ));
+            }
+            // A last pcluster's stored length is an upper bound; a
+            // decoder reads only what it needs, so cap it at the source.
+            let stored = (*stored_len).min(geometry.source_len.saturating_sub(*offset));
+            let mut raw = vec![0u8; stored as usize];
+            read(*offset, &mut raw)?;
+            match algorithm {
+                None if *interlaced => {
+                    let head = (decoded_start % bs) as usize;
+                    let on_disk = if *inline { bs as usize } else { raw.len() };
+                    for (k, byte) in out.iter_mut().enumerate() {
+                        let at = crate::fs::interlaced_index(on_disk, bs as usize, head, skip + k);
+                        *byte = *raw.get(at).ok_or_else(|| {
+                            fail(
+                                *offset,
+                                *stored_len,
+                                "an interlaced pcluster is shorter than its extent".into(),
+                            )
+                        })?;
+                    }
+                }
+                None => {
+                    let bytes = raw.get(skip..skip + len).ok_or_else(|| {
+                        fail(
+                            *offset,
+                            *stored_len,
+                            "a pcluster stored as is is shorter than its extent".into(),
+                        )
+                    })?;
+                    out.copy_from_slice(bytes);
+                }
+                Some(algorithm) => {
+                    let sb = superblock.ok_or_else(|| {
+                        fail(
+                            *offset,
+                            *stored_len,
+                            "a pcluster cannot be decoded without the superblock".into(),
+                        )
+                    })?;
+                    let cfgs = crate::superblock::read_compr_cfgs(source, sb).map_err(|error| {
+                        fail(
+                            *offset,
+                            *stored_len,
+                            format!("the codec settings do not decode: {error}"),
+                        )
+                    })?;
+                    let lzma = cfgs.as_ref().and_then(|c| c.lzma.as_ref());
+                    let zero_padding = sb.feature_incompat
+                        & crate::superblock::EROFS_FEATURE_INCOMPAT_ZERO_PADDING
+                        != 0;
+                    let decode = if *partial {
+                        crate::decompress::decompress_prefix_with_config_and_padding
+                    } else {
+                        crate::decompress::decompress_with_config_and_padding
+                    };
+                    let mut decoded = vec![0u8; span];
+                    decode(*algorithm, lzma, zero_padding, &raw, &mut decoded).map_err(
+                        |error| {
+                            fail(
+                                *offset,
+                                *stored_len,
+                                format!("the pcluster does not decompress: {error}"),
+                            )
+                        },
+                    )?;
+                    out.copy_from_slice(&decoded[skip..skip + len]);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1469,5 +1680,51 @@ mod tests {
             panic!("not broken")
         };
         assert_eq!(finding.structure, Structure::DataMap { nid });
+    }
+
+    #[test]
+    fn read_extent_returns_the_bytes_and_refuses_what_it_cannot_read() {
+        let bytes = tree_image();
+        let geometry = geometry_of(&bytes);
+        let source = SliceDevice::new(bytes.clone());
+        let nid = nid_of(&bytes, "/big.bin");
+        let inode = inspect_inode(&source, &geometry, nid).inode.unwrap();
+        let walk = walk_data(&source, &geometry, None, &inode);
+        let read = read_extent(&source, &geometry, None, nid, &walk.extents[0]).unwrap();
+        assert_eq!(read, vec![7u8; 3 * 4096]);
+
+        let hole = DataExtent {
+            logical: 0,
+            len: 10,
+            source: ExtentSource::Hole,
+        };
+        assert_eq!(
+            read_extent(&source, &geometry, None, nid, &hole).unwrap(),
+            vec![0u8; 10]
+        );
+
+        let past = DataExtent {
+            logical: 0,
+            len: 10,
+            source: ExtentSource::Plain {
+                device: 0,
+                offset: geometry.source_len - 4,
+            },
+        };
+        let finding = read_extent(&source, &geometry, None, nid, &past).unwrap_err();
+        assert!(
+            finding.detail.contains("past the source's end"),
+            "{finding:?}"
+        );
+
+        let elsewhere = DataExtent {
+            logical: 0,
+            len: 10,
+            source: ExtentSource::Plain {
+                device: 1,
+                offset: 0,
+            },
+        };
+        assert!(read_extent(&source, &geometry, None, nid, &elsewhere).is_err());
     }
 }

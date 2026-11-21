@@ -211,12 +211,17 @@ pub const MAX_SYMLINK_TARGET: u64 = 4096;
 /// the rest from the start of the first: a rotation of the pcluster by
 /// `on_disk_len - (bs - head_in_block)`. For a one-block pcluster that is
 /// just `head_in_block`.
-fn interlaced_index(on_disk_len: usize, bs: usize, head_in_block: usize, off: usize) -> usize {
+pub(crate) fn interlaced_index(
+    on_disk_len: usize,
+    bs: usize,
+    head_in_block: usize,
+    off: usize,
+) -> usize {
     (on_disk_len - (bs - head_in_block) + off) % on_disk_len
 }
 
 /// How many bytes a physical cluster covers of the file, or a refusal.
-fn pcluster_span(start_byte: u64, end_byte: u64) -> Result<usize> {
+pub(crate) fn pcluster_span(start_byte: u64, end_byte: u64) -> Result<usize> {
     let span = end_byte
         .checked_sub(start_byte)
         .ok_or(Error::BadInode("pcluster ends before it starts"))?;
