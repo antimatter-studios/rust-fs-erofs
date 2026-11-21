@@ -45,6 +45,11 @@ pub enum Structure {
         /// The file's NID.
         nid: u64,
     },
+    /// An inode's inline xattrs, or one shared xattr entry.
+    Xattr {
+        /// The inode's NID.
+        nid: u64,
+    },
     /// One block of a directory's entries.
     DirBlock {
         /// The directory's NID.
@@ -1288,6 +1293,173 @@ pub fn read_extent<R: BlockRead + ?Sized>(
         }
     }
     Ok(out)
+}
+
+/// One extended attribute as found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XattrEntryEvidence {
+    /// Source byte offset of the entry's header.
+    pub offset: u64,
+    /// The shared-xattr id it was reached through, or `None` for an
+    /// entry stored inline after the inode.
+    pub shared_id: Option<u32>,
+    /// Namespace index, as stored (`0x80` and up name a long prefix).
+    pub name_index: u8,
+    /// The name after the namespace prefix, as stored.
+    pub name: Vec<u8>,
+    /// The value, as stored.
+    pub value: Vec<u8>,
+}
+
+/// An inode's extended attributes, whatever state they are in.
+#[derive(Debug, Clone)]
+pub struct XattrEvidence {
+    /// The inode's NID.
+    pub nid: u64,
+    /// Every entry that decodes: the inline ones in order, up to the
+    /// first that does not, then each shared one that does.
+    pub entries: Vec<XattrEntryEvidence>,
+    /// Everything wrong with them.
+    pub findings: Vec<Finding>,
+}
+
+const XATTR_IBODY_HEADER: u64 = 12;
+const XATTR_ENTRY_HEADER: u64 = 4;
+
+/// Read an inode's extended attributes, keeping every one that decodes.
+///
+/// Inline entries are read in order up to the first that does not fit
+/// (after it, where the next one starts is unknown); each shared entry is
+/// read on its own, so one bad shared entry costs only itself. Every
+/// fault is a [`Finding`] at its byte offset.
+pub fn inspect_xattrs<R: BlockRead + ?Sized>(
+    source: &R,
+    geometry: &Geometry,
+    inode: &Inode,
+) -> XattrEvidence {
+    let nid = inode.nid;
+    let mut evidence = XattrEvidence {
+        nid,
+        entries: Vec::new(),
+        findings: Vec::new(),
+    };
+    if inode.xattr_icount == 0 {
+        return evidence;
+    }
+    let finding = |offset: u64, len: u64, detail: String| Finding {
+        structure: Structure::Xattr { nid },
+        offset,
+        len,
+        detail,
+    };
+    let start = geometry.inode_offset(nid) + u64::from(inode.on_disk_size);
+    let size = XATTR_IBODY_HEADER + (u64::from(inode.xattr_icount) - 1) * 4;
+    if start.saturating_add(size) > geometry.source_len {
+        evidence.findings.push(finding(
+            start,
+            size,
+            "the inline xattrs run past the source's end".into(),
+        ));
+        return evidence;
+    }
+    let mut body = vec![0u8; size as usize];
+    if let Err(error) = source.read_at(start, &mut body) {
+        evidence.findings.push(finding(
+            start,
+            size,
+            format!("the inline xattrs cannot be read: {error}"),
+        ));
+        return evidence;
+    }
+    let shared_count = u64::from(body[4]);
+    let mut cursor = XATTR_IBODY_HEADER + shared_count * 4;
+    if cursor > size {
+        evidence.findings.push(finding(
+            start + 4,
+            1,
+            format!("{shared_count} shared ids do not fit in {size} bytes of inline xattrs"),
+        ));
+        return evidence;
+    }
+    let shared: Vec<u32> = (0..shared_count as usize)
+        .map(|i| {
+            let at = XATTR_IBODY_HEADER as usize + i * 4;
+            u32::from_le_bytes(body[at..at + 4].try_into().unwrap())
+        })
+        .collect();
+
+    while cursor + XATTR_ENTRY_HEADER <= size {
+        let at = cursor as usize;
+        let name_len = u64::from(body[at]);
+        let name_index = body[at + 1];
+        let value_len = u64::from(u16::from_le_bytes([body[at + 2], body[at + 3]]));
+        if name_len == 0 && name_index == 0 && value_len == 0 {
+            break; // padding to the end of the area
+        }
+        let end = cursor + XATTR_ENTRY_HEADER + name_len + value_len;
+        if name_len == 0 || end > size {
+            evidence.findings.push(finding(
+                start + cursor,
+                XATTR_ENTRY_HEADER,
+                format!(
+                    "an inline entry of a {name_len}-byte name and {value_len}-byte value does not \
+                     fit; the entries after it cannot be placed"
+                ),
+            ));
+            break;
+        }
+        let name_at = at + XATTR_ENTRY_HEADER as usize;
+        let value_at = name_at + name_len as usize;
+        evidence.entries.push(XattrEntryEvidence {
+            offset: start + cursor,
+            shared_id: None,
+            name_index,
+            name: body[name_at..value_at].to_vec(),
+            value: body[value_at..end as usize].to_vec(),
+        });
+        cursor = end.div_ceil(4) * 4;
+    }
+
+    let base = u64::from(geometry.xattr_blkaddr).saturating_mul(geometry.block_size);
+    for id in shared {
+        let offset = base.saturating_add(u64::from(id) * 4);
+        let mut header = [0u8; XATTR_ENTRY_HEADER as usize];
+        if offset.saturating_add(XATTR_ENTRY_HEADER) > geometry.source_len
+            || source.read_at(offset, &mut header).is_err()
+        {
+            evidence.findings.push(finding(
+                offset,
+                XATTR_ENTRY_HEADER,
+                format!("shared xattr {id} cannot be read"),
+            ));
+            continue;
+        }
+        let name_len = u64::from(header[0]);
+        let value_len = u64::from(u16::from_le_bytes([header[2], header[3]]));
+        let total = XATTR_ENTRY_HEADER + name_len + value_len;
+        let mut entry = vec![0u8; total as usize];
+        if name_len == 0
+            || offset.saturating_add(total) > geometry.source_len
+            || source.read_at(offset, &mut entry).is_err()
+        {
+            evidence.findings.push(finding(
+                offset,
+                XATTR_ENTRY_HEADER,
+                format!("shared xattr {id} of a {name_len}-byte name and {value_len}-byte value cannot be read"),
+            ));
+            continue;
+        }
+        let name_at = XATTR_ENTRY_HEADER as usize;
+        let value_at = name_at + name_len as usize;
+        evidence.entries.push(XattrEntryEvidence {
+            offset,
+            shared_id: Some(id),
+            name_index: header[1],
+            name: entry[name_at..value_at].to_vec(),
+            value: entry[value_at..].to_vec(),
+        });
+    }
+    evidence
 }
 
 #[cfg(test)]
