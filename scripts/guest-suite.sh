@@ -80,5 +80,5 @@ command -v cargo >/dev/null ||
 echo "== in-guest suite: $(uname -srm), $(cargo --version)"
 started=$(date +%s)
 # shellcheck disable=SC2046  # the words are the target list
-scripts/test.sh --locked --release $(scripts/test-targets.sh all) "$@"
+scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh all) "$@"
 echo "== in-guest suite: $(( $(date +%s) - started ))s"

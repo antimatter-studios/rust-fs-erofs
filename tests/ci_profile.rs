@@ -1330,10 +1330,10 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
         commands.iter().any(|c| {
             let as_cargo = c.replace(TEST_WRAPPER, "cargo test");
             as_cargo.contains("cargo test")
-                && as_cargo.contains("--release")
+                && as_cargo.contains("--profile test-opt")
                 && as_cargo.contains("test-targets.sh all")
         }),
-        "chores.yml `test:native` must run the whole suite in the release profile, \
+        "chores.yml `test:native` must run the whole suite in the test-opt profile, \
          selected with `scripts/test-targets.sh all`; it runs {commands:?}"
     );
     assert!(
@@ -3889,4 +3889,20 @@ mod merge_group_planner_runs {
         }
         std::fs::remove_dir_all(&root).unwrap();
     }
+}
+
+#[test]
+fn optimized_test_profile_disables_lto() {
+    let manifest = include_str!("../Cargo.toml");
+    let profile = manifest
+        .split("[profile.test-opt]")
+        .nth(1)
+        .expect("test-opt profile missing")
+        .split('[')
+        .next()
+        .unwrap();
+    let settings: Vec<_> = profile.lines().map(str::trim).collect();
+    assert!(settings.contains(&"inherits = \"release\""));
+    assert!(settings.contains(&"lto = false"));
+    assert!(settings.contains(&"codegen-units = 16"));
 }
