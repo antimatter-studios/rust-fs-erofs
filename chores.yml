@@ -468,7 +468,7 @@ tasks:
     # that job read no mkfs.erofs image at all, on the architecture this
     # crate actually ships on.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:images images 120 8000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
+      - '../rust-fs-core/scripts/tier.sh test:images images 120 8000 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh images)'
       - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored images 3'
 
   test:oracle:
@@ -490,7 +490,7 @@ tasks:
     # for a run that never reached scripts/test.sh.
     cmds:
       - scripts/tools.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 800 63000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 800 63000 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh oracle) -- --show-output'
       # 90: the 87 measured before the tools, plus tests/cli_mkfs_oracle.rs
       # and tests/cli_fs_oracle.rs's eight, less a margin. Only goes up.
       - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored oracle 90'
@@ -509,7 +509,7 @@ tasks:
       # (main at a25af53 printed 404 lines, 30,253 bytes in CI run 44689909094;
       # each stacked test file measured in the harness guest, its section of the
       # tier's output). The budget leaves about 5% for the next test.
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 670 55800 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 670 55800 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh kernel) -- --show-output'
     # 5: the 3 measured on main at ca0c577 (CI run 36351672753) -- the
     # third being the readlink kernel oracle #139 added -- plus the two
     # #125 added: the deduplicated images read back through the kernel,
@@ -570,8 +570,8 @@ tasks:
     # toolchain install, the downloads and the Compiling lines never reach
     # tmp/logs/android.log; the tier compiles nothing.
     cmds:
-      - 'scripts/test.sh --locked --release --no-run --quiet $(scripts/test-targets.sh android)'
-      - '../rust-fs-core/scripts/tier.sh test:android android 11 470 -- scripts/test.sh --locked --release $(scripts/test-targets.sh android)'
+      - 'scripts/test.sh --locked --profile test-opt --no-run --quiet $(scripts/test-targets.sh android)'
+      - '../rust-fs-core/scripts/tier.sh test:android android 11 470 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh android)'
     # One test, so one is the honest floor; it exists to catch the
     # selection going empty, not to measure the suite's size.
       - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored android 1'
@@ -685,7 +685,7 @@ tasks:
       # (#244). Quiet, libtest prints a row of dots per test binary and
       # keeps the `running N tests` and `test result:` lines test-floor.sh
       # counts, and a failure still prints its name and output.
-      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all) -- --quiet'
+      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh all) -- --quiet'
       # #239 adds one declared preservation test to the 528-case floor (#235).
       # #240 adds one declared export policy test.
       # #233 adds one declared damaged-tree export test.
