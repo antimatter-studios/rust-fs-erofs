@@ -1672,21 +1672,43 @@ fn block_addr(block: u64) -> Result<u32> {
 const COPY_BUFFER: usize = 128 << 10;
 
 /// The sink an image is written to, addressed in blocks.
+///
+/// It seeks only where a write does not follow the last one: a seek can
+/// cost more than the write, as a `BufWriter`'s flushes its buffer, so
+/// data written in turn would otherwise reach the file a block at a time.
 struct ImageSink<'a, W: Write + Seek> {
     out: &'a mut W,
     bs: u64,
+    /// Where the sink is, once a seek has said.
+    at: Option<u64>,
 }
 
 impl<'a, W: Write + Seek> ImageSink<'a, W> {
     fn new(out: &'a mut W, bs: u64) -> Self {
-        Self { out, bs }
+        Self { out, bs, at: None }
+    }
+
+    /// Move to `offset`, unless the sink is there.
+    fn seek_to(&mut self, offset: u64) -> Result<()> {
+        if self.at != Some(offset) {
+            self.out
+                .seek(std::io::SeekFrom::Start(offset))
+                .map_err(io_error)?;
+            self.at = Some(offset);
+        }
+        Ok(())
+    }
+
+    /// Write `bytes` where the sink is.
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.out.write_all(bytes).map_err(io_error)?;
+        self.at = self.at.map(|at| at + bytes.len() as u64);
+        Ok(())
     }
 
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
-        self.out
-            .seek(std::io::SeekFrom::Start(offset))
-            .map_err(io_error)?;
-        self.out.write_all(bytes).map_err(io_error)
+        self.seek_to(offset)?;
+        self.write(bytes)
     }
 
     /// Write `bytes` at block `blkaddr`, then zeros to the end of
@@ -1707,7 +1729,7 @@ impl<'a, W: Write + Seek> ImageSink<'a, W> {
         const ZEROS: [u8; 4096] = [0; 4096];
         while len > 0 {
             let n = len.min(ZEROS.len() as u64) as usize;
-            self.out.write_all(&ZEROS[..n]).map_err(io_error)?;
+            self.write(&ZEROS[..n])?;
             len -= n as u64;
         }
         Ok(())
@@ -1724,9 +1746,7 @@ impl<'a, W: Write + Seek> ImageSink<'a, W> {
         let to_sink = size - keep;
         let mut kept = Vec::with_capacity(keep as usize);
         let mut reader = (content.open)().map_err(io_error)?;
-        self.out
-            .seek(std::io::SeekFrom::Start(blkaddr * self.bs))
-            .map_err(io_error)?;
+        self.seek_to(blkaddr * self.bs)?;
         let mut buf = vec![0u8; COPY_BUFFER.min(size as usize)];
         let mut left = size;
         while left > 0 {
@@ -1740,7 +1760,7 @@ impl<'a, W: Write + Seek> ImageSink<'a, W> {
             // Of these bytes, those before `to_sink` go to the sink.
             let done = size - left;
             let sink_part = (to_sink.saturating_sub(done) as usize).min(n);
-            self.out.write_all(&buf[..sink_part]).map_err(io_error)?;
+            self.write(&buf[..sink_part])?;
             kept.extend_from_slice(&buf[sink_part..n]);
             left -= n as u64;
         }
