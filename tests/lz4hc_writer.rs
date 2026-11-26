@@ -16,9 +16,13 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// One compressing thread: the default, a thread per core, would multiply by
+/// the number of tests running (#331). `any_thread_count_builds_the_same_bytes`
+/// is where more than one is covered.
 fn options() -> BuildOptions {
     BuildOptions {
         compression: Some(Compression::LZ4HC_12_32K),
+        threads: 1,
         ..BuildOptions::default()
     }
 }
@@ -423,7 +427,8 @@ fn any_thread_count_builds_the_same_bytes() {
         mkfs::build_image_with(tree(), 12, options).unwrap()
     };
     let one = build(1);
-    for threads in [2, 7, 0] {
+    // Fixed counts only: what 0 resolves to is a unit test in `mkfs.rs`.
+    for threads in [2, 4] {
         assert!(
             build(threads) == one,
             "{threads} threads built other bytes than one"

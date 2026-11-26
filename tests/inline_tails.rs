@@ -98,6 +98,7 @@ fn a_file_stored_uncompressed_by_the_compressor_has_its_tail_inline() {
     let data = noise(50_001, 2);
     let options = BuildOptions {
         compression: Some(Compression::LZ4HC_12_32K),
+        threads: 1,
         ..BuildOptions::default()
     };
     let fs =

@@ -1012,6 +1012,7 @@ fn fsck_passes_on_contents_that_borrow_a_local_buffer() {
         };
         let options = mkfs::BuildOptions {
             compression,
+            threads: 1,
             ..mkfs::BuildOptions::default()
         };
         let img = mkfs::build_image_with(tree, 12, options).unwrap();
