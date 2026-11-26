@@ -188,13 +188,14 @@ One binary, `rust-fs-erofs`, dispatching on the name it is started under, the wa
 
 | name | what |
 |---|---|
-| `mkfs.erofs OUTPUT SOURCE [-b BYTES]` | build an uncompressed image of a directory (the same argument order as erofs-utils) |
+| `mkfs.erofs OUTPUT SOURCE [-b BYTES] [-z ALGORITHM]` | build an image of a directory, uncompressed or LZ4 / LZ4HC (the same argument order as erofs-utils) |
 | `fs.erofs IMAGE ls\|stat\|read\|xattr\|get\|info [...]` | list a directory, inspect a path or its attributes, read raw bytes, or report the volume, without mounting it (every compressor the library reads) |
 | `rust-fs-erofs doctor` | is every name on `PATH` this program? If not, what wins and how to fix it |
 
 ```sh
 mkfs.erofs out.img source-tree/                 # 4 KiB blocks, no compression
 mkfs.erofs -b 16384 out.img source-tree/        # another block size
+mkfs.erofs -z lz4hc,12 out.img source-tree/     # compressed: lz4, lz4hc or lz4hc,LEVEL
 mkfs.erofs out.img source-tree/ | jq .skipped   # what was left out, and why
 fs.erofs out.img ls /etc                        # JSON entries; a symlink's carries its target
 fs.erofs out.img ls -R --max-depth 8 --limit 1000 /etc # a bounded depth-first walk
@@ -230,7 +231,7 @@ Recursive defaults are `--max-depth 64 --limit 100000`; both options require `--
 
 erofs-utils installs a `mkfs.erofs` too. Only one can be first on `PATH`; `rust-fs-erofs doctor` says which, and how to change it.
 
-Symbolic links, special files, and non-UTF-8 directory entries are left out on the CLI path: each is named in the report's `skipped` list and warned about on stderr. Use the library API (`mkfs::build_image_with(...)`) for full control over the on-disk shape (compression, xattrs, ACLs, prefix dictionary, COMPR_CFGS blob).
+Symlinks, FIFOs, sockets and device nodes are written as what they are, and the names of a hardlinked file as one inode. A name or symlink target that is not UTF-8, and a device number Linux has no room for, are left out: each is named in the report's `skipped` list and warned about on stderr. On Windows a special file is left out too, and each name of a hardlinked file is copied. Use the library API (`mkfs::build_image_with(...)`) for full control over the on-disk shape (other codecs, big pclusters, xattrs, ACLs, prefix dictionary, COMPR_CFGS blob).
 
 The output is byte-deterministic given the same input tree and options — useful for reproducible builds.
 

@@ -191,26 +191,140 @@ fn every_block_size_the_reader_supports_round_trips() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlink_in_the_source_is_left_out_and_named_in_the_report() {
-    let src = scratch("symlink-src");
-    write_tree(&src, &[("real.txt", b"i am real".to_vec())]);
-    std::os::unix::fs::symlink("real.txt", src.join("link.txt")).unwrap();
-    let (img, out) = build("symlink", &src, &[]);
+fn links_and_a_fifo_are_written_as_what_they_are() {
+    use fs_erofs::FileType;
+    let src = scratch("links-src");
+    write_tree(
+        &src,
+        &[
+            ("a-real.txt", b"i am real".to_vec()),
+            ("d/empty", Vec::new()),
+        ],
+    );
+    std::os::unix::fs::symlink("a-real.txt", src.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("nowhere/at/all", src.join("dangling")).unwrap();
+    std::fs::hard_link(src.join("a-real.txt"), src.join("d/hard")).unwrap();
+    std::fs::hard_link(src.join("a-real.txt"), src.join("z-hard")).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(src.join("pipe"))
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo: {made}");
+    let (img, out) = build("links", &src, &[]);
     assert!(out.status.success(), "{}", stderr(&out));
     let report = stdout(&out);
-    assert!(report.contains("\"reason\": \"symlink\""), "{report}");
+    assert!(report.contains("\"skipped\": []"), "{report}");
+    assert_eq!(json_field(&report, "files"), "2");
+    assert_eq!(json_field(&report, "symlinks"), "2");
+    assert_eq!(json_field(&report, "special_files"), "1");
+    assert_eq!(json_field(&report, "hard_links"), "2");
+    let fs = open_image_path(Path::new(&img));
+    let inode = |path: &str| {
+        fs.lookup_path(path)
+            .unwrap_or_else(|e| panic!("{path}: {e}"))
+    };
+    for (path, target) in [("/link.txt", "a-real.txt"), ("/dangling", "nowhere/at/all")] {
+        let link = inode(path);
+        assert_eq!(link.file_type(), FileType::Symlink, "{path}");
+        assert_eq!(
+            fs.read_symlink_target(&link).unwrap(),
+            target.as_bytes(),
+            "{path}"
+        );
+    }
+    let first = inode("/a-real.txt");
+    assert_eq!(first.nlink, 3);
+    for path in ["/d/hard", "/z-hard"] {
+        assert_eq!(inode(path).nid, first.nid, "{path} is another inode");
+        assert_eq!(read_all(&fs, path), b"i am real", "{path}");
+    }
+    assert_eq!(inode("/pipe").file_type(), FileType::Fifo);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_target_that_is_not_utf8_is_left_out_and_named_in_the_report() {
+    use std::os::unix::ffi::OsStrExt;
+    let src = scratch("raw-target-src");
+    write_tree(&src, &[("real.txt", b"i am real".to_vec())]);
+    let target = std::ffi::OsStr::from_bytes(b"not-\xff-utf8");
+    std::os::unix::fs::symlink(target, src.join("raw")).unwrap();
+    let (img, out) = build("raw-target", &src, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report = stdout(&out);
     assert!(
-        report.contains(&format!("\"path\": \"{}\"", src.join("link.txt").display())),
+        report.contains("\"reason\": \"symlink target is not UTF-8\""),
         "{report}"
     );
+    assert_eq!(json_field(&report, "symlinks"), "0");
     assert!(
-        stderr(&out).contains("warning: left out") && stderr(&out).contains("link.txt"),
+        stderr(&out).contains("warning: left out") && stderr(&out).contains("raw"),
         "{}",
         stderr(&out)
     );
     let fs = open_image_path(Path::new(&img));
     assert_eq!(read_all(&fs, "/real.txt"), b"i am real");
-    assert!(fs.lookup_path("/link.txt").is_err());
+    assert!(fs.lookup_path("/raw").is_err());
+}
+
+#[test]
+fn each_compressor_makes_a_smaller_image_that_reads_back_the_same() {
+    use fs_erofs::DataLayout;
+    let src = scratch("compress-src");
+    let text: Vec<u8> = b"the quick brown fox jumps over the lazy dog\n".repeat(6000);
+    let files = [
+        ("text", text),
+        ("noise", pattern(20_000, 7)),
+        ("empty", Vec::new()),
+        ("tiny", b"tiny".to_vec()),
+    ];
+    write_tree(&src, &files);
+    let (plain, out) = build("compress-none", &src, &["-q"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("\"compression\": null"),
+        "{}",
+        stdout(&out)
+    );
+    let plain_len = std::fs::metadata(&plain).unwrap().len();
+    for (args, named) in [
+        (&["-q", "-z", "lz4"][..], "lz4"),
+        (&["-q", "-zlz4hc"][..], "lz4hc,9"),
+        (&["-q", "--compress", "lz4hc,12"][..], "lz4hc,12"),
+    ] {
+        let (img, out) = build("compress", &src, args);
+        assert!(out.status.success(), "{named}: {}", stderr(&out));
+        assert_eq!(json_field(&stdout(&out), "compression"), named);
+        let len = std::fs::metadata(&img).unwrap().len();
+        assert!(len < plain_len, "{named}: {len} bytes, {plain_len} plain");
+        let fs = open_image_path(Path::new(&img));
+        let layout = fs.lookup_path("/text").unwrap().format.layout;
+        assert!(
+            matches!(
+                layout,
+                DataLayout::Compression | DataLayout::CompressionLegacy
+            ),
+            "{named}: /text is {layout:?}"
+        );
+        for (path, bytes) in &files {
+            assert_eq!(
+                read_all(&fs, &format!("/{path}")),
+                *bytes,
+                "{named} /{path}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_compressor_the_tool_does_not_have_is_usage_and_writes_nothing() {
+    let src = scratch("bad-z");
+    for value in ["zstd", "lz4hc,13", "lz4hc,0", "lz4,1"] {
+        let (img, out) = build("bad-z", &src, &["-z", value]);
+        assert_eq!(out.status.code(), Some(2), "-z {value}: {}", stderr(&out));
+        assert!(out.stdout.is_empty(), "-z {value}");
+        assert!(!Path::new(&img).exists(), "-z {value}");
+    }
 }
 
 /// SOURCE naming a regular file makes an image whose root holds that one

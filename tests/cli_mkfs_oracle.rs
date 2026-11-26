@@ -79,3 +79,120 @@ fn every_image_the_tool_builds_passes_fsck_erofs_and_dump_erofs_agrees_with_its_
         assert_eq!(json_field(&report, "inodes"), "317", "-b {bs}");
     }
 }
+
+/// The first number `dump.erofs` prints after `label`.
+#[track_caller]
+fn dump_number(dump: &str, label: &str) -> u64 {
+    let rest = dump
+        .split_once(label)
+        .unwrap_or_else(|| panic!("dump.erofs printed no `{label}`:\n{dump}"))
+        .1
+        .trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|e| panic!("`{label}` is not followed by a number ({e}):\n{dump}"))
+}
+
+/// Symlinks, a FIFO, hard links and each compressor: `fsck.erofs` accepts
+/// every image and extracts the source back out of it, and `dump.erofs`
+/// reports each inode's size and link count, one inode for the names of the
+/// hardlinked file.
+#[test]
+fn links_special_files_and_compression_pass_fsck_erofs_and_dump_erofs_reads_them_back() {
+    let src = scratch("oracle-links-src");
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "text",
+            b"the quick brown fox jumps over the lazy dog\n".repeat(6000),
+        ),
+        ("noise", pattern(100_000, 11)),
+        ("empty", Vec::new()),
+        ("d/tiny", b"tiny".to_vec()),
+    ];
+    write_tree(&src, &files);
+    std::os::unix::fs::symlink("text", src.join("link")).unwrap();
+    std::fs::hard_link(src.join("text"), src.join("d/hard")).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(src.join("pipe"))
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo: {made}");
+    let source = src.display().to_string();
+
+    for bs in ["1024", "4096"] {
+        for (tag, compression) in [
+            ("none", &[][..]),
+            ("lz4", &["-z", "lz4"][..]),
+            ("lz4hc", &["-z", "lz4hc"][..]),
+            ("lz4hc12", &["-z", "lz4hc,12"][..]),
+        ] {
+            let what = format!("mkfs.erofs -b {bs} {tag}");
+            let img = image_path(&format!("oracle-links-{tag}-{bs}"));
+            let report = stdout(&ok(tool("mkfs.erofs")
+                .args(["-q", "-b", bs])
+                .args(compression)
+                .args([&img, &source])));
+            assert!(report.contains("\"skipped\": []"), "{what}: {report}");
+            assert_fsck_clean(&img, &what);
+
+            let extracted = scratch(&format!("oracle-links-out-{tag}-{bs}")).join("tree");
+            let out = oracle("fsck.erofs")
+                .arg(format!("--extract={}", extracted.display()))
+                .arg(&img)
+                .output();
+            assert!(out.status.success(), "{what}: {}", stderr(&out));
+            for (path, bytes) in &files {
+                assert!(
+                    std::fs::read(extracted.join(path)).unwrap() == *bytes,
+                    "{what}: fsck.erofs extracted other bytes for /{path}"
+                );
+            }
+            assert!(
+                std::fs::read(extracted.join("d/hard")).unwrap() == files[0].1,
+                "{what}: /d/hard"
+            );
+            assert_eq!(
+                std::fs::read_link(extracted.join("link")).unwrap(),
+                std::path::Path::new("text"),
+                "{what}"
+            );
+
+            let dump = |path: &str| {
+                let out = oracle("dump.erofs")
+                    .arg(format!("--path={path}"))
+                    .arg(&img)
+                    .output();
+                assert!(
+                    out.status.success(),
+                    "{what}: dump.erofs {path}: {}",
+                    stderr(&out)
+                );
+                stdout(&out)
+            };
+            for (path, bytes) in &files {
+                let seen = dump(&format!("/{path}"));
+                assert_eq!(
+                    dump_number(&seen, "Size:"),
+                    bytes.len() as u64,
+                    "{what} /{path}"
+                );
+            }
+            let (text, hard) = (dump("/text"), dump("/d/hard"));
+            for seen in [&text, &hard] {
+                assert_eq!(dump_number(seen, "Links:"), 2, "{what}:\n{seen}");
+            }
+            assert_eq!(
+                dump_number(&text, "NID:"),
+                dump_number(&hard, "NID:"),
+                "{what}: two inodes for one file"
+            );
+            assert_eq!(
+                dump_number(&dump("/link"), "Size:"),
+                "text".len() as u64,
+                "{what}: the symlink's size"
+            );
+            assert_eq!(dump_number(&dump("/pipe"), "Links:"), 1, "{what}");
+        }
+    }
+}

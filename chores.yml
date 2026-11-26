@@ -736,7 +736,9 @@ tasks:
       # Successful exports in test-fs.sh add 37 checks: the image, five single
       # files x 3, replacement 5, stdout 3, a directory 2, a tree 6, times 5
       # (#307).
-      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 681'
+      # test-mkfs.sh's -z checks add 16: three compressors x 4, and a refused
+      # one x 4 (#306).
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 697'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob

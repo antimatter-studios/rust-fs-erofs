@@ -17,7 +17,7 @@ use fs_erofs::mkfs;
 use std::process::Output;
 
 /// An image of a small tree with a symlink in it, built by the library
-/// (the `mkfs.erofs` tool leaves symlinks out), written to a file.
+/// and not by the tool under test, written to a file.
 fn image() -> (String, Vec<u8>) {
     let tree = dir(vec![
         ("hello.txt", file(b"hi\n")),
