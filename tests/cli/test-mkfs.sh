@@ -23,7 +23,8 @@ dirs=$(( 1 + 8 + 1 ))
 
 img="$SANDBOX/out.img"
 mkfs.erofs "$img" "$src" >"$SANDBOX/mkfs.json" 2>"$SANDBOX/mkfs.err"
-check "mkfs.erofs exits 0 ($(tail -n 1 "$SANDBOX/mkfs.err"))" test $? -eq 0
+status=$?
+check "mkfs.erofs exits 0 ($(tail -n 1 "$SANDBOX/mkfs.err"))" test "$status" -eq 0
 jq_check "the report's numbers are numbers" \
     '[.bytes, .block_size, .blocks, .inodes, .files, .directories] | all(type == "number")' \
     "$SANDBOX/mkfs.json"
@@ -53,7 +54,8 @@ check "rust-fs-erofs mkfs writes the same image" cmp -s "$img" "$SANDBOX/repo.im
 # Every block size the format allows, and the report says which.
 for bs in 512 1024 2048 4096 8192 16384 32768 65536; do
     mkfs.erofs -q -b "$bs" "$SANDBOX/bs.img" "$src" >"$SANDBOX/bs.json" 2>"$SANDBOX/bs.err"
-    check "-b $bs exits 0 ($(cat "$SANDBOX/bs.err"))" test $? -eq 0
+    status=$?
+    check "-b $bs exits 0 ($(cat "$SANDBOX/bs.err"))" test "$status" -eq 0
     jq_check "-b $bs is reported" ".block_size == $bs" "$SANDBOX/bs.json"
 done
 for bs in 256 3000 131072; do
