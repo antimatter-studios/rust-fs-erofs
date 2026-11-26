@@ -687,10 +687,7 @@ pub fn build_image_to<W: Write + Seek>(
         .compression
         .map(|c| c.validate(bs).map(|()| c))
         .transpose()?;
-    let threads = match options.threads {
-        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
-        n => n,
-    };
+    let threads = compression_threads(options.threads);
     let mut placements: Vec<Placement> = (0..plan.len()).map(|_| Placement::default()).collect();
     let mut any_compressed = false;
     let mut any_inline_tail = false;
@@ -1337,6 +1334,15 @@ struct FileInFlight {
 }
 
 /// Where segments are compressed: on this thread, or on a pool of them.
+/// The threads that compress for a [`BuildOptions::threads`] of `asked`: 0
+/// is one per core.
+fn compression_threads(asked: usize) -> usize {
+    match asked {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    }
+}
+
 enum Compressors {
     Here(Lz4Hc),
     Pool {
@@ -4967,6 +4973,16 @@ mod tests {
     }
 
     // --- W5: BuildOptions writer extensions ------------------------------
+
+    /// What 0 asks for is tested here, so that no build in the tests has to
+    /// start a thread per core to cover it (#331).
+    #[test]
+    fn zero_compression_threads_means_one_per_core() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(compression_threads(0), cores);
+        assert_eq!(compression_threads(1), 1);
+        assert_eq!(compression_threads(3), 3);
+    }
 
     #[test]
     fn xattr_prefix_dict_emits_correctly() {

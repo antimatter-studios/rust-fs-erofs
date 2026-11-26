@@ -154,6 +154,7 @@ fn an_lz4hc_image_is_within_two_percent_of_mkfs_erofs() {
         mtime_is_build_time: true,
         share_xattrs: true,
         compression: Some(Compression::LZ4HC_12_32K),
+        threads: 1,
         ..BuildOptions::default()
     };
     let ours = mkfs::build_image_with(tree(), 12, options).unwrap();

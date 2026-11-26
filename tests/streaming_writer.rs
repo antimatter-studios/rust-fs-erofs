@@ -214,7 +214,8 @@ fn contents_that_borrow_build_and_read_back() {
         opens.store(0, Ordering::SeqCst);
         let options = BuildOptions {
             compression,
-            threads: 4,
+            // Two: more than one worker borrows the contents, and no more.
+            threads: 2,
             ..BuildOptions::default()
         };
         let img = mkfs::build_image_with(borrowing_tree(&buf, &opens), 12, options).unwrap();
