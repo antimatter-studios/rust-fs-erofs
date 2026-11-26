@@ -1272,6 +1272,15 @@ fn compress_segment(
 /// one that started before it. Each pcluster takes more than a block of
 /// the file but the last of a segment, which ends on a block boundary, so
 /// no two start in one lcluster.
+///
+/// A file that ends inside a block its last pcluster does not start in
+/// gets a PLAIN head there, at the end of the file, as `mkfs.erofs`
+/// writes: older kernels, 5.10 among them, decompress a pcluster with no
+/// head after it to the end of the block the file ends in, which is more
+/// than its compressed data holds, and fail the read. The head is of no
+/// pcluster (`pcluster_idx` one past the last) and names block 0, as
+/// `mkfs.erofs` has it: it maps only what is past the end, so nothing
+/// reads its block.
 fn index_pclusters(
     pclusters: &[(u64, PclusterPlan)],
     size: u64,
@@ -1304,6 +1313,16 @@ fn index_pclusters(
                     .map_err(|_| Error::BadInode("pcluster spans more than 65535 lclusters"))?,
                 pcluster_idx: owner.0,
             }),
+        }
+    }
+    let tail = size % bs;
+    if let Some(last) = entries.last_mut() {
+        if tail > 0 && last.cluster_type == Z_EROFS_LCLUSTER_TYPE_NONHEAD {
+            *last = LclusterIndexEntry {
+                cluster_type: Z_EROFS_LCLUSTER_TYPE_PLAIN,
+                clusterofs_or_delta0: tail as u16,
+                pcluster_idx: pclusters.len() as u32,
+            };
         }
     }
     Ok(entries)
@@ -3743,6 +3762,9 @@ fn encode_zmap_trailer(n: &PlanNode, addrs: &[u32], body_end: u64, blkszbits: u8
         CompressedAlgo::Deflate => 2,
     };
     debug_assert_eq!(addrs.len(), pclusters.len());
+    // A head's block: its pcluster's, or 0 for the head at the end of a
+    // file (`pcluster_idx` one past the last), which has none.
+    let head_addr = |idx: u32| addrs.get(idx as usize).copied().unwrap_or(0);
 
     let has_inline = ztailpacking_inline.is_some();
     let idata_size: u16 = ztailpacking_inline
@@ -3801,7 +3823,7 @@ fn encode_zmap_trailer(n: &PlanNode, addrs: &[u32], body_end: u64, blkszbits: u8
                     };
                     (0u16, delta0 | (delta1[i] as u32) << 16)
                 } else {
-                    let blkaddr = addrs[entry.pcluster_idx as usize];
+                    let blkaddr = head_addr(entry.pcluster_idx);
                     (entry.clusterofs_or_delta0, blkaddr)
                 };
                 let bytes = encode_lcluster_index(entry.cluster_type, clusterofs, u);
