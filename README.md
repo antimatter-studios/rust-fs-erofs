@@ -185,7 +185,9 @@ into a `Vec`.
 A file that comes from another image, unchanged, need not be compressed
 again. `Transplant::of` describes the LZ4 pclusters an open image stores it
 in, and `Node::TransplantedFile` writes them as they are, under an index of
-the new image's own; where it answers `None` -- another codec, ztailpacking,
+the new image's own. A file stored uncompressed is described as its blocks,
+stored as they are, and stays uncompressed. Where it answers `None` --
+another codec, ztailpacking,
 fragments, a deduplicated extent -- the file is read and written as any
 other:
 

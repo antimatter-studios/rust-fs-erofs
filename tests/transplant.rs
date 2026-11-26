@@ -66,8 +66,8 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
 /// Files of every shape the compressor writes: all compressed, with a
 /// partial last block and without; stored blocks between compressed
 /// pclusters; more than one 4 MiB segment; a pcluster of zeros that holds
-/// far more than it fills; and the two a transplant cannot describe, one
-/// stored uncompressed and one inline.
+/// far more than it fills; and three it stores uncompressed, two of whole
+/// blocks with a tail inline after the inode and one of whole blocks alone.
 fn files() -> Vec<(&'static str, Vec<u8>)> {
     let mut mixed = text(70_001, 1);
     mixed.extend(noise(50_000, 2));
@@ -81,9 +81,18 @@ fn files() -> Vec<(&'static str, Vec<u8>)> {
         ("zeros", vec![0u8; 3 << 20]),
         ("two", text(4097, 8)),
         ("noise", noise(100_000, 9)),
+        ("noise-blocks", noise(40 * 4096, 12)),
         ("inline", text(700, 10)),
     ]
 }
+
+/// The names of [`files`] the compressor stores uncompressed, and the
+/// layout it gives each.
+const FLAT: [(&str, DataLayout); 3] = [
+    ("noise", DataLayout::FlatInline),
+    ("noise-blocks", DataLayout::FlatPlain),
+    ("inline", DataLayout::FlatInline),
+];
 
 fn source(options: BuildOptions) -> Vec<u8> {
     let tree = dir(files()
@@ -163,20 +172,35 @@ fn assert_every_file_reads_back(img: Vec<u8>) {
 }
 
 #[test]
-fn a_compressed_file_can_be_transplanted_and_a_flat_one_cannot() {
+fn a_compressed_file_and_a_flat_one_can_be_transplanted() {
     let fs = open_image(source(compressing(32 << 10)));
     for (name, data) in files() {
         let inode = fs.lookup_path(&format!("/{name}")).unwrap();
-        let transplant = Transplant::of(&fs, &inode).unwrap();
-        match name {
-            "noise" | "inline" => assert!(transplant.is_none(), "{name}"),
-            _ => {
-                let transplant = transplant.unwrap_or_else(|| panic!("{name}"));
-                assert_eq!(transplant.size(), data.len() as u64);
-                assert_eq!(transplant.blkszbits(), 12);
-                assert_eq!(transplant.pclusters()[0].offset, 0);
-            }
+        let transplant = Transplant::of(&fs, &inode)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(transplant.size(), data.len() as u64);
+        assert_eq!(transplant.blkszbits(), 12);
+        assert_eq!(transplant.pclusters()[0].offset, 0);
+        if let Some((_, layout)) = FLAT.iter().find(|(flat, _)| *flat == name) {
+            assert_eq!(inode.format.layout, *layout, "{name}");
+            // A block of the file, stored as it is, for each block of it.
+            let blocks = (data.len() as u64).div_ceil(4096);
+            let stored: Vec<Pcluster> = (0..blocks)
+                .map(|at| pcluster(at * 4096, 1, false))
+                .collect();
+            assert_eq!(transplant.pclusters(), stored, "{name}");
         }
+    }
+}
+
+#[test]
+fn a_transplanted_flat_file_is_flat_in_the_image_that_takes_it() {
+    let from = open_image(source(compressing(32 << 10)));
+    let fs = open_image(rebuilt(&from, compressing(32 << 10)));
+    for (name, layout) in FLAT {
+        let inode = fs.lookup_path(&format!("/{name}")).unwrap();
+        assert_eq!(inode.format.layout, layout, "{name}");
     }
 }
 

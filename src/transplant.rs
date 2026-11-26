@@ -10,9 +10,11 @@
 //! What can be taken is what the builder itself writes: LZ4 pclusters, in
 //! logical clusters of one block, each a frame ending at the end of its
 //! blocks (`EROFS_FEATURE_INCOMPAT_ZERO_PADDING`) or one block of the file
-//! stored as it is. A file stored any other way is one [`Transplant::of`]
-//! answers `None` for, and the caller reads it and writes it as any other
-//! file.
+//! stored as it is. A file stored uncompressed is taken as such stored
+//! blocks, one for each block of it, so a file its source found did not
+//! compress is not compressed again either. A file stored any other way is
+//! one [`Transplant::of`] answers `None` for, and the caller reads it and
+//! writes it as any other file.
 //!
 //! Spec: the compressed-data layout in the public EROFS on-disk-format
 //! documentation
@@ -138,18 +140,23 @@ impl<'a> Transplant<'a> {
     /// of the block, as the builder writes them; and every pcluster of it
     /// a size the kernel reads.
     ///
+    /// One stored uncompressed (`FLAT_PLAIN`, or `FLAT_INLINE` with its last
+    /// block inline after the inode) is described as a stored pcluster for
+    /// each block of it, the last one's bytes past the end of the file
+    /// zeros; the image taking it stores it uncompressed again.
+    ///
     /// The blocks are read from `fs` when the image taking them is built.
     pub fn of(fs: &'a Filesystem, inode: &Inode) -> Result<Option<Self>> {
         let sb = fs.superblock();
-        let compressed = matches!(
-            inode.format.layout,
-            DataLayout::Compression | DataLayout::CompressionLegacy
-        );
-        if !inode.is_regular_file()
-            || inode.size == 0
-            || !compressed
-            || sb.feature_incompat & EROFS_FEATURE_INCOMPAT_ZERO_PADDING == 0
-        {
+        if !inode.is_regular_file() || inode.size == 0 {
+            return Ok(None);
+        }
+        match inode.format.layout {
+            DataLayout::FlatPlain | DataLayout::FlatInline => return Self::flat(fs, inode),
+            DataLayout::Compression | DataLayout::CompressionLegacy => {}
+            DataLayout::ChunkBased => return Ok(None),
+        }
+        if sb.feature_incompat & EROFS_FEATURE_INCOMPAT_ZERO_PADDING == 0 {
             return Ok(None);
         }
         let dev = fs.metadata_device();
@@ -220,6 +227,7 @@ impl<'a> Transplant<'a> {
         let reader = PclusterBlocks {
             fs,
             runs: runs.into_iter(),
+            tail: None,
             buf: Vec::new(),
             at: 0,
         };
@@ -228,6 +236,57 @@ impl<'a> Transplant<'a> {
             inode.size,
             pclusters,
             Content::new(total * bs, move || Ok(reader)),
+        )
+        .map(Some)
+    }
+
+    /// A file stored uncompressed, as a stored pcluster for each block of
+    /// it: the blocks from its `raw_blkaddr` on, and for `FLAT_INLINE` the
+    /// last one from after the inode, as the reader takes them.
+    fn flat(fs: &'a Filesystem, inode: &Inode) -> Result<Option<Self>> {
+        let sb = fs.superblock();
+        let bs = sb.block_size();
+        let blocks = inode.size.div_ceil(bs);
+        let (whole, tail) = match inode.format.layout {
+            DataLayout::FlatInline => {
+                let len = inode.size - (blocks - 1) * bs;
+                (blocks - 1, Some((inode.body_end(sb), len as usize)))
+            }
+            _ => (blocks, None),
+        };
+        if whole > 0 && inode.raw_u as u64 + whole > sb.blocks as u64 {
+            return Ok(None);
+        }
+        let most = (MAX_PCLUSTER_BYTES / bs) as u32;
+        let mut runs = Vec::new();
+        let mut at = 0u64;
+        while at < whole {
+            let n = (whole - at).min(most as u64) as u32;
+            runs.push(Run {
+                blkaddr: inode.raw_u + at as u32,
+                blocks: n,
+            });
+            at += n as u64;
+        }
+        let pclusters = (0..blocks)
+            .map(|block| Pcluster {
+                offset: block * bs,
+                blocks: 1,
+                compressed: false,
+            })
+            .collect();
+        let reader = PclusterBlocks {
+            fs,
+            runs: runs.into_iter(),
+            tail,
+            buf: Vec::new(),
+            at: 0,
+        };
+        Self::new(
+            sb.blkszbits,
+            inode.size,
+            pclusters,
+            Content::new(blocks * bs, move || Ok(reader)),
         )
         .map(Some)
     }
@@ -260,6 +319,10 @@ struct Run {
 struct PclusterBlocks<'a> {
     fs: &'a Filesystem,
     runs: std::vec::IntoIter<Run>,
+    /// Where the last block of a `FLAT_INLINE` file is, after its inode,
+    /// and how many of its bytes are the file's: read after the runs, and
+    /// made a block with zeros.
+    tail: Option<(u64, usize)>,
     buf: Vec<u8>,
     at: usize,
 }
@@ -267,14 +330,21 @@ struct PclusterBlocks<'a> {
 impl std::io::Read for PclusterBlocks<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if self.at == self.buf.len() {
-            let Some(run) = self.runs.next() else {
-                return Ok(0);
-            };
             let bs = self.fs.superblock().block_size();
-            self.buf.resize((run.blocks as u64 * bs) as usize, 0);
-            self.fs
-                .read_data(0, run.blkaddr as u64 * bs, &mut self.buf)
-                .map_err(std::io::Error::other)?;
+            if let Some(run) = self.runs.next() {
+                self.buf.resize((run.blocks as u64 * bs) as usize, 0);
+                self.fs
+                    .read_data(0, run.blkaddr as u64 * bs, &mut self.buf)
+                    .map_err(std::io::Error::other)?;
+            } else if let Some((offset, len)) = self.tail.take() {
+                self.buf.clear();
+                self.buf.resize(bs as usize, 0);
+                self.fs
+                    .read_data(0, offset, &mut self.buf[..len])
+                    .map_err(std::io::Error::other)?;
+            } else {
+                return Ok(0);
+            }
             self.at = 0;
         }
         let n = out.len().min(self.buf.len() - self.at);

@@ -52,8 +52,9 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
 /// one; text with stretches that do not compress, which it stores a block
 /// at a time from wherever the text before them ended; more than the
 /// 4 MiB the writer holds at once; zeros, a pcluster of which holds far
-/// more than it fills. And two it stores uncompressed, which a transplant
-/// does not describe.
+/// more than it fills. And three it stores uncompressed, which a transplant
+/// takes as stored blocks: two with a tail inline after the inode, one of
+/// whole blocks alone.
 fn files() -> Vec<(&'static str, Vec<u8>)> {
     let mut mixed = text(70_001, 1);
     mixed.extend(noise(50_000, 2));
@@ -69,6 +70,7 @@ fn files() -> Vec<(&'static str, Vec<u8>)> {
         ("segments", text((5 << 20) + 123, 7)),
         ("zeros", vec![0u8; 3 << 20]),
         ("noise", noise(100_000, 9)),
+        ("noise-blocks", noise(40 * 4096, 13)),
         ("inline", text(700, 10)),
     ]
 }
@@ -173,8 +175,8 @@ const SHAPES: [(&str, &[&str], bool); 5] = [
 ];
 
 /// An image built of the pclusters of one `mkfs.erofs` wrote, in `shape`,
-/// having held that every compressed file was taken and none other, and
-/// that the pclusters were of the shape asked for.
+/// having held that every file was taken, the compressed ones and those
+/// stored uncompressed, and that the pclusters were of the shape asked for.
 fn transplanted_from(shape: &str) -> Vec<u8> {
     let (tag, args, big) = SHAPES
         .iter()
@@ -182,9 +184,9 @@ fn transplanted_from(shape: &str) -> Vec<u8> {
         .expect("a shape of SHAPES");
     let (img, mut taken) = rebuilt(&source(args));
     taken.names.sort();
-    let mut compressed = COMPRESSED.to_vec();
-    compressed.sort();
-    assert_eq!(taken.names, compressed, "[{tag}]");
+    let mut every: Vec<&str> = files().iter().map(|(name, _)| *name).collect();
+    every.sort();
+    assert_eq!(taken.names, every, "[{tag}]");
     assert_eq!(taken.largest > 1, *big, "[{tag}] largest {}", taken.largest);
     // All but the 1 MiB pclusters, which take the noise in with the text,
     // store it a block at a time from where the text ended.
