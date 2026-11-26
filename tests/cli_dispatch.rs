@@ -8,6 +8,7 @@
 mod cli_support;
 
 use cli_support::*;
+use fs_erofs_test_support::{assert_image_unchanged, snapshot_image};
 use std::path::Path;
 
 const CRATE: &str = env!("CARGO_PKG_NAME");
@@ -37,11 +38,11 @@ fn the_repository_name_reaches_a_tool_by_verb_and_by_full_name() {
     let src = src.display().to_string();
     let img = image_path("repo-form");
     let dotted = ok(tool("mkfs.erofs").args(["-q", &img, &src]));
-    let first = std::fs::read(&img).unwrap();
+    let first = snapshot_image(&img);
     for word in ["mkfs", "mkfs.erofs"] {
         let repo = ok(tool("rust-fs-erofs").args([word, "-q", &img, &src]));
         assert_eq!(stdout(&repo), stdout(&dotted), "rust-fs-erofs {word}");
-        assert_eq!(std::fs::read(&img).unwrap(), first, "rust-fs-erofs {word}");
+        assert_image_unchanged(&img, &first, &format!("rust-fs-erofs {word}"));
     }
     // cargo's own build, under cargo's name, is the same entry point.
     let cargo = ok(entry().args(["mkfs", "-q", &img, &src]));

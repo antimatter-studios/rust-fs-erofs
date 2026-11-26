@@ -3,9 +3,15 @@
 //! holds itself to — erofs-utils (see [`oracle`]) and the Linux kernel
 //! (see [`kernel`]).
 
+mod images;
 mod kernel;
 mod oracle;
 
+pub use images::{
+    assert_file_bytes, assert_image_unchanged, assert_images_equal, copy_sparse_at,
+    first_difference, read_image_region, read_small_file, sha256_file, snapshot_image,
+    write_image_region, ImageSnapshot, SMALL_FILE,
+};
 pub use kernel::{
     guest_kernel_acl_report, guest_kernel_link_report, guest_kernel_read,
     guest_kernel_read_if_mounted, guest_kernel_refusal, guest_kernel_report,

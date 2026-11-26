@@ -16,7 +16,7 @@
 
 mod common;
 use common::{build_with_mkfs_erofs, dir, file, run_mkfs_erofs, MemDev};
-use fs_erofs_test_support::ScratchDir;
+use fs_erofs_test_support::{read_small_file, ScratchDir};
 
 use fs_core::BlockRead;
 use fs_erofs::{mkfs, Error, Filesystem};
@@ -32,7 +32,9 @@ const UUID_AT: usize = SB + 0x30;
 fn fixture() -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-disks/erofs-zstd-4k.img");
     // Committed, so a missing file is a failure rather than a skip.
-    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    // The committed 36 KiB fixture, small by construction; the tests damage
+    // copies of it in memory.
+    read_small_file(path)
 }
 
 fn has_checksum(img: &[u8]) -> bool {

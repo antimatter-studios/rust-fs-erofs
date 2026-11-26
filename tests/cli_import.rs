@@ -6,6 +6,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
+use fs_erofs_test_support::assert_file_bytes;
 use std::fs::File;
 use std::io::Seek;
 use std::path::{Path, PathBuf};
@@ -85,7 +86,7 @@ fn stdin_offset_and_every_image_byte_survive_import_refusal() {
         cmd.args(flags).stdin(input.try_clone().unwrap());
         refused_as(bounded(cmd), flags.contains(&"--text"));
         assert_eq!(input.stream_position().unwrap(), 0, "stdin was consumed");
-        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert_file_bytes(&target, &before, "import changed the image");
     }
 }
 
@@ -103,8 +104,8 @@ fn refusal_precedes_source_and_image_validation() {
             refused(bounded(cmd));
         }
     }
-    assert_eq!(std::fs::read(&target).unwrap(), before);
-    assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+    assert_file_bytes(&target, &before, "import changed the image");
+    assert_file_bytes(&source, b"source bytes", "import changed the source");
     assert!(!absent.exists());
 }
 
@@ -133,7 +134,7 @@ fn a_source_fifo_without_a_writer_is_never_opened() {
     let source = root.join("source.fifo");
     fifo(&source);
     refused(bounded(import(&target, &source)));
-    assert_eq!(std::fs::read(&target).unwrap(), before);
+    assert_file_bytes(&target, &before, "import changed the image");
 }
 
 #[test]

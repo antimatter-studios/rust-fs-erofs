@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::open_image;
+use common::open_image_path;
 use fs_erofs::mkfs::{
     self, BuildOptions, Compression, Content, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
 };
@@ -129,10 +129,10 @@ fn build_and_check(compression: Option<Compression>, threads: usize) {
     } else {
         PEAK_LIMIT
     };
-    let mut sink = tempfile::tempfile().expect("a file to build into");
+    let mut sink = tempfile::NamedTempFile::new().expect("a file to build into");
     let before = LIVE.load(Ordering::SeqCst);
     PEAK.store(before, Ordering::SeqCst);
-    let len = mkfs::build_image_to(tree, 12, options, &mut sink).expect("build");
+    let len = mkfs::build_image_to(tree, 12, options, sink.as_file_mut()).expect("build");
     let peak = PEAK.load(Ordering::SeqCst) - before;
 
     assert!(
@@ -149,11 +149,7 @@ fn build_and_check(compression: Option<Compression>, threads: usize) {
     );
 
     // And it is the image the tree described.
-    let mut img = Vec::new();
-    use std::io::Seek;
-    sink.rewind().unwrap();
-    sink.read_to_end(&mut img).unwrap();
-    let fs = open_image(img);
+    let fs = open_image_path(sink.path());
     for (path, seed, size) in [
         ("/big-00".to_string(), 1_000_000u64, BIG_SIZE),
         (

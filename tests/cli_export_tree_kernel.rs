@@ -5,8 +5,9 @@ use cli_support::*;
 use fs_core::FileDevice;
 use fs_erofs::{DataLayout, Filesystem, Inode};
 use fs_erofs_test_support::{
-    assert_fsck_clean, guest_kernel_read, guest_kernel_report, mkfs_from_guest_tree, oracle,
-    sha256_hex, ScratchDir,
+    assert_file_bytes, assert_fsck_clean, assert_image_unchanged, assert_images_equal,
+    copy_sparse_at, guest_kernel_read, guest_kernel_report, mkfs_from_guest_tree, oracle,
+    read_image_region, sha256_file, sha256_hex, snapshot_image, write_image_region, ScratchDir,
 };
 use std::sync::Arc;
 
@@ -43,7 +44,7 @@ fn recursive_export_matches_kernel_and_reference_digests_and_reports_each_item()
         let built = mkfs_from_guest_tree(&image, &stage, &args);
         assert!(built.status.success(), "mkfs.erofs: {}", stderr(&built));
         assert_fsck_clean(image.to_str().unwrap(), "recursive export source");
-        let before = std::fs::read(&image).unwrap();
+        let before = snapshot_image(&image);
         let kernel = guest_kernel_report(image.to_str().unwrap(), "recursive export reference");
         let sums: Vec<_> = kernel
             .iter()
@@ -94,10 +95,14 @@ fn recursive_export_matches_kernel_and_reference_digests_and_reports_each_item()
         assert_eq!(json_field(&report, "refused"), "3", "{report}");
         assert_eq!(json_field(&report, "failed"), "0", "{report}");
         for ((_, path), want) in sums {
-            let bytes = std::fs::read(dest.join(path.strip_prefix("tree/").unwrap())).unwrap();
-            assert_eq!(&sha256_hex(&bytes), want, "{path}: exported versus kernel");
+            let exported = dest.join(path.strip_prefix("tree/").unwrap());
             assert_eq!(
-                &sha256_hex(&std::fs::read(extracted.join(path)).unwrap()),
+                &sha256_file(exported),
+                want,
+                "{path}: exported versus kernel"
+            );
+            assert_eq!(
+                &sha256_file(extracted.join(path)),
                 want,
                 "{path}: reference extractor versus kernel"
             );
@@ -138,12 +143,8 @@ fn recursive_export_matches_kernel_and_reference_digests_and_reports_each_item()
             .unwrap();
         assert_eq!(again.status.code(), Some(5), "{}", stderr(&again));
         assert!(item(&stdout(&again), "/tree/big").contains("\"status\": \"refused\""));
-        assert_eq!(std::fs::read(&kept).unwrap(), b"keep me");
-        assert_eq!(
-            std::fs::read(&image).unwrap(),
-            before,
-            "export changed its source"
-        );
+        assert_file_bytes(&kept, b"keep me", "a refused export");
+        assert_image_unchanged(&image, &before, "export changed its source");
     }
 }
 
@@ -187,7 +188,7 @@ PY
         let built = mkfs_from_guest_tree(&image, STAGE, &["-b4096", &force]);
         assert!(built.status.success(), "mkfs.erofs: {}", stderr(&built));
         assert_fsck_clean(image.to_str().unwrap(), "preserved export source");
-        let before = std::fs::read(&image).unwrap();
+        let before = snapshot_image(&image);
         let kernel = guest_kernel_read(image.to_str().unwrap(), REPORT);
         assert!(
             kernel.status.success(),
@@ -298,9 +299,10 @@ PY
                     "{name}: exported hard-link identity"
                 );
                 assert_eq!(host.nlink().to_string(), row[3]);
-                assert_eq!(
-                    std::fs::read(&local).unwrap(),
-                    std::fs::read(reference.join("tree").join(name)).unwrap()
+                assert_images_equal(
+                    &local,
+                    reference.join("tree").join(name),
+                    "exported versus fsck.erofs",
                 );
             }
             if layout == "extended" && name == "file" {
@@ -310,11 +312,7 @@ PY
                 );
             }
         }
-        assert_eq!(
-            std::fs::read(&image).unwrap(),
-            before,
-            "export changed its source"
-        );
+        assert_image_unchanged(&image, &before, "export changed its source");
     }
 }
 
@@ -367,7 +365,7 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
         let built = mkfs_from_guest_tree(&image, POLICY_STAGE, &args);
         assert!(built.status.success(), "mkfs.erofs: {}", stderr(&built));
         assert_fsck_clean(image.to_str().unwrap(), "export policy source");
-        let before = std::fs::read(&image).unwrap();
+        let before = snapshot_image(&image);
         let kernel = guest_kernel_report(image.to_str().unwrap(), "export policy reference");
         let kernel_value = |kind: &str, name: &str| {
             kernel
@@ -377,9 +375,8 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
         };
         let assert_files = |root: &std::path::Path, names: &[&str]| {
             for name in names {
-                let bytes = std::fs::read(root.join(name)).unwrap();
                 assert_eq!(
-                    sha256_hex(&bytes),
+                    sha256_file(root.join(name)),
                     kernel_value("sha256", name),
                     "{}/{name}: exported versus kernel",
                     root.display()
@@ -427,9 +424,10 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
             assert!(entry.contains("merged into existing directory"), "{entry}");
         }
         assert!(!item(&report, "/tree/sub/a/b").contains("merged into existing directory"));
-        assert_eq!(
-            std::fs::read(merged.join("sub/local-only")).unwrap(),
-            b"not from the image"
+        assert_file_bytes(
+            merged.join("sub/local-only"),
+            b"not from the image",
+            "a merge keeps other entries",
         );
         assert_files(&merged, &POLICY_FILES);
 
@@ -463,9 +461,10 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
                 "{a}"
             );
             assert!(!report.contains("\"path\": \"/tree/sub/a/b\""), "{report}");
-            assert_eq!(
-                std::fs::read(kept.join("sub/a")).unwrap(),
-                b"not a directory"
+            assert_file_bytes(
+                kept.join("sub/a"),
+                b"not a directory",
+                "a refused directory",
             );
             let sub_file = item(&report, "/tree/sub/file");
             if replace {
@@ -473,15 +472,13 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
                 assert_files(&kept, &["sub/file"]);
             } else {
                 assert!(sub_file.contains("\"status\": \"refused\""), "{sub_file}");
-                assert_eq!(std::fs::read(kept.join("sub/file")).unwrap(), b"keep me");
+                assert_file_bytes(kept.join("sub/file"), b"keep me", "a refused file");
             }
         }
 
         // An image at an offset exports the same tree only through --offset.
         let embedded = dir.join("embedded");
-        let mut shifted_bytes = vec![0; 4096];
-        shifted_bytes.extend_from_slice(&before);
-        std::fs::write(&embedded, shifted_bytes).unwrap();
+        copy_sparse_at(&image, &embedded, 4096);
         let unshifted = dir.join("unshifted");
         let out = export_tree(&embedded, &[], &[], &unshifted);
         assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
@@ -521,7 +518,7 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
                     .arg(&dest)));
                 assert_eq!(json_field(&report, "bytes"), kernel_value("size", name));
                 assert_eq!(json_field(&report, "sha256"), want);
-                assert_eq!(sha256_hex(&std::fs::read(&dest).unwrap()), want);
+                assert_eq!(sha256_file(&dest), want);
             }
             let get = stdout(&ok(tool("fs.erofs").arg(target).args(global).arg("get")));
             let info = stdout(&ok(tool("fs.erofs").arg(target).args(global).arg("info")));
@@ -536,11 +533,7 @@ fn recursive_export_policies_and_single_file_commands_match_the_kernel() {
                 json_field(&get, "total_blocks")
             );
         }
-        assert_eq!(
-            std::fs::read(&image).unwrap(),
-            before,
-            "export changed its source"
-        );
+        assert_image_unchanged(&image, &before, "export changed its source");
     }
 }
 
@@ -584,7 +577,7 @@ fn recursive_export_reports_a_damaged_file_failed_and_never_publishes_or_replace
             .unwrap_or_else(|| panic!("kernel digested tree/{name}"))
             .clone();
         assert_eq!(
-            sha256_hex(&std::fs::read(extracted.join("tree").join(name)).unwrap()),
+            sha256_file(extracted.join("tree").join(name)),
             sum,
             "{name}: reference extractor versus kernel"
         );
@@ -600,19 +593,19 @@ fn recursive_export_reports_a_damaged_file_failed_and_never_publishes_or_replace
         DataLayout::FlatPlain | DataLayout::FlatInline
     ));
     let at = Inode::iloc(fs.superblock(), inode.nid) as usize + 16;
-    let mut bytes = std::fs::read(&image).unwrap();
+    let length = std::fs::metadata(&image).unwrap().len();
     // Keep metadata intact, but make the file's data run beyond the image.
     // One full shared-transfer chunk remains readable before the failure.
-    let block = u32::try_from(bytes.len() / 4096 - 257).unwrap();
-    bytes[at..at + 4].copy_from_slice(&block.to_le_bytes());
+    let block = u32::try_from(length / 4096 - 257).unwrap();
+    write_image_region(&image, at as u64, &block.to_le_bytes());
     // The inode can share the superblock's block, so reseal its checksum.
     if fs.superblock().feature_compat & 1 != 0 {
-        bytes[1028..1032].fill(0);
-        let end = 1024 + fs.superblock().checksum_span_len();
-        let checksum = crc32c::crc32c(&bytes[1024..end]) ^ u32::MAX;
-        bytes[1028..1032].copy_from_slice(&checksum.to_le_bytes());
+        write_image_region(&image, 1028, &[0; 4]);
+        let span = fs.superblock().checksum_span_len();
+        let covered = read_image_region(&image, 1024, span);
+        let checksum = crc32c::crc32c(&covered) ^ u32::MAX;
+        write_image_region(&image, 1028, &checksum.to_le_bytes());
     }
-    std::fs::write(&image, bytes).unwrap();
     let damaged = Filesystem::open(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
     let inode = damaged.lookup_path("/tree/big").unwrap();
     let mut chunk = vec![0; 1 << 20];
@@ -629,17 +622,20 @@ fn recursive_export_reports_a_damaged_file_failed_and_never_publishes_or_replace
         let failed = item(&report, "/tree/big");
         assert!(failed.contains("\"status\": \"failed\""), "{failed}");
         for (name, sum) in DAMAGED_SIBLINGS.iter().zip(&siblings) {
-            let bytes = std::fs::read(dest.join(name)).unwrap();
-            assert_eq!(&sha256_hex(&bytes), sum, "{name}: exported versus kernel");
+            assert_eq!(
+                &sha256_file(dest.join(name)),
+                sum,
+                "{name}: exported versus kernel"
+            );
             let entry = item(&report, &format!("/tree/{name}"));
             assert!(entry.contains("\"status\": \"completed\""), "{entry}");
             assert!(entry.contains(sum.as_str()), "{entry}");
         }
         if replace {
-            assert_eq!(
-                std::fs::read(dest.join("big")).unwrap(),
+            assert_file_bytes(
+                dest.join("big"),
                 b"original destination",
-                "a failed replacement kept the original bytes"
+                "a failed replacement kept the original bytes",
             );
             assert_eq!(names(&dest), ["a", "big", "sub"]);
         } else {

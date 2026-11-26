@@ -4,6 +4,7 @@ mod common;
 use cli_support::*;
 use common::{dir, file, symlink};
 use fs_erofs::mkfs;
+use fs_erofs_test_support::{assert_image_unchanged, snapshot_image};
 use std::process::Output;
 
 fn image() -> String {
@@ -74,7 +75,7 @@ fn recursive_listing_bounds_require_recursion_and_unsigned_values() {
 #[test]
 fn recursive_listing_reached_bounds_keep_the_prefix_and_exact_fits_succeed() {
     let image = image();
-    let before = std::fs::read(&image).unwrap();
+    let before = snapshot_image(&image);
     let complete = ok(tool("fs.erofs").arg(&image).args(["ls", "--recursive"]));
     let expected = [
         "/empty",
@@ -128,7 +129,7 @@ fn recursive_listing_reached_bounds_keep_the_prefix_and_exact_fits_succeed() {
     assert_eq!(text.status.code(), Some(1));
     assert_eq!(stdout(&text).lines().count(), 1);
     assert_eq!(stderr(&text), "fs.erofs: --limit 1 reached at /hello.txt\n");
-    assert_eq!(std::fs::read(&image).unwrap(), before);
+    assert_image_unchanged(&image, &before, "listing changed the image");
 }
 
 #[test]

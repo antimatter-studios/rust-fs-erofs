@@ -2,7 +2,9 @@
 mod cli_support;
 
 use cli_support::*;
-use fs_erofs_test_support::{guest_kernel_read, mkfs_from_guest_tree, ScratchDir};
+use fs_erofs_test_support::{
+    assert_image_unchanged, guest_kernel_read, mkfs_from_guest_tree, snapshot_image, ScratchDir,
+};
 use std::collections::BTreeMap;
 
 #[test]
@@ -26,7 +28,7 @@ printf raw > $'a/deep/raw-\xfe'
     );
     assert!(built.status.success(), "{}", stderr(&built));
     let image_arg = image.display().to_string();
-    let before = std::fs::read(&image).unwrap();
+    let before = snapshot_image(&image);
     let oracle = guest_kernel_read(
         &image_arg,
         "find \"$MNT\" -mindepth 1 -printf '%P\\0%y\\0%s\\0%i\\0'",
@@ -79,5 +81,5 @@ printf raw > $'a/deep/raw-\xfe'
     }
     assert_eq!(actual, expected);
     assert_eq!(order, expected.keys().cloned().collect::<Vec<_>>());
-    assert_eq!(std::fs::read(&image).unwrap(), before);
+    assert_image_unchanged(&image, &before, "ls --recursive changed the image");
 }

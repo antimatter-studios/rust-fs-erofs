@@ -23,7 +23,7 @@
 //! --extract` reproduced the source tree from it byte for byte.
 
 mod common;
-use common::{open_image, MemDev};
+use common::open_image_path;
 use fs_erofs_test_support::{oracle, ScratchDir};
 
 use fs_erofs::Filesystem;
@@ -88,8 +88,7 @@ fn read_whole(fs: &Filesystem, path: &str) -> Vec<u8> {
 
 #[test]
 fn the_committed_zstd_image_reads_back_exactly() {
-    let bytes = std::fs::read(fixture_path()).expect("read the committed zstd fixture");
-    let fs = open_image(bytes);
+    let fs = open_image_path(&fixture_path());
 
     // The superblock says zstd, and the COMPR_CFGS record for it parsed
     // — before this codec existed, an image advertising it was refused
@@ -133,8 +132,7 @@ fn the_committed_zstd_image_reads_back_exactly() {
 /// the failure a whole-file read would not catch.
 #[test]
 fn partial_reads_of_a_zstd_file_land_where_they_should() {
-    let bytes = std::fs::read(fixture_path()).expect("read the committed zstd fixture");
-    let fs = open_image(bytes);
+    let fs = open_image_path(&fixture_path());
     let want = pattern(16384);
     let inode = fs.lookup_path("/incompressible.bin").expect("lookup");
 
@@ -225,8 +223,7 @@ fn a_freshly_built_zstd_image_reads_back_exactly() {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        let fs =
-            Filesystem::open(MemDev::arc(std::fs::read(&img).expect("read image"))).expect("open");
+        let fs = open_image_path(&img);
         for (path, want) in &files {
             assert!(
                 read_whole(&fs, path) == *want,

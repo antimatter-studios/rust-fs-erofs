@@ -6,7 +6,10 @@ mod cli_support;
 use cli_support::*;
 use fs_core::FileDevice;
 use fs_erofs::{xattr::parse_inline_xattrs, Filesystem, Inode};
-use fs_erofs_test_support::{guest_kernel_read, mkfs_from_guest_tree, ScratchDir};
+use fs_erofs_test_support::{
+    assert_file_bytes, assert_image_unchanged, copy_sparse_at, guest_kernel_read,
+    mkfs_from_guest_tree, read_image_region, snapshot_image, ScratchDir,
+};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
@@ -89,12 +92,13 @@ fn xattr_names_and_values_match_the_kernel_inline_shared_and_with_prefixes() {
         }
         let built = mkfs_from_guest_tree(&image, STAGE, &args);
         assert!(built.status.success(), "mkfs.erofs: {}", stderr(&built));
-        let before = std::fs::read(&image).unwrap();
+        let before = snapshot_image(&image);
         let fs = Filesystem::open(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
         let inode = fs.lookup_path("/file").unwrap();
         let start = Inode::iloc(fs.superblock(), inode.nid) + u64::from(inode.on_disk_size);
         let end = inode.body_end(fs.superblock());
-        let (shared, inline) = parse_inline_xattrs(&before[start as usize..end as usize]).unwrap();
+        let body = read_image_region(&image, start, (end - start) as usize);
+        let (shared, inline) = parse_inline_xattrs(&body).unwrap();
         assert!(!shared.is_empty(), "fixture must exercise shared xattrs");
         assert!(!inline.is_empty(), "fixture must exercise inline xattrs");
         assert_eq!(!fs.xattr_prefix_dict().unwrap().is_empty(), dictionary);
@@ -143,7 +147,7 @@ fn xattr_names_and_values_match_the_kernel_inline_shared_and_with_prefixes() {
                         .stdout
                         .is_empty()
                 );
-                assert_eq!(std::fs::read(&dest).unwrap(), *value);
+                assert_file_bytes(&dest, &value[..], "xattr -o");
                 assert!(!dir.join("value.partial").exists());
             }
             let list = ok(tool("fs.erofs")
@@ -158,9 +162,7 @@ fn xattr_names_and_values_match_the_kernel_inline_shared_and_with_prefixes() {
             assert_eq!(stdout(&out).trim_end(), text.join("\n"));
         }
         let embedded = dir.join("embedded");
-        let mut bytes = vec![0; 4096];
-        bytes.extend_from_slice(&before);
-        std::fs::write(&embedded, bytes).unwrap();
+        copy_sparse_at(&image, &embedded, 4096);
         let out = ok(tool("fs.erofs").arg(&embedded).args([
             "--offset",
             "4096",
@@ -169,6 +171,6 @@ fn xattr_names_and_values_match_the_kernel_inline_shared_and_with_prefixes() {
             "user.comment",
         ]));
         assert_eq!(out.stdout, b"hello\0\xff\n");
-        assert_eq!(std::fs::read(&image).unwrap(), before);
+        assert_image_unchanged(&image, &before, "xattr changed the image");
     }
 }

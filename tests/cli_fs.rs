@@ -14,6 +14,7 @@ mod common;
 use cli_support::*;
 use common::{dir, file, symlink};
 use fs_erofs::mkfs;
+use fs_erofs_test_support::assert_file_bytes;
 use std::process::Output;
 
 /// An image of a small tree with a symlink in it, built by the library
@@ -135,7 +136,7 @@ fn read_writes_each_file_s_exact_bytes_to_stdout_or_a_file() {
     let dest = image_path("read-o");
     let out = ok(tool("fs.erofs").args([&img, "read", "/big", "-o", &dest]));
     assert!(out.stdout.is_empty());
-    assert_eq!(std::fs::read(&dest).unwrap(), pattern(20_000, 1));
+    assert_file_bytes(&dest, &pattern(20_000, 1), "read -o");
 }
 
 #[test]
@@ -189,10 +190,7 @@ fn every_verb_that_would_change_the_image_is_refused_as_read_only() {
         let err = refused(&run(&img, verb), 3);
         assert!(err.contains("EROFS is read-only"), "{verb:?}: {err}");
     }
-    assert!(
-        std::fs::read(&img).unwrap() == bytes,
-        "a refused verb changed the image"
-    );
+    assert_file_bytes(&img, &bytes, "a refused verb changed the image");
 }
 
 #[test]

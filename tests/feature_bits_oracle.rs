@@ -22,7 +22,7 @@
 
 mod common;
 use common::{materialize_tree, run_mkfs_erofs};
-use fs_erofs_test_support::ScratchDir;
+use fs_erofs_test_support::{read_image_region, ScratchDir};
 
 use fs_erofs::mkfs;
 use fs_erofs::superblock::{
@@ -33,7 +33,6 @@ use fs_erofs::superblock::{
     EROFS_FEATURE_INCOMPAT_ZTAILPACKING, Z_EROFS_COMPRESSION_DEFLATE_BIT,
     Z_EROFS_COMPRESSION_LZ4_BIT, Z_EROFS_COMPRESSION_LZMA_BIT,
 };
-use fs_erofs::Filesystem;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -91,8 +90,7 @@ fn incompat_for(dir: &Path, label: &str, extra: &[&str]) -> u32 {
         "mkfs.erofs {extra:?} failed: {}",
         run.stderr
     );
-    let bytes = std::fs::read(&img).expect("read the built image");
-    let raw: [u8; 4] = bytes[FEATURE_INCOMPAT_AT..FEATURE_INCOMPAT_AT + 4]
+    let raw: [u8; 4] = read_image_region(&img, FEATURE_INCOMPAT_AT as u64, 4)
         .try_into()
         .expect("four bytes at 0x50");
     let bits = u32::from_le_bytes(raw);
@@ -242,9 +240,7 @@ fn compression_configurations_set_compr_cfgs_and_still_read() {
             EROFS_FEATURE_INCOMPAT_COMPR_CFGS,
             "{args:?} should add COMPR_CFGS to the compressed baseline"
         );
-        let bytes = std::fs::read(dir.path().join(format!("{label}.img"))).unwrap();
-        let fs = Filesystem::open(common::MemDev::arc(bytes))
-            .unwrap_or_else(|e| panic!("{label}: an image with COMPR_CFGS did not open: {e:?}"));
+        let fs = common::open_image_path(&dir.path().join(format!("{label}.img")));
         assert_eq!(
             fs.superblock().u1,
             algorithm,
