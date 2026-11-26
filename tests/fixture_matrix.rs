@@ -29,9 +29,6 @@ use fs_erofs::Filesystem;
 use fs_erofs_test_support::fixture;
 use std::sync::Arc;
 
-mod common;
-use common::MemDev;
-
 /// Every image `chore fixtures` builds, and the flags it was built with
 /// (for the failure message). THIS LIST AND
 /// `test-disks/guest-build-images.sh` MUST AGREE — `tests/fixtures_present`
@@ -92,9 +89,8 @@ fn expected() -> Vec<(&'static str, Vec<u8>)> {
 
 fn open_fixture(name: &str) -> Filesystem {
     let path = fixture(env!("CARGO_MANIFEST_DIR"), &format!("erofs-{name}.img"));
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let dev: Arc<dyn fs_core::BlockRead> = MemDev::arc(bytes);
-    Filesystem::open(dev).unwrap_or_else(|e| panic!("open {path}: {e:?}"))
+    let device = fs_core::FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    Filesystem::open(Arc::new(device)).unwrap_or_else(|e| panic!("open {path}: {e:?}"))
 }
 
 fn read_whole(fs: &Filesystem, path: &str) -> Vec<u8> {

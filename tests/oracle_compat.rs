@@ -299,8 +299,7 @@ setfattr -n user.unique -v f1only f1.txt"#,
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
-    let bytes = std::fs::read(&img_path).expect("read built image");
-    let fs = common::open_image(bytes);
+    let fs = common::open_image_path(&img_path);
 
     // f2 and f3 should each carry the shared xattr only.
     for name in ["f2.txt", "f3.txt"] {
@@ -345,8 +344,7 @@ setfattr -n user.dataitem.other -v v2 file.txt"#,
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
-    let bytes = std::fs::read(&img_path).expect("read built image");
-    let fs = common::open_image(bytes);
+    let fs = common::open_image_path(&img_path);
 
     // Sanity: dictionary should have at least one entry.
     let dict = fs.xattr_prefix_dict().expect("read dict");

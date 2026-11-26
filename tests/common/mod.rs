@@ -60,10 +60,11 @@ pub fn open_image(bytes: Vec<u8>) -> Filesystem {
     Filesystem::open(MemDev::arc(bytes)).expect("filesystem open")
 }
 
-/// Open an EROFS image from a file path.
+/// Open an EROFS image from a file path, read as the filesystem asks for it.
 pub fn open_image_path(path: &Path) -> Filesystem {
-    let bytes = std::fs::read(path).expect("read image file");
-    open_image(bytes)
+    let device =
+        fs_core::FileDevice::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    Filesystem::open(Arc::new(device)).expect("filesystem open")
 }
 
 // ---- mkfs::Node tree builders -----------------------------------------

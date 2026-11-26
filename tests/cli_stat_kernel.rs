@@ -4,7 +4,10 @@
 mod cli_support;
 
 use cli_support::*;
-use fs_erofs_test_support::{guest_kernel_stat_report, mkfs_from_guest_tree, ScratchDir};
+use fs_erofs_test_support::{
+    assert_image_unchanged, guest_kernel_stat_report, mkfs_from_guest_tree, snapshot_image,
+    ScratchDir,
+};
 use std::os::unix::ffi::OsStringExt;
 
 const STAGE: &str = r#"
@@ -54,7 +57,7 @@ fn check_layout(layout: &str) {
             stderr(&built)
         );
         let image = image.to_str().unwrap();
-        let before = std::fs::read(image).unwrap();
+        let before = snapshot_image(image);
         let report = guest_kernel_stat_report(image);
         let mut lines = report.lines();
         let mut seen = 0;
@@ -134,11 +137,7 @@ fn check_layout(layout: &str) {
             seen += 1;
         }
         assert_eq!(seen, 13, "every source path, including root: {report}");
-        assert_eq!(
-            std::fs::read(image).unwrap(),
-            before,
-            "stat leaves the image unchanged"
-        );
+        assert_image_unchanged(image, &before, "stat leaves the image unchanged");
     }
 }
 

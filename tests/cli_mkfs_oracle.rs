@@ -9,7 +9,7 @@
 mod cli_support;
 
 use cli_support::*;
-use fs_erofs_test_support::{assert_fsck_clean, oracle};
+use fs_erofs_test_support::{assert_file_bytes, assert_fsck_clean, oracle};
 
 /// The value of `dump.erofs`'s `Filesystem <label>:` line.
 #[track_caller]
@@ -143,14 +143,16 @@ fn links_special_files_and_compression_pass_fsck_erofs_and_dump_erofs_reads_them
                 .output();
             assert!(out.status.success(), "{what}: {}", stderr(&out));
             for (path, bytes) in &files {
-                assert!(
-                    std::fs::read(extracted.join(path)).unwrap() == *bytes,
-                    "{what}: fsck.erofs extracted other bytes for /{path}"
+                assert_file_bytes(
+                    extracted.join(path),
+                    bytes,
+                    &format!("{what}: fsck.erofs extracted /{path}"),
                 );
             }
-            assert!(
-                std::fs::read(extracted.join("d/hard")).unwrap() == files[0].1,
-                "{what}: /d/hard"
+            assert_file_bytes(
+                extracted.join("d/hard"),
+                &files[0].1,
+                &format!("{what}: /d/hard"),
             );
             assert_eq!(
                 std::fs::read_link(extracted.join("link")).unwrap(),

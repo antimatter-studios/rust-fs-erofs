@@ -6,7 +6,9 @@ use cli_support::*;
 use fs_core::FileDevice;
 use fs_erofs::{DataLayout, Filesystem, Inode};
 use fs_erofs_test_support::{
-    assert_fsck_clean, guest_kernel_report, mkfs_from_guest_tree, oracle, sha256_hex, ScratchDir,
+    assert_file_bytes, assert_fsck_clean, assert_image_unchanged, copy_sparse_at,
+    guest_kernel_report, mkfs_from_guest_tree, oracle, read_image_region, sha256_file, sha256_hex,
+    snapshot_image, write_image_region, ScratchDir,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -42,7 +44,7 @@ fn export_matches_kernel_and_reference_digests_with_shared_publication_rules() {
             compressed,
             "the fixture must exercise the requested data layout"
         );
-        let before = std::fs::read(&image).unwrap();
+        let before = snapshot_image(&image);
         let kernel = guest_kernel_report(image.to_str().unwrap(), "export reference");
         let extracted = dir.join("extracted");
         let reference = oracle("fsck.erofs")
@@ -58,10 +60,7 @@ fn export_matches_kernel_and_reference_digests_with_shared_publication_rules() {
             let want = kernel
                 .get(&("sha256".to_string(), name.to_string()))
                 .expect("kernel digested the source file");
-            assert_eq!(
-                &sha256_hex(&std::fs::read(extracted.join(name)).unwrap()),
-                want
-            );
+            assert_eq!(&sha256_file(extracted.join(name)), want);
             let path = format!("/{name}");
             let dest = dir.join(name);
             let report = stdout(&ok(tool("fs.erofs")
@@ -71,11 +70,10 @@ fn export_matches_kernel_and_reference_digests_with_shared_publication_rules() {
             assert_eq!(json_field(&report, "bytes"), size.to_string());
             assert_eq!(json_field(&report, "sha256"), *want);
             assert_eq!(json_field(&report, "replaced"), "false");
-            let bytes = std::fs::read(&dest).unwrap();
-            assert_eq!(bytes.len(), size);
-            assert_eq!(&sha256_hex(&bytes), want);
+            assert_eq!(std::fs::metadata(&dest).unwrap().len(), size);
+            assert_eq!(&sha256_file(&dest), want);
             let raw = ok(tool("fs.erofs").arg(&image).args(["export", &path, "-"]));
-            assert_eq!(raw.stdout, bytes);
+            assert_file_bytes(&dest, &raw.stdout, "export to stdout");
             assert!(raw.stderr.is_empty());
             std::fs::write(&dest, b"keep me").unwrap();
             let refused = tool("fs.erofs")
@@ -85,13 +83,13 @@ fn export_matches_kernel_and_reference_digests_with_shared_publication_rules() {
                 .output()
                 .unwrap();
             assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
-            assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+            assert_file_bytes(&dest, b"keep me", "a refused export");
             let replaced = stdout(&ok(tool("fs.erofs")
                 .arg(&image)
                 .args(["export", "--replace", &path])
                 .arg(&dest)));
             assert_eq!(json_field(&replaced, "replaced"), "true");
-            assert_eq!(&sha256_hex(&std::fs::read(&dest).unwrap()), want);
+            assert_eq!(&sha256_file(&dest), want);
         }
         for path in ["/dir", "/link", "/pipe", "/missing"] {
             let dest = dir.join("refused");
@@ -116,9 +114,7 @@ fn export_matches_kernel_and_reference_digests_with_shared_publication_rules() {
         assert!(help.contains("Examples:"), "{help}");
         assert!(help.contains("fs.erofs rootfs.erofs export"), "{help}");
         let embedded = dir.join("embedded");
-        let mut bytes = vec![0; 4096];
-        bytes.extend_from_slice(&before);
-        std::fs::write(&embedded, bytes).unwrap();
+        copy_sparse_at(&image, &embedded, 4096);
         let out = ok(tool("fs.erofs")
             .arg(&embedded)
             .args(["--offset", "4096", "export", "/big", "-"]));
@@ -126,11 +122,7 @@ fn export_matches_kernel_and_reference_digests_with_shared_publication_rules() {
             &sha256_hex(&out.stdout),
             kernel.get(&("sha256".into(), "big".into())).unwrap()
         );
-        assert_eq!(
-            std::fs::read(&image).unwrap(),
-            before,
-            "export changed its source"
-        );
+        assert_image_unchanged(&image, &before, "export changed its source");
     }
 }
 
@@ -145,18 +137,18 @@ fn unreadable_export_never_publishes_or_replaces_and_cleans_staging() {
         DataLayout::FlatPlain | DataLayout::FlatInline
     ));
     let at = Inode::iloc(fs.superblock(), inode.nid) as usize + 16;
-    let mut bytes = std::fs::read(&image).unwrap();
+    let length = std::fs::metadata(&image).unwrap().len();
     // Keep metadata intact, but make the file's data run beyond the image.
     // One full shared-transfer chunk remains readable before the failure.
-    let block = u32::try_from(bytes.len() / 4096 - 257).unwrap();
-    bytes[at..at + 4].copy_from_slice(&block.to_le_bytes());
+    let block = u32::try_from(length / 4096 - 257).unwrap();
+    write_image_region(&image, at as u64, &block.to_le_bytes());
     if fs.superblock().feature_compat & 1 != 0 {
-        bytes[1028..1032].fill(0);
-        let end = 1024 + fs.superblock().checksum_span_len();
-        let checksum = crc32c::crc32c(&bytes[1024..end]) ^ u32::MAX;
-        bytes[1028..1032].copy_from_slice(&checksum.to_le_bytes());
+        write_image_region(&image, 1028, &[0; 4]);
+        let span = fs.superblock().checksum_span_len();
+        let covered = read_image_region(&image, 1024, span);
+        let checksum = crc32c::crc32c(&covered) ^ u32::MAX;
+        write_image_region(&image, 1028, &checksum.to_le_bytes());
     }
-    std::fs::write(&image, bytes).unwrap();
     let damaged = Filesystem::open(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
     let inode = damaged.lookup_path("/big").unwrap();
     let mut chunk = vec![0; 1 << 20];
@@ -181,7 +173,7 @@ fn unreadable_export_never_publishes_or_replaces_and_cleans_staging() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(out.stdout.is_empty());
-    assert_eq!(std::fs::read(&dest).unwrap(), b"original destination");
+    assert_file_bytes(&dest, b"original destination", "a failed export");
     assert_no_staging(&dest);
 }
 

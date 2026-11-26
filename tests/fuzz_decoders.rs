@@ -31,6 +31,7 @@
 //! take a byte slice, so a mutation of a superblock is a mutation of a
 //! real superblock rather than of noise.
 
+use fs_erofs_test_support::read_small_file;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -129,8 +130,8 @@ fn seeds(corpus: &str) -> Vec<(String, Vec<u8>)> {
         })
         .map(|entry| {
             let path = entry.expect("corpus directory entry").path();
-            let bytes = std::fs::read(&path)
-                .unwrap_or_else(|e| panic!("reading the seed {}: {e}", path.display()));
+            // A committed seed, small by construction.
+            let bytes = read_small_file(&path);
             let name = path
                 .file_name()
                 .expect("seed file name")

@@ -37,7 +37,9 @@ mod common;
 use fs_erofs::acl::{self, AclEntry, AclTag};
 use fs_erofs::xattr::{ns, parse_inline_xattrs};
 use fs_erofs::{Filesystem, Inode};
-use fs_erofs_test_support::{guest_kernel_acl_report, mkfs_from_guest_tree, ScratchDir};
+use fs_erofs_test_support::{
+    guest_kernel_acl_report, mkfs_from_guest_tree, read_small_file, ScratchDir,
+};
 use std::collections::BTreeMap;
 
 const ACCESS: &str = "system.posix_acl_access";
@@ -248,7 +250,9 @@ fn acls_the_kernel_set_read_back_as_the_kernel_reads_them() {
     let many = k("getfacl", "many.txt").split(',').count();
     assert_eq!(many, 36, "many.txt: getfacl listed {many} entries, not 36");
 
-    let bytes = std::fs::read(&image_path).expect("read the built image");
+    // A tree of a few dozen small files, so a small image; the ACL walk
+    // reads its raw bytes.
+    let bytes = read_small_file(&image_path);
     let fs = common::open_image(bytes.clone());
     let root = fs.lookup_path("/").expect("root");
     let mut paths = Vec::new();

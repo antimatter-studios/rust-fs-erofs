@@ -17,7 +17,7 @@ use fs_erofs::primitives::{
     inspect_inode, inspect_superblock, inspect_xattrs, Geometry, XattrEvidence,
 };
 use fs_erofs::xattr::resolve_full_name;
-use fs_erofs_test_support::{guest_kernel_read, mkfs_from_guest_tree, ScratchDir};
+use fs_erofs_test_support::{guest_kernel_read, mkfs_from_guest_tree, read_small_file, ScratchDir};
 use std::collections::BTreeMap;
 
 const STAGE: &str = r#"
@@ -117,7 +117,9 @@ fn xattrs_read_as_the_kernel_lists_them_and_damage_costs_only_the_damaged_entry(
         "{}",
         String::from_utf8_lossy(&built.stderr)
     );
-    let healthy = std::fs::read(&healthy_path).unwrap();
+    // A handful of attribute-carrying files, so a small image; the damage
+    // cases edit copies of it in memory.
+    let healthy = read_small_file(&healthy_path);
     let geometry = geometry(&healthy);
 
     let kernel = kernel_attrs(&healthy_path);

@@ -18,7 +18,7 @@ mod common;
 
 use cli_support::*;
 use common::{build_with_mkfs_erofs, dir, file, symlink};
-use fs_erofs_test_support::oracle;
+use fs_erofs_test_support::{copy_sparse_at, oracle, read_image_region, write_image_region};
 
 /// The source: every size boundary a 4 KiB block has, a MiB of noise, a
 /// long name, deep nesting, a directory that spans blocks, and symlinks.
@@ -193,7 +193,6 @@ fn a_damaged_image_is_refused_by_fsck_erofs_and_by_the_tool() {
     );
     let img = image_path("oracle-damaged");
     ok(tool("mkfs.erofs").args(["-q", &img, &src.display().to_string()]));
-    let bytes = std::fs::read(&img).unwrap();
     let get = stdout(&ok(tool("fs.erofs").args([
         &img,
         "get",
@@ -209,16 +208,17 @@ fn a_damaged_image_is_refused_by_fsck_erofs_and_by_the_tool() {
     // longer matches; and the image cut after its first block, before the
     // inodes. (Cut inside the file data instead, fsck.erofs accepts it,
     // with or without --extract: it never reads past what it can check.)
-    let mut bad_checksum = bytes.clone();
-    bad_checksum[1024 + 0x30] ^= 0xFF;
-    let cut = bytes[..4096].to_vec();
     let scratch = scratch("oracle-damaged");
-    for (what, bytes) in [
+    let bad_checksum = scratch.join("a-bad-superblock-checksum.img");
+    copy_sparse_at(&img, &bad_checksum, 0);
+    let uuid = read_image_region(&img, 1024 + 0x30, 1)[0];
+    write_image_region(&bad_checksum, 1024 + 0x30, &[uuid ^ 0xFF]);
+    let cut = scratch.join("a-truncated-image.img");
+    std::fs::write(&cut, read_image_region(&img, 0, 4096)).unwrap();
+    for (what, path) in [
         ("a bad superblock checksum", bad_checksum),
         ("a truncated image", cut),
     ] {
-        let path = scratch.join(format!("{}.img", what.replace(' ', "-")));
-        std::fs::write(&path, bytes).unwrap();
         let path = path.display().to_string();
         // fsck.erofs's verdict is its report, not its status: for a bad
         // superblock checksum it prints "failed to verify superblock

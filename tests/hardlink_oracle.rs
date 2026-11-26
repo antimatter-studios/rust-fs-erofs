@@ -107,7 +107,7 @@ fn links_agree_with_the_kernel(label: &str, layout: &str, inode_size: u8) {
     }
     assert_eq!(kernel_field("ino", "a"), kernel_field("ino", "d/c"));
 
-    let fs = common::open_image(std::fs::read(&image_path).expect("read the built image"));
+    let fs = common::open_image_path(&image_path);
     let root = fs.root_inode().expect("root inode");
     let mut paths = Vec::new();
     walk(&fs, &root, "", &mut paths);

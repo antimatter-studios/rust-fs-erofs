@@ -258,7 +258,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// SHA-256, spelled out so the test support crate needs no dependency
 /// for it (FIPS 180-4).
-struct Sha256 {
+pub(crate) struct Sha256 {
     state: [u32; 8],
     buffer: Vec<u8>,
     length: u64,
@@ -278,7 +278,7 @@ impl Sha256 {
         0xc67178f2,
     ];
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: [
                 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -289,7 +289,7 @@ impl Sha256 {
         }
     }
 
-    fn update(&mut self, bytes: &[u8]) {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
         self.length += bytes.len() as u64;
         self.buffer.extend_from_slice(bytes);
         let mut at = 0;
@@ -342,7 +342,7 @@ impl Sha256 {
         }
     }
 
-    fn hex(mut self) -> String {
+    pub(crate) fn hex(mut self) -> String {
         let bits = self.length * 8;
         self.buffer.push(0x80);
         while self.buffer.len() % 64 != 56 {
