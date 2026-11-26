@@ -204,4 +204,104 @@ head -c 2048 "$img" >"$SANDBOX/cut.img"
 refuse "a truncated image" fs.erofs "$SANDBOX/cut.img" ls /
 refuse "a file read from a truncated image" fs.erofs "$SANDBOX/cut.img" read /big
 
+# Export that succeeds, of single files and of a tree: the bytes, the names,
+# the kinds and the times. Windows runs this suite against the release zip, so
+# nothing here needs a symlink, a mode or a name Windows cannot hold.
+exp="$SANDBOX/exp-src"
+mkdir -p "$exp/tree/a/b/c" "$exp/tree/hollow"
+: >"$exp/tree/empty"
+printf 'x' >"$exp/tree/one"
+head -c 4097 /dev/urandom >"$exp/tree/f4097"
+head -c 3145729 /dev/urandom >"$exp/tree/big"
+printf 'deep' >"$exp/tree/a/b/c/deep"
+printf 'spaced' >"$exp/tree/a/with space"
+files=(empty one f4097 big a/b/c/deep "a/with space")
+mkfs.erofs -q "$SANDBOX/exp.img" "$exp" >/dev/null 2>"$SANDBOX/exp-mkfs.err"
+check "mkfs.erofs made the export image ($(cat "$SANDBOX/exp-mkfs.err"))" test -s "$SANDBOX/exp.img"
+
+# Five single files, "a/with space" among them; "empty" is the first.
+n=0
+for name in empty one f4097 big "a/with space"; do
+    n=$((n + 1))
+    want="$(sha256 <"$exp/tree/$name")" || fail "export needs SHA-256 (install coreutils or Perl's shasum)"
+    size="$(wc -c <"$exp/tree/$name" | tr -d ' ')"
+    fs.erofs "$SANDBOX/exp.img" export "/tree/$name" "$SANDBOX/single-$n" \
+        >"$SANDBOX/export.json" 2>"$SANDBOX/export.err"
+    status=$?
+    check "export /tree/$name exits 0 ($(cat "$SANDBOX/export.err"))" test "$status" -eq 0
+    jq_check "export /tree/$name reports the source's size and digest" \
+        ".bytes == $size and .sha256 == \"$want\" and .replaced == false" "$SANDBOX/export.json"
+    check "export /tree/$name writes the source's bytes" cmp -s "$exp/tree/$name" "$SANDBOX/single-$n"
+done
+
+# An existing destination is kept unless --replace is given.
+printf 'keep me' >"$SANDBOX/kept"
+fs.erofs "$SANDBOX/exp.img" export /tree/big "$SANDBOX/kept" >/dev/null 2>&1
+check "export over an existing file exits 1" test $? -eq 1
+check "export over an existing file keeps it" test "$(cat "$SANDBOX/kept")" = 'keep me'
+fs.erofs "$SANDBOX/exp.img" export --replace /tree/big "$SANDBOX/kept" \
+    >"$SANDBOX/export.json" 2>"$SANDBOX/export.err"
+status=$?
+check "export --replace exits 0 ($(cat "$SANDBOX/export.err"))" test "$status" -eq 0
+jq_check "export --replace says it replaced" '.replaced == true' "$SANDBOX/export.json"
+check "export --replace writes the source's bytes" cmp -s "$exp/tree/big" "$SANDBOX/kept"
+
+fs.erofs "$SANDBOX/exp.img" export /tree/big - >"$SANDBOX/export.raw" 2>"$SANDBOX/export.err"
+check "export to stdout exits 0" test $? -eq 0
+check "export to stdout writes the source's bytes" cmp -s "$exp/tree/big" "$SANDBOX/export.raw"
+check "export to stdout says nothing on stderr" test ! -s "$SANDBOX/export.err"
+
+fs.erofs "$SANDBOX/exp.img" export /tree "$SANDBOX/not-recursive" >/dev/null 2>&1
+check "export of a directory without --recursive exits 1" test $? -eq 1
+check "export of a directory without --recursive writes nothing" test ! -e "$SANDBOX/not-recursive"
+
+# listing DIR [FIND TESTS...]: the names under DIR, sorted.
+listing() {
+    local dir="$1"
+    shift
+    (cd "$dir" && find . "$@" | LC_ALL=C sort)
+}
+entries="$(find "$exp/tree" | wc -l | tr -d ' ')"
+out="$SANDBOX/exported-whole"
+fs.erofs "$SANDBOX/exp.img" export --recursive /tree "$out" \
+    >"$SANDBOX/tree.json" 2>"$SANDBOX/tree.err"
+status=$?
+check "export --recursive exits 0 ($(cat "$SANDBOX/tree.err"))" test "$status" -eq 0
+jq_check "export --recursive completes every entry" \
+    ".completed == $entries and .skipped == 0 and .refused == 0 and .failed == 0 and .merged_directories == 0" \
+    "$SANDBOX/tree.json"
+check "export --recursive writes the source's names" \
+    test "$(listing "$out")" = "$(listing "$exp/tree")"
+check "export --recursive writes directories as directories" \
+    test "$(listing "$out" -type d)" = "$(listing "$exp/tree" -type d)"
+bytes_ok=1
+report_ok=1
+for name in "${files[@]}"; do
+    cmp -s "$exp/tree/$name" "$out/$name" || { bytes_ok=0; fail "export --recursive: $name differs"; }
+    want="$(sha256 <"$exp/tree/$name")"
+    # Windows joins the report's paths with backslashes.
+    jq -e --arg path "/tree/$name" --arg want "$want" \
+        'any(.items[]; (.path | gsub("\\\\"; "/")) == $path and .status == "completed" and .copy.sha256 == $want)' \
+        "$SANDBOX/tree.json" >/dev/null 2>&1 || { report_ok=0; fail "export --recursive reports no digest for $name"; }
+done
+check "export --recursive writes every file's bytes" test "$bytes_ok" = 1
+check "export --recursive reports every file's digest" test "$report_ok" = 1
+
+# Times. This image stores no modification time of its own, so every entry
+# reads as the epoch. Without --preserve=times an exported entry is dated now.
+touch -t 200001010000 "$SANDBOX/year-2000"
+touch -t 197001030000 "$SANDBOX/epoch-plus-two-days"
+check "export --recursive dates its entries now" \
+    test -z "$(find "$out" ! -newer "$SANDBOX/year-2000")"
+dated="$SANDBOX/exported-dated"
+fs.erofs "$SANDBOX/exp.img" export --recursive --preserve=times /tree "$dated" \
+    >"$SANDBOX/tree.json" 2>"$SANDBOX/tree.err"
+status=$?
+check "export --preserve=times exits 0 ($(head -c 2000 "$SANDBOX/tree.json"))" test "$status" -eq 0
+jq_check "export --preserve=times completes every entry" \
+    ".completed == $entries and .failed == 0" "$SANDBOX/tree.json"
+check "export --preserve=times writes every file's bytes" cmp -s "$exp/tree/big" "$dated/big"
+check "export --preserve=times dates files and directories at the image's time" \
+    test -z "$(find "$dated" -newer "$SANDBOX/epoch-plus-two-days")"
+
 finish

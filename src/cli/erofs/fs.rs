@@ -408,6 +408,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
                     &mut TreeExport {
                         fs: &fs,
                         image: std::path::Path::new(target),
+                        root: std::path::PathBuf::from(&request.path),
                     },
                     tree,
                     transfer::LinkOptions::from_matches(sub)?,
@@ -911,16 +912,36 @@ fn export(
     transfer::export_with_options(request, &mut ExportSource { fs, inode, path }, options)
 }
 
+/// The path in the image of a `path` the shared traversal made by joining
+/// entry names to the request's own, `root`. It joins them with the host's
+/// separator, which on Windows is not the image's: the part below `root` is
+/// joined again with `/`. `root` is taken as it was given.
+fn tree_path(root: &std::path::Path, path: &std::path::Path) -> Vec<u8> {
+    let Ok(below) = path.strip_prefix(root) else {
+        return os_bytes(&path.as_os_str().to_owned()).to_vec();
+    };
+    let mut bytes = os_bytes(&root.as_os_str().to_owned()).to_vec();
+    for name in below.components() {
+        if !bytes.ends_with(b"/") {
+            bytes.push(b'/');
+        }
+        bytes.extend_from_slice(os_bytes(&name.as_os_str().to_owned()));
+    }
+    bytes
+}
+
 /// EROFS only supplies filesystem operations. Core owns traversal, depth,
 /// safe names, destination merging, publication and per-item reports.
 struct TreeExport<'a> {
     fs: &'a Filesystem,
     image: &'a std::path::Path,
+    /// The path in the image the export was asked for.
+    root: std::path::PathBuf,
 }
 
 impl TreeExport<'_> {
     fn resolve(&self, path: &std::path::Path) -> Result<(Vec<u8>, Inode), CliError> {
-        let bytes = os_bytes(&path.as_os_str().to_owned()).to_vec();
+        let bytes = tree_path(&self.root, path);
         let inode = self
             .fs
             .lookup_path_bytes(&bytes)
@@ -1177,6 +1198,29 @@ mod tests {
         assert_eq!(e.code, fs_core::cli::output::EXIT_FAILED, "{json}");
         assert_eq!(json_kind(&e).as_deref(), Some("\"not_found\""), "{json}");
         assert!(e.message.starts_with("/missing/f: "), "{json}");
+    }
+
+    /// Joined as the shared traversal joins them, with the host's separator.
+    #[test]
+    fn a_path_below_the_export_root_is_joined_with_slashes() {
+        use std::path::Path;
+        for (root, names, want) in [
+            ("/tree", &[][..], "/tree"),
+            ("/tree", &["a", "b c", "d"][..], "/tree/a/b c/d"),
+            ("/", &["tree", "a"][..], "/tree/a"),
+            ("/tree/", &["a"][..], "/tree/a"),
+        ] {
+            let root = Path::new(root);
+            let mut path = root.to_path_buf();
+            for name in names {
+                path = path.join(name);
+            }
+            assert_eq!(
+                show(&tree_path(root, &path)),
+                want,
+                "{root:?} and {names:?}"
+            );
+        }
     }
 
     #[test]
