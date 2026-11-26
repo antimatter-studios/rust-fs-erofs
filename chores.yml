@@ -108,9 +108,21 @@ chore_min_version: 0.10.0
 #     images     13 l /    684 B  120 l /  8,000 B  the first --release tier in
 #                 3 tests                           a job, so it pays the cold
 #                                                   build too: 73 l cold
-#     oracle    674 l / 53,442 B  800 l / 63,000 B  runs warm in CI (unit and
-#                                                   images built already): ~18%.
-#                                                   Run 41432903213's oracle.log
+#     oracle    755 l / 66,725 B  900 l / 80,000 B  runs warm in CI (unit and
+#                                                   images built already): ~19%.
+#                                                   CI run 45750563176, with
+#                                                   mkfs.erofs's links, special
+#                                                   files and compression oracle
+#                                                   (4 codecs x 2 block sizes,
+#                                                   about 80 l / 13,068 B of
+#                                                   fsck.erofs and dump.erofs
+#                                                   evidence); the merge-queue
+#                                                   run 45747874005 before it
+#                                                   printed 671 l / 53,373 B
+#                                                   against 800 l / 63,000 B.
+#                                                   Before that, 674 l /
+#                                                   53,442 B: run
+#                                                   41432903213's oracle.log
 #                                                   and the part of its
 #                                                   kernel.log that stays in
 #                                                   oracle_writer.rs (#252-#263).
@@ -490,7 +502,7 @@ tasks:
     # for a run that never reached scripts/test.sh.
     cmds:
       - scripts/tools.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 800 63000 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh oracle) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 900 80000 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh oracle) -- --show-output'
       # 90: the 87 measured before the tools, plus tests/cli_mkfs_oracle.rs
       # and tests/cli_fs_oracle.rs's eight, less a margin. Only goes up.
       - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored oracle 90'
