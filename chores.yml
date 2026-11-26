@@ -163,8 +163,13 @@ chore_min_version: 0.10.0
 #                                                   41432903213 with the builder's
 #                                                   tests (#252-#263); the budget
 #                                                   is 1,400 l / 72,000 B
-#     scripts    31 l /  1,231 B   40 l /  2,000 B  ~29%. 29 l / 1,118 B in the
-#                                                   merge-queue run 41877043436,
+#     scripts    41 l /  1,710 B   50 l /  2,300 B  ~20%. 39 l / 1,615 B in the
+#                                                   merge-queue run 45747874005,
+#                                                   plus the 2 l of
+#                                                   no-whole-image-reads.sh
+#                                                   (#302). Before that, 29 l /
+#                                                   1,118 B in the merge-queue
+#                                                   run 41877043436,
 #                                                   plus 2 l / 113 B for
 #                                                   test-staticlib-target-dir.sh
 #                                                   (#282). Each file prints its
@@ -760,7 +765,7 @@ tasks:
     cmds:
       - |
         set -eu
-        ../rust-fs-core/scripts/tier.sh test:scripts scripts 40 2000 -- bash -c '
+        ../rust-fs-core/scripts/tier.sh test:scripts scripts 50 2300 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
